@@ -49,7 +49,7 @@ regularization_params = [1e-1]  # Regularisation parameters
 img_shape = (1, 128, 128)
 num_experiments = 1
 folds = [0, 1, 2, 3, 4] # 0-4 for 5-fold cross validation, 5 for only one training
-lambda_values = [0]  # Ratio between generated images and original images per class. 8 is reserfved for TESTONGENERATED
+lambda_values = [0, 0.25, 0.5, 1, 2, 3]  # Ratio between generated images and original images per class. 8 is reserfved for TESTONGENERATED
 
 ES, patience = True, 10  # Use early stopping
 IMGCHECK = True  # Check the input images (Tool for control)
@@ -59,7 +59,7 @@ NORMALISEIMGSTOPM = False  # Normalise images to [-1, 1]
 NORMALISESCS = False  # Normalise scattering coefficients to [0, 1]
 NORMALISESCSTOPM = False  # Normalise scattering coefficients to [-1, 1]
 USE_CLASS_WEIGHTS = True  # Set to False to disable class weights
-TESTONGENERATED = True  # Use generated data as testdata
+TESTONGENERATED = False  # Use generated data as testdata
 FILTERED = True  # Remove in training, validation and test data for the classifier
 FILTERGEN = False  # Remove generated images that are too similar to other generated images
 
