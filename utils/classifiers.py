@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 
 
 class ProjectModel(nn.Module):
@@ -128,8 +127,7 @@ class MLPClassifier(nn.Module):
         return x
 
 
-import torch
-import torch.nn as nn
+
 
 class DualClassifier(nn.Module):
     def __init__(self, img_shape, scat_shape, num_classes, 

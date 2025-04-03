@@ -338,7 +338,7 @@ def plot_cut_flow_for_all_filters(images, labels, num_thresholds=11, region_size
     save_cut_flow_plot(thresholds, removed_proportion_regions, 'Cut-Flow: Emission Regions', f"{save_path_prefix}regions.png")
 
 
-def filter_away_faintest(images, labels, region=(128, 128), threshold=0.3, save_path="./bright_pixel_filtering.png"):
+def filter_away_faintest(images, labels, region=(128, 128), threshold=0.1, save_path="./bright_pixel_filtering.png"):
     """
     Filters out images (and their associated labels) where the brightest pixel in the specified
     central region is below the given threshold.
@@ -955,22 +955,22 @@ def load_FIRST(path=None, fold=0, target_classes=None, img_shape=(1, 300, 300), 
 
     if fold is not None and fold >= 0 and fold < 6:
         if fold == 5:
-            train_data = FIRSTGalaxyData(root="./", selected_split="train", input_data_list=[f"galaxy_data_h5.h5"],
+            train_data = FIRSTGalaxyData(root="./.cache", selected_split="train", input_data_list=[f"galaxy_data_h5.h5"],
                                         selected_classes=target_classes, is_PIL=True, is_RGB=False, transform=transforms.ToTensor())
             if train:
-                eval_data = FIRSTGalaxyData(root="./", selected_split="valid", input_data_list=[f"galaxy_data_h5.h5"],
+                eval_data = FIRSTGalaxyData(root="./.cache", selected_split="valid", input_data_list=[f"galaxy_data_h5.h5"],
                                             is_PIL=True, is_RGB=False, transform=transforms.ToTensor())
             else:
-                eval_data = FIRSTGalaxyData(root="./", selected_split="test", input_data_list=[f"galaxy_data_h5.h5"],
+                eval_data = FIRSTGalaxyData(root="./.cache", selected_split="test", input_data_list=[f"galaxy_data_h5.h5"],
                                             is_PIL=True, is_RGB=False, transform=transforms.ToTensor())
         else:
-            train_data = FIRSTGalaxyData(root="./", selected_split="train", input_data_list=[f"galaxy_data_crossvalid_{fold}_h5.h5"],
+            train_data = FIRSTGalaxyData(root="./.cache", selected_split="train", input_data_list=[f"galaxy_data_crossvalid_{fold}_h5.h5"],
                                          selected_classes=target_classes, is_PIL=True, is_RGB=False, transform=transforms.ToTensor())
             if train:
-                eval_data = FIRSTGalaxyData(root="./", selected_split="valid", input_data_list=[f"galaxy_data_crossvalid_{fold}_h5.h5"],
+                eval_data = FIRSTGalaxyData(root="./.cache", selected_split="valid", input_data_list=[f"galaxy_data_crossvalid_{fold}_h5.h5"],
                                             selected_classes=target_classes, is_PIL=True, is_RGB=False, transform=transforms.ToTensor())
             else:
-                eval_data = FIRSTGalaxyData(root="./", selected_split="test", input_data_list=["galaxy_data_crossvalid_test_h5.h5"],
+                eval_data = FIRSTGalaxyData(root="./.cache", selected_split="test", input_data_list=["galaxy_data_crossvalid_test_h5.h5"],
                                             selected_classes=target_classes, is_PIL=True, is_RGB=False, transform=transforms.ToTensor()) # Smaller sample of test data
 
             
@@ -993,8 +993,8 @@ def load_FIRST(path=None, fold=0, target_classes=None, img_shape=(1, 300, 300), 
             #plot_cut_flow_for_all_filters(train_images, train_labels, save_path_prefix="./generator/filtering/")
             #train_images, train_labels = remove_outliers(train_images, train_labels, PLOTFILTERED=True)
             #eval_images, eval_labels = remove_outliers(eval_images, eval_labels, v="validation")
-            train_images, train_labels = filter_away_faintest(train_images, train_labels, threshold=0.5, save_path="./generator/filtering/faintest_train.png")
-            eval_images, eval_labels = filter_away_faintest(eval_images, eval_labels, threshold=0.5, save_path="./generator/filtering/faintest_eval.png")
+            train_images, train_labels = filter_away_faintest(train_images, train_labels, threshold=0.1, save_path="./generator/filtering/faintest_train.png")
+            eval_images, eval_labels = filter_away_faintest(eval_images, eval_labels, threshold=0.1, save_path="./generator/filtering/faintest_eval.png")
 
                 
         # Limit by sample size

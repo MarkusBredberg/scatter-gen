@@ -39,7 +39,7 @@ galaxy_classes = [10, 11, 12, 13]  # Classes to classify
 max_num_galaxies = 100000  # Upper limit for the all-classes combined training data before classical augmentation
 dataset_portions = [1]  # Portions of complete dataset for the accuracy vs dataset size
 J, L, order = 2, 12, 2  # Scatter transform parameters
-classifier = ["ProjectModel", "Rustige", "ScatterNet", "ScatterDual"][1]  # Choose one classifier model model
+classifier = ["ProjectModel", "Rustige", "ScatterNet", "ScatterDual"][3]  # Choose one classifier model model
 gen_model_names = ['GAN'] #['GAN', 'Dual', 'CNN', 'STMLP', 'lavgSTMLP', 'ldiffSTMLP'] # Specify the generative model_name
 num_epochs_cuda = 200
 num_epochs_cpu = 100
@@ -187,6 +187,25 @@ def compute_scattering_coeffs(images, scattering=scattering, batch_size=128, dev
                 batch_scat = batch_scat.squeeze(1)  # becomes [B, C, H, W]
             scat_coeffs_list.append(batch_scat.cpu())
         scat_coeffs = torch.cat(scat_coeffs_list, dim=0)
+    return scat_coeffs
+
+
+def cache_scattering(images, scattering, cache_path, batch_size=128, device='cpu'):
+    if os.path.exists(cache_path):
+        print("Loading cached scattering coefficients from", cache_path)
+        scat_coeffs = torch.load(cache_path)
+    else:
+        print("Computing scattering coefficients and caching to", cache_path)
+        scat_coeffs_list = []
+        with torch.no_grad():
+            for i in range(0, len(images), batch_size):
+                batch = images[i:i + batch_size].to(device)
+                batch_scat = scattering(batch).detach()
+                if batch_scat.shape[1] == 1:
+                    batch_scat = batch_scat.squeeze(1)
+                scat_coeffs_list.append(batch_scat.cpu())
+        scat_coeffs = torch.cat(scat_coeffs_list, dim=0)
+        torch.save(scat_coeffs, cache_path)
     return scat_coeffs
 
 def custom_collate(batch):
@@ -357,10 +376,8 @@ for gen_model_name in gen_model_names:
                     with torch.no_grad():
                         generated_batch = generate_from_noise(
                             model,
-                            train_labels=generated_labels,
                             latent_dim=latent_dim,
                             num_samples=current_batch,
-                            num_classes=4,  # Set to the actual number of classes
                             DEVICE='cpu')
                     # Ensure the batch dimension is first:
                     if generated_batch.shape[0] != current_batch:
@@ -398,8 +415,6 @@ for gen_model_name in gen_model_names:
             ###### RELABEL ######
             min_label = test_labels.min()
             test_labels = test_labels - min_label
-            test_labels = torch.nn.functional.one_hot(test_labels, num_classes=num_classes).float()
-            test_labels = test_labels.view(-1, num_classes)
 
             # Prepare input data
             mock_tensor = torch.zeros_like(test_images)
@@ -489,9 +504,7 @@ for gen_model_name in gen_model_names:
                             model,
                             latent_dim=latent_dim,
                             num_samples=current_batch,
-                            DEVICE='cpu'
-                        )
-
+                            DEVICE='cpu')
                     # Ensure the tensor is [batch_size, channels, H, W]
                     if generated_batch.shape[0] != current_batch:
                         generated_batch = generated_batch.permute(1, 0, 2, 3)
@@ -569,6 +582,11 @@ for gen_model_name in gen_model_names:
                         num_images=36,
                         save_path=f"./classifier/{gen_model_name}_{cls}_{num_galaxies}_generated_grid.png"
                     )
+                    # Select train images with a particular class
+                    train_images_cls = train_images[train_labels == (cls - min(galaxy_classes))]
+                    # Select the first 36 images
+                    train_images_cls = train_images_cls[:36]
+                    # Plot the images
                     plot_image_grid(
                         train_images,
                         num_images=36,
@@ -608,20 +626,7 @@ for gen_model_name in gen_model_names:
                         pristine_train_images = normalize_to_minus1_1(pristine_train_images)
                         generated_images = normalize_to_minus1_1(generated_images)
 
-        if classifier in ['ScatterNet', 'ScatterDual']:
-            if NORMALISESCS:
-                train_scat_coeffs = normalize_to_0_1(train_scat_coeffs)
-                valid_scat_coeffs = normalize_to_0_1(valid_scat_coeffs)
-                if NORMALISESCSTOPM:
-                    train_scat_coeffs = normalize_to_minus1_1(train_scat_coeffs)
-                    valid_scat_coeffs = normalize_to_minus1_1(valid_scat_coeffs)
 
-        if IMGCHECK and lambda_generate not in [0, 8]: 
-            if classifier in ['ProjectModel', 'Rustige', 'ScatterDual']:
-                #save_images_tensorboard(generated_images[:36], save_path=f"./classifier/{gen_model_name}_{galaxy_classes}_{num_galaxies}_generated.png", nrow=6)
-                plot_histograms(pristine_train_images, valid_images, title1="Train images", title2="Valid images", imgs3=generated_images, imgs4=test_images, title3='Generated images', title4='Test images', save_path=f"./classifier/{gen_model_name}_{galaxy_classes}_{num_galaxies}_histograms.png")
-
-        
         ###### RELABEL ######
         min_label = train_labels.min()
         train_labels = train_labels - min_label
@@ -631,8 +636,22 @@ for gen_model_name in gen_model_names:
         mock_tensor = torch.zeros_like(train_images)
         valid_mock_tensor = torch.zeros_like(valid_images)
         if classifier in ['ScatterNet', 'ScatterDual']:
-            train_scat_coeffs = compute_scattering_coeffs(train_images)
-            valid_scat_coeffs = compute_scattering_coeffs(valid_images)
+            
+            train_cache = f"./.cache/train_scat_{galaxy_classes}_{fold}_{lambda_generate}_{dataset_portions[0]}_{FILTERED}_{num_galaxies}.pt"
+            valid_cache = f"./.cache/valid_scat_{galaxy_classes}_{fold}_{lambda_generate}_{dataset_portions[0]}_{FILTERED}_{num_galaxies}.pt"
+
+            train_scat_coeffs = cache_scattering(train_images, scattering, train_cache, batch_size=128, device="cpu")
+            valid_scat_coeffs = cache_scattering(valid_images, scattering, valid_cache, batch_size=128, device="cpu")
+            
+            if NORMALISESCS:
+                train_scat_coeffs = normalize_to_0_1(train_scat_coeffs)
+                valid_scat_coeffs = normalize_to_0_1(valid_scat_coeffs)
+                if NORMALISESCSTOPM:
+                    train_scat_coeffs = normalize_to_minus1_1(train_scat_coeffs)
+                    valid_scat_coeffs = normalize_to_minus1_1(valid_scat_coeffs)
+            
+            #train_scat_coeffs = compute_scattering_coeffs(train_images)
+            #valid_scat_coeffs = compute_scattering_coeffs(valid_images)
             scatdim = train_scat_coeffs[0].shape
         if classifier == "ScatterNet":
             print("Shape of mock_tensor: ", mock_tensor.shape)
@@ -658,7 +677,12 @@ for gen_model_name in gen_model_names:
         
         print(f"Train dataset size: {len(train_dataset)}, Validation dataset size: {len(valid_dataset)}")
 
+        if IMGCHECK and lambda_generate not in [0, 8]: 
+            if classifier in ['ProjectModel', 'Rustige', 'ScatterDual']:
+                #save_images_tensorboard(generated_images[:36], save_path=f"./classifier/{gen_model_name}_{galaxy_classes}_{num_galaxies}_generated.png", nrow=6)
+                plot_histograms(pristine_train_images, valid_images, title1="Train images", title2="Valid images", imgs3=generated_images, imgs4=test_images, title3='Generated images', title4='Test images', save_path=f"./classifier/{gen_model_name}_{galaxy_classes}_{num_galaxies}_histograms.png")
 
+        
                 
         ###############################################
         ############# DEFINE MODEL ####################
@@ -796,6 +820,7 @@ for gen_model_name in gen_model_names:
                                 outputs = model(images)
                             pred_probs = torch.softmax(outputs, dim=1).cpu().numpy()
                             true_labels = labels.cpu().numpy()
+                            #true_labels = torch.argmax(labels, dim=1).cpu().numpy()
                             pred_labels = np.argmax(pred_probs, axis=1)
                             all_pred_probs[key].extend(pred_probs)
                             all_pred_labels[key].extend(pred_labels)

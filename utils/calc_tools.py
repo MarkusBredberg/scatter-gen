@@ -1,13 +1,124 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import random
+from lpips import LPIPS
 import numpy as np
 from sklearn.cluster import KMeans
 from sklearn.metrics import pairwise_distances
 from scipy.ndimage import label
 from utils.models import get_model
 from sklearn.metrics import mean_squared_error
+from torchvision.models import inception_v3
+from scipy import linalg
 
+
+#################################
+###### METRICS FUNCTIONS ########
+#################################
+
+
+def calculate_rmae(real, gen):
+    return np.mean(np.abs(real - gen) / (np.abs(real) + np.abs(gen) + 1e-10), axis=None)
+
+def bhattacharyya_coefficient(data1, data2, bins=50):
+    hist1, bin_edges = np.histogram(data1, bins=bins, density=True)
+    hist2, _ = np.histogram(data2, bins=bin_edges, density=True)
+    # Normalize the histograms so they sum to 1
+    hist1 = hist1 / np.sum(hist1)
+    hist2 = hist2 / np.sum(hist2)
+    return np.sum(np.sqrt(hist1 * hist2))
+
+def total_variation_distance(data1, data2, bins=50):
+    hist1, bin_edges = np.histogram(data1, bins=bins, density=True)
+    hist2, _ = np.histogram(data2, bins=bin_edges, density=True)
+    # Normalize the histograms so they sum to 1
+    hist1 = hist1 / np.sum(hist1)
+    hist2 = hist2 / np.sum(hist2)
+    return 0.5 * np.sum(np.abs(hist1 - hist2))
+
+def histogram_intersection(data1, data2, bins=50):
+    hist1, bin_edges = np.histogram(data1, bins=bins, density=True)
+    hist2, _ = np.histogram(data2, bins=bin_edges, density=True)
+    # Normalize the histograms so they sum to 1
+    hist1 = hist1 / np.sum(hist1)
+    hist2 = hist2 / np.sum(hist2)
+    return np.sum(np.minimum(hist1, hist2))
+
+def calculate_lpips_diversity(images, model_name='alex', device='cpu'):
+    loss_fn = LPIPS(net=model_name).to(device)
+    indices = random.sample(range(len(images)), k=min(100, len(images)))  # sample 100 images
+    pairs = [(i, j) for i in indices for j in indices if i < j]
+    total_score = 0.0
+    for i, j in pairs[:200]:  # compute on at most 200 pairs for speed
+        d = loss_fn(images[i].unsqueeze(0).to(device), images[j].unsqueeze(0).to(device))
+        total_score += d.item()
+    return total_score / len(pairs[:200])
+
+def calculate_cmmd(real_images, gen_images, sigma=1.0):
+    # Flatten images to vectors
+    real = real_images.view(real_images.size(0), -1)
+    gen = gen_images.view(gen_images.size(0), -1)
+    
+    def gaussian_kernel(x, y, sigma):
+        diff = x.unsqueeze(1) - y.unsqueeze(0)  # (n, m, d)
+        dist_sq = (diff ** 2).sum(dim=2)
+        return torch.exp(-dist_sq / (2 * sigma**2))
+    
+    K_xx = gaussian_kernel(real, real, sigma)
+    K_yy = gaussian_kernel(gen, gen, sigma)
+    K_xy = gaussian_kernel(real, gen, sigma)
+    
+    n = real.size(0)
+    m = gen.size(0)
+    # Exclude diagonal for same-set kernel sums
+    sum_K_xx = K_xx.sum() - torch.diag(K_xx).sum()
+    sum_K_yy = K_yy.sum() - torch.diag(K_yy).sum()
+    
+    mmd = sum_K_xx / (n * (n - 1)) + sum_K_yy / (m * (m - 1)) - 2 * K_xy.mean()
+    return mmd.item()
+
+
+def get_inception_features(images, model, batch_size=32, device='cpu'):
+    model.eval()
+    n_images = images.shape[0]
+    activations = []
+    with torch.no_grad():
+        for i in range(0, n_images, batch_size):
+            batch = images[i:i+batch_size]
+            # Resize to 299x299 and convert to 3 channels if needed
+            batch = F.interpolate(batch, size=(299,299), mode='bilinear', align_corners=False)
+            if batch.shape[1] == 1:
+                batch = batch.repeat(1, 3, 1, 1)
+            # Convert from [-1,1] to [0,1]
+            batch = (batch + 1) / 2
+            batch = batch.to(device)
+            pred = model(batch)
+            # If output is 2D (logits), use as is; if 4D, pool to get a flat vector.
+            if len(pred.shape) == 2:
+                features = pred
+            else:
+                if pred.shape[2] != 1 or pred.shape[3] != 1:
+                    pred = F.adaptive_avg_pool2d(pred, output_size=(1,1))
+                features = pred.view(batch.size(0), -1)
+            activations.append(features.cpu().numpy())
+    return np.concatenate(activations, axis=0)
+
+def calculate_fid(real_images, gen_images, device='cpu'):
+    inception = inception_v3(pretrained=True, transform_input=False).to(device)
+    inception.eval()
+    real_act = get_inception_features(real_images, inception, device=device)
+    gen_act = get_inception_features(gen_images, inception, device=device)
+    mu_real = np.mean(real_act, axis=0)
+    mu_gen = np.mean(gen_act, axis=0)
+    sigma_real = np.cov(real_act, rowvar=False)
+    sigma_gen = np.cov(gen_act, rowvar=False)
+    diff = mu_real - mu_gen
+    covmean, _ = linalg.sqrtm(sigma_real.dot(sigma_gen), disp=False)
+    if np.iscomplexobj(covmean):
+        covmean = covmean.real
+    fid = diff.dot(diff) + np.trace(sigma_real + sigma_gen - 2 * covmean)
+    return fid
 
 
 def cluster_metrics(features, n_clusters=13):
@@ -38,6 +149,27 @@ def cluster_metrics(features, n_clusters=13):
     cluster_std_dev = np.std(distances)
     
     return cluster_error, cluster_distance, cluster_std_dev
+
+###############################################
+###### IMAGE PROCESSING FUNCTIONS #############
+###############################################
+
+def change_images(images):
+    # Apply random flipping 
+    if np.random.rand() > 0.5:
+        images = images.flip(3)  # Flip horizontally
+    if np.random.rand() > 0.5:
+        images = images.flip(2)  # Flip vertically
+    
+    # Apply random rotation 90, 180, 270 degrees
+    if np.random.rand() > 0.5:
+        images = torch.rot90(images, 1, [2, 3])  # Rotate 90 degrees
+    if np.random.rand() > 0.5:
+        images = torch.rot90(images, 2, [2, 3])  # Rotate 180 degrees
+    if np.random.rand() > 0.5:
+        images = torch.rot90(images, 3, [2, 3])  # Rotate 270 degrees
+    return images
+
 
 def normalize_to_0_1(images, batch_size=64):
     normed_images = torch.zeros_like(images)  # Placeholder for the normalized images
@@ -162,6 +294,11 @@ def get_main_and_secondary_peaks_with_locations(images, threshold=0.1):
     return peak_info_all
 
 
+#################################################
+##### MODEL AND DATA LOADING FUNCTIONS ##########
+#################################################
+
+
 def get_model_name(galaxy_classes, num_galaxies, encoder, fold):
     if isinstance(galaxy_classes, int):
         runname = f'{galaxy_classes}_{num_galaxies}_{encoder}_{fold}'
@@ -193,6 +330,16 @@ def load_model(path, scatshape, hidden_dim1=256, hidden_dim2=128, latent_dim=64,
     model.load_state_dict(adapted_state_dict, strict=False)
     model.to(DEVICE)
     return model
+
+def get_model_directory(galaxy_classes=11, num_galaxies=1001028, encoder='Dual', fold=0):
+    if isinstance(galaxy_classes, int):
+        runname = f'{galaxy_classes}_{num_galaxies}_{encoder}_{fold}'
+        return f'./generator/VAE_{runname}/model.pth'
+        #return f'./generator/model_{runname}.pth'
+    else:
+        galaxy_classes_str = ", ".join(map(str, galaxy_classes))
+        runname = f'[{galaxy_classes_str}]_{num_galaxies}_{encoder}_{fold}'
+        return f'./generator/VAE_{runname}/model.pth'
 
 
 def generate_from_noise(model, img_shape=(1, 128, 128), latent_dim=128,
@@ -226,15 +373,7 @@ def generate_from_noise(model, img_shape=(1, 128, 128), latent_dim=128,
         return generated_images
  
 
-def get_model_directory(galaxy_classes=11, num_galaxies=1001028, encoder='Dual', fold=0):
-    if isinstance(galaxy_classes, int):
-        runname = f'{galaxy_classes}_{num_galaxies}_{encoder}_{fold}'
-        return f'./generator/VAE_{runname}/model.pth'
-        #return f'./generator/model_{runname}.pth'
-    else:
-        galaxy_classes_str = ", ".join(map(str, galaxy_classes))
-        runname = f'[{galaxy_classes_str}]_{num_galaxies}_{encoder}_{fold}'
-        return f'./generator/VAE_{runname}/model.pth'
+
             
 def find_most_similar_images(real_images, generated_images):
     most_similar_images = []
@@ -279,5 +418,3 @@ def compute_radial_intensity(images, img_shape):
     radial_intensity /= radial_counts
     return radial_intensity
 
-def calculate_rmae(real, gen):
-    return np.mean(np.abs(real - gen) / (np.abs(real) + np.abs(gen) + 1e-10), axis=None)

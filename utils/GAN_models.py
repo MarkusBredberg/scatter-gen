@@ -4,6 +4,199 @@ import torch.nn.functional as F
 import torch.nn.utils.spectral_norm as spectral_norm
 
 
+def load_gan_generator(path, latent_dim, device='cpu'):
+    generator = DCGANGenerator(latent_dim=latent_dim)
+    state_dict = torch.load(path, map_location=device)
+    model_state = generator.state_dict()
+    filtered_state_dict = {}
+    for k, v in state_dict.items():
+        if k in model_state:
+            if model_state[k].shape == v.shape:
+                filtered_state_dict[k] = v
+            else:
+                print(f"Skipping key '{k}': checkpoint shape {v.shape} does not match model shape {model_state[k].shape}.")
+        else:
+            print(f"Skipping unexpected key '{k}' in checkpoint.")
+    # Update the model state with the filtered checkpoint values.
+    model_state.update(filtered_state_dict)
+    generator.load_state_dict(model_state)
+    return generator
+
+
+class DCGANGenerator(nn.Module):
+    def __init__(self, latent_dim=128, ngf=64, nc=1):
+        super().__init__()
+        self.main = nn.Sequential(
+            # Input: (batch_size, latent_dim, 1, 1)
+            nn.ConvTranspose2d(latent_dim, ngf * 8, 4, 1, 0, bias=False),   # 4x4
+            nn.BatchNorm2d(ngf * 8),
+            nn.ReLU(True),
+
+            nn.ConvTranspose2d(ngf * 8, ngf * 4, 4, 2, 1, bias=False),        # 8x8
+            nn.BatchNorm2d(ngf * 4),
+            nn.ReLU(True),
+
+            nn.ConvTranspose2d(ngf * 4, ngf * 2, 4, 2, 1, bias=False),        # 16x16
+            nn.BatchNorm2d(ngf * 2),
+            nn.ReLU(True),
+
+            nn.ConvTranspose2d(ngf * 2, ngf, 4, 2, 1, bias=False),              # 32x32
+            nn.BatchNorm2d(ngf),
+            nn.ReLU(True),
+
+            nn.ConvTranspose2d(ngf, ngf // 2, 4, 2, 1, bias=False),             # 64x64
+            nn.BatchNorm2d(ngf // 2),
+            nn.ReLU(True),
+
+            nn.ConvTranspose2d(ngf // 2, nc, 4, 2, 1, bias=False),              # 128x128
+            nn.Tanh()  # Output in [-1, 1]
+        )
+    
+    def forward(self, x):
+        return self.main(x)
+
+
+class DCGANDiscriminator(nn.Module):
+    def __init__(self, ndf=64, nc=1):
+        """
+        Args:
+            ndf (int): Base number of discriminator feature maps.
+            nc (int): Number of channels in input images.
+        """
+        super().__init__()
+        self.main = nn.Sequential(
+            nn.Conv2d(nc, ndf, 4, 2, 1, bias=False),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            nn.Conv2d(ndf, ndf * 2, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ndf * 2),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            nn.Conv2d(ndf * 2, ndf * 4, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ndf * 4),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            nn.Conv2d(ndf * 4, ndf * 8, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ndf * 8),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            # Changed kernel size from 5 to 4 to match input dimensions.
+            nn.Conv2d(ndf * 8, 1, 4, 1, 0, bias=False)
+            # No sigmoid because we use raw logits with custom loss functions
+        )
+    
+    def forward(self, x):
+        out = self.main(x)
+        # Average over spatial dimensions
+        out = torch.mean(out, dim=[2, 3], keepdim=True)
+        return out.view(-1, 1)
+    
+    
+##########################################
+########## ADVANCED STUFF ################
+##########################################
+class DualInputDiscriminator(nn.Module):
+    def __init__(self, img_shape, scat_shape, output_dim=1, hidden_dim=128, disc_hidden_dim=384, dropout_rate=0.3, J=2):
+        super().__init__()
+        # --- Image Branch ---
+        self.cnn_encoder = nn.Sequential(
+            nn.Conv2d(img_shape[0], 32, kernel_size=5, stride=1, padding=2, bias=True),
+            nn.BatchNorm2d(32),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.BatchNorm2d(64),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Conv2d(64, 128, kernel_size=5, stride=1, padding=2, bias=True),
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+        self.conv_to_latent_img = nn.Sequential(
+            nn.Conv2d(128, 128, kernel_size=3, stride=2, padding=1, bias=True),
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(128, 128, kernel_size=3, stride=2, padding=1, bias=True),
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(0.2, inplace=True),
+        )
+
+        # --- Scattering Coefficients Branch ---
+        def conv_block(in_channels, out_channels, kernel_size=3, stride=1, padding=1):
+            return nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, bias=True),
+                nn.BatchNorm2d(out_channels),
+                nn.LeakyReLU(0.2, inplace=True)
+            )
+        if J == 4:
+            downsample_blocks = 1
+        elif J == 3:
+            downsample_blocks = 2
+        elif J == 2:
+            downsample_blocks = 3
+        elif J == 1:
+            downsample_blocks = 4
+        else:
+            raise ValueError("Invalid value for J. Supported values are 1, 2, 3, or 4.")
+        conv_blocks = []
+        for _ in range(downsample_blocks):
+            conv_blocks.append(conv_block(hidden_dim, hidden_dim, kernel_size=3, stride=1, padding=1))
+            conv_blocks.append(conv_block(hidden_dim, hidden_dim, kernel_size=3, stride=2, padding=1))
+        self.conv_to_latent_scat = nn.Sequential(
+            conv_block(scat_shape[0], hidden_dim, kernel_size=3, stride=1, padding=1),
+            *conv_blocks
+        )
+
+        # --- Fully Connected Layers ---
+        # Use dummy inputs to determine flattened dimensions.
+        with torch.no_grad():
+            dummy_img = torch.zeros(1, *img_shape)
+            dummy_scat = torch.zeros(1, *scat_shape)
+            # Process image branch
+            img_feat = self.cnn_encoder(dummy_img)
+            img_feat = self.conv_to_latent_img(img_feat)
+            img_flat_dim = img_feat.view(1, -1).size(1)
+            # Process scattering branch and pool to a fixed size (e.g. 4x4)
+            scat_feat = self.conv_to_latent_scat(dummy_scat)
+            scat_feat = F.adaptive_avg_pool2d(scat_feat, output_size=(4, 4))
+            scat_flat_dim = scat_feat.view(1, -1).size(1)
+            combined_dim = img_flat_dim + scat_flat_dim
+
+        self.FC_input = nn.Linear(combined_dim, disc_hidden_dim, bias=True)
+        self.bn1 = nn.BatchNorm1d(disc_hidden_dim)
+        self.FC_hidden = nn.Linear(disc_hidden_dim, disc_hidden_dim // 2, bias=True)
+        self.bn2 = nn.BatchNorm1d(disc_hidden_dim // 2)
+        self.FC_out = nn.Linear(disc_hidden_dim // 2, output_dim, bias=True)
+        self.LeakyReLU = nn.LeakyReLU(0.2, inplace=True)
+        self.dropout = nn.Dropout(dropout_rate)
+
+
+    def forward(self, img, scat):
+        # Process image branch.
+        img_features = self.cnn_encoder(img)
+        img_features = self.conv_to_latent_img(img_features)
+        img_flat = img_features.view(img_features.size(0), -1)
+        
+        # Process scattering branch.
+        scat_features = self.conv_to_latent_scat(scat)
+        # Force the scattering features to a fixed spatial size (4x4)
+        scat_features = F.adaptive_avg_pool2d(scat_features, output_size=(4, 4))
+        scat_flat = scat_features.view(scat_features.size(0), -1)
+        
+        # Concatenate the flattened features.
+        combined = torch.cat([img_flat, scat_flat], dim=1)
+        h = self.FC_input(combined)
+        h = self.LeakyReLU(self.bn1(h))
+        h = self.dropout(h)
+        h = self.FC_hidden(h)
+        h = self.LeakyReLU(self.bn2(h))
+        h = self.dropout(h)
+        out = self.FC_out(h)
+        return out
+
+
+
+
+
 # ------------------------------------------------
 # Optional Self-Attention block
 # ------------------------------------------------
@@ -129,98 +322,6 @@ class GANDiscriminator(nn.Module):
         # We usually do NOT apply batchnorm in the improved discriminator,
         # but if you do, you can init it similarly.
 
-
-def load_gan_generator(path, latent_dim, device='cpu'):
-    generator = DCGANGenerator(latent_dim=latent_dim)
-    state_dict = torch.load(path, map_location=device)
-    model_state = generator.state_dict()
-    filtered_state_dict = {}
-    for k, v in state_dict.items():
-        if k in model_state:
-            if model_state[k].shape == v.shape:
-                filtered_state_dict[k] = v
-            else:
-                print(f"Skipping key '{k}': checkpoint shape {v.shape} does not match model shape {model_state[k].shape}.")
-        else:
-            print(f"Skipping unexpected key '{k}' in checkpoint.")
-    # Update the model state with the filtered checkpoint values.
-    model_state.update(filtered_state_dict)
-    generator.load_state_dict(model_state)
-    return generator
-
-
-class DCGANGenerator(nn.Module):
-    def __init__(self, latent_dim=128, ngf=64, nc=1):
-        super().__init__()
-        self.main = nn.Sequential(
-            # Input: (batch_size, latent_dim, 1, 1)
-            nn.ConvTranspose2d(latent_dim, ngf * 8, 4, 1, 0, bias=False),   # 4x4
-            nn.BatchNorm2d(ngf * 8),
-            nn.ReLU(True),
-
-            nn.ConvTranspose2d(ngf * 8, ngf * 4, 4, 2, 1, bias=False),        # 8x8
-            nn.BatchNorm2d(ngf * 4),
-            nn.ReLU(True),
-
-            nn.ConvTranspose2d(ngf * 4, ngf * 2, 4, 2, 1, bias=False),        # 16x16
-            nn.BatchNorm2d(ngf * 2),
-            nn.ReLU(True),
-
-            nn.ConvTranspose2d(ngf * 2, ngf, 4, 2, 1, bias=False),              # 32x32
-            nn.BatchNorm2d(ngf),
-            nn.ReLU(True),
-
-            nn.ConvTranspose2d(ngf, ngf // 2, 4, 2, 1, bias=False),             # 64x64
-            nn.BatchNorm2d(ngf // 2),
-            nn.ReLU(True),
-
-            nn.ConvTranspose2d(ngf // 2, nc, 4, 2, 1, bias=False),              # 128x128
-            nn.Tanh()  # Output in [-1, 1]
-        )
-    
-    def forward(self, x):
-        return self.main(x)
-
-
-class DCGANDiscriminator(nn.Module):
-    def __init__(self, ndf=64, nc=1):
-        """
-        Args:
-            ndf (int): Base number of discriminator feature maps.
-            nc (int): Number of channels in input images.
-        """
-        super().__init__()
-        self.main = nn.Sequential(
-            nn.Conv2d(nc, ndf, 4, 2, 1, bias=False),
-            nn.LeakyReLU(0.2, inplace=True),
-
-            nn.Conv2d(ndf, ndf * 2, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(ndf * 2),
-            nn.LeakyReLU(0.2, inplace=True),
-
-            nn.Conv2d(ndf * 2, ndf * 4, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(ndf * 4),
-            nn.LeakyReLU(0.2, inplace=True),
-
-            nn.Conv2d(ndf * 4, ndf * 8, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(ndf * 8),
-            nn.LeakyReLU(0.2, inplace=True),
-
-            # Changed kernel size from 5 to 4 to match input dimensions.
-            nn.Conv2d(ndf * 8, 1, 4, 1, 0, bias=False)
-            # No sigmoid because we use raw logits with custom loss functions
-        )
-    
-    def forward(self, x):
-        out = self.main(x)
-        # Average over spatial dimensions
-        out = torch.mean(out, dim=[2, 3], keepdim=True)
-        return out.view(-1, 1)
-    
-    
-##########################################
-########## ADVANCED STUFF ################
-##########################################
 
 
 class ResBlockUp(nn.Module):

@@ -1,5 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
+from torchvision.utils import make_grid, save_image
 import torch
 import os
 
@@ -7,6 +8,10 @@ import os
 ###############################################
 ########## SIMPLE PLOTS OF IMAGES #############
 ###############################################
+
+def save_images_tensorboard(images, file_path, nrow=4):
+    grid = make_grid(images, nrow=nrow, normalize=True, value_range=(-1, 1))
+    save_image(grid, file_path)
 
 def show_image(x, idx, save=True, title=None, save_path=None):
     # Assume x is a batch tensor where each item is a flattened image
@@ -258,19 +263,19 @@ def plot_histograms(
     plt.figure(figsize=(10, 6))
 
     # Convert and flatten the first two required image tensors
-    imgs1_np = imgs1.cpu().numpy().flatten()
-    imgs2_np = imgs2.cpu().numpy().flatten()
+    imgs1_np = imgs1.cpu().detach().numpy().flatten()
+    imgs2_np = imgs2.cpu().detach().numpy().flatten()
     plt.hist(imgs1_np, bins=bins, density=True, histtype='step', linewidth=2, label=title1)
     plt.hist(imgs2_np, bins=bins, density=True, histtype='step', linewidth=2, label=title2)
 
     # Optionally handle imgs3
     if imgs3 is not None:
-        imgs3_np = imgs3.cpu().numpy().flatten()
+        imgs3_np = imgs3.cpu().detach().numpy().flatten()
         plt.hist(imgs3_np, bins=bins, density=True, histtype='step', linewidth=2, label=title3)
 
     # Optionally handle imgs4
     if imgs4 is not None:
-        imgs4_np = imgs4.cpu().numpy().flatten()
+        imgs4_np = imgs4.cpu().detach().numpy().flatten()
         plt.hist(imgs4_np, bins=bins, density=True, histtype='step', linewidth=2, label=title4)
 
     # Add titles and labels
