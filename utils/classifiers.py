@@ -39,6 +39,75 @@ class ProjectModel(nn.Module):
         return x
 
 
+class NEWRustigeClassifier(nn.Module):
+    def __init__(self, input_shape, num_classes=4):
+        super(NEWRustigeClassifier, self).__init__()
+        
+        # Parse (channels, height, width) from input_shape
+        in_channels = input_shape[0]
+        height = input_shape[1]
+        width = input_shape[2]
+
+        # Convolutional block 1
+        self.conv1 = nn.Conv2d(
+            in_channels=in_channels, 
+            out_channels=8, 
+            kernel_size=3, 
+            stride=2, 
+            padding=1
+        )
+        self.ln1  = nn.LayerNorm([8, height // 2, width // 2])
+        self.act1 = nn.LeakyReLU()
+        
+        # Convolutional block 2
+        self.conv2 = nn.Conv2d(8, 16, kernel_size=3, stride=2, padding=1)
+        self.ln2  = nn.LayerNorm([16, height // 4, width // 4])
+        self.act2 = nn.LeakyReLU()
+        
+        # Convolutional block 3
+        self.conv3 = nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1)
+        self.ln3  = nn.LayerNorm([32, height // 8, width // 8])
+        self.act3 = nn.LeakyReLU()
+        
+        # Convolutional block 4
+        self.conv4 = nn.Conv2d(32, 16, kernel_size=3, stride=2, padding=1)
+        self.ln4  = nn.LayerNorm([16, height // 16, width // 16])
+        self.act4 = nn.LeakyReLU()
+        
+        # Convolutional block 5
+        self.conv5 = nn.Conv2d(16, 16, kernel_size=3, stride=2, padding=1)
+        self.ln5  = nn.LayerNorm([16, height // 32, width // 32])
+        self.act5 = nn.LeakyReLU()
+        
+        # Fully connected layers
+        self.fc1   = nn.Linear(16 * (height // 32) * (width // 32), 100)
+        self.act6  = nn.ReLU()
+        self.fc2   = nn.Linear(100, num_classes)
+        self.act7  = nn.ReLU()
+        
+        # Final softmax
+        self.softmax = nn.Softmax(dim=1)
+
+    def forward(self, x):
+        # Pass through conv blocks
+        x = self.act1(self.ln1(self.conv1(x)))
+        x = self.act2(self.ln2(self.conv2(x)))
+        x = self.act3(self.ln3(self.conv3(x)))
+        x = self.act4(self.ln4(self.conv4(x)))
+        x = self.act5(self.ln5(self.conv5(x)))
+        
+        # Flatten
+        x = x.view(x.size(0), -1)
+        
+        # Fully connected layers
+        x = self.act6(self.fc1(x))
+        x = self.act7(self.fc2(x))
+        
+        # Final softmax
+        x = self.softmax(x)
+        return x
+
+
 class RustigeClassifier(nn.Module):
     def __init__(self, input_shape, num_classes=4):
         super(RustigeClassifier, self).__init__()

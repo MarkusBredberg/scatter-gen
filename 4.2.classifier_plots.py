@@ -20,19 +20,19 @@ print("Running script 4.2")
 ################ CONFIGURATION ################
 ###############################################
 
-FILTERED = True        # Evaluation with filtered data (REMOVEOUTLIERS = True)
+FILTERED = False       # Evaluation with filtered data (REMOVEOUTLIERS = True)
 TESTONGENERATED = False # Use generated data as testdata
 
 classes = get_classes()
 galaxy_classes = [10, 11, 12, 13]
 #galaxy_classes = [31, 32, 33, 34, 35, 36]
 learning_rates = [1e-3]
-regularization_params = [1e-1]
+regularization_params = [0, 1e-1]
 lambda_values = [0, 0.25, 0.5, 1, 2, 3, 10]
 num_experiments = 1
-folds = [0, 1, 2, 3, 4]
-generators = ['GAN']
-classifier = ["ProjectModel", "Rustige", "ScatterNet", "ScatterDual"][1]  # Choose one classifier model model
+folds = [4]
+generators = ['DDPM']
+classifier = ["ProjectModel", "Rustige", "ScatterNet", "ScatterDual"][0]  # Choose one classifier model model
 
 
 
@@ -59,16 +59,15 @@ if galaxy_classes == [31, 32, 33, 34, 35, 36]:
 elif galaxy_classes == [10, 11, 12, 13]:
     if FILTERED:
         #dataset_sizes = [[3200], [3200], [3200], [3200], [3200]]
-        dataset_sizes = [[11688], [11656], [11784], [11752], [11720]] 
-
+        #dataset_sizes = [[11688], [11656], [11784], [11752], [11720]] 
+        dataset_sizes = [[12368], [12336], [12368], [12368], [12368]] 
     elif max(folds) == 5:
         dataset_sizes = [[281], [281], [281],[281], [281], [281]] # Used for faster trouble shooting
         #dataset_sizes = [[281, 2812, 14064, 28128], [281, 2812, 14064, 28128], [281, 2812, 14064, 28128], 
         #                    [281, 2812, 14064, 28128], [281, 2812, 14064, 28128], [281, 2812, 14064, 28128]] #Need length = folds[0] = 1
     else:
-        dataset_sizes = [[249, 2492, 12464, 24928], [249, 2492, 12464, 24928],
-                        [249, 2492, 12464, 24928], [249, 2492, 12464, 24928],
-                        [250, 2505, 12528, 25056]]    
+        #dataset_sizes = [[249, 2492, 12464, 24928], [249, 2492, 12464, 24928], [249, 2492, 12464, 24928], [249, 2492, 12464, 24928], 250, 2505, 12528, 25056]]    
+        dataset_sizes = [[12464], [12464], [12464], [12464], [12528]]
 
 if 'GAN' in generators:
     latent_dim = 64 
@@ -226,7 +225,7 @@ def plot_accuracy_vs_lambda(lambda_values, metrics, generator, dataset_sizes=dat
     plt.grid(True, linestyle='--', alpha=0.5)
     plt.tight_layout()
     
-    plot_path = f'{save_dir}/{galaxy_classes}_{classifier}_all_{max(dataset_sizes[-1])}__{lr}_{reg}_accuracy_vs_lambda.png'
+    plot_path = f'{save_dir}/{galaxy_classes}_{classifier}_all_{max(dataset_sizes[-1])}_{lr}_{reg}_accuracy_vs_lambda.png'
     plt.savefig(plot_path)
     plt.close()
     print(f"Saved overlayed accuracy vs. lambda plot to {plot_path}")
@@ -267,7 +266,7 @@ def plot_all_metrics_vs_dataset_size(metrics, generators, merge_map={249: "250",
                 if avg_values:
                     avg_values = np.array(avg_values)
                     std_values = np.array(std_values)
-                    plt.plot(categories, avg_values, marker='o', linestyle='-', label=labels[i])
+                    plt.plot(categories, avg_values, marker='o', linestyle='-', label=f"λ={lambda_generate}")
                     plt.fill_between(categories, avg_values - std_values, avg_values + std_values, alpha=0.2)
             plt.legend(title='Lambda Values', fontsize=12, loc='best')
             plt.title(f'{title} vs Dataset Size ({generator})', fontsize=16)
@@ -275,7 +274,7 @@ def plot_all_metrics_vs_dataset_size(metrics, generators, merge_map={249: "250",
             plt.ylabel(title, fontsize=14)
             plt.grid(True, linestyle='--', alpha=0.5)
             plt.tight_layout()
-            plot_path = f'{save_dir}/{galaxy_classes}_{classifier}_{generator}_{max(dataset_sizes[-1])}_{metric}_vs_dataset_size.png'
+            plot_path = f'{save_dir}/{galaxy_classes}_{classifier}_{generator}_{max(merge_map)}_{lr}_{reg}_{metric}_vs_dataset_size.png'
             plt.savefig(plot_path)
             plt.close()
 

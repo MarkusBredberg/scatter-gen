@@ -287,6 +287,26 @@ def plot_histograms(
 
     plt.savefig(save_path)
     plt.close()
+    
+    
+def plot_variance_histograms(gen_images, real_images, save_path):
+    """
+    Compute per-image variance (over pixels) for generated and real images,
+    and plot histograms comparing the two distributions.
+    """
+    # Flatten each image and compute variance over the pixels.
+    gen_variances = gen_images.view(gen_images.size(0), -1).var(dim=1).detach().cpu().numpy()
+    real_variances = real_images.view(real_images.size(0), -1).var(dim=1).detach().cpu().numpy()
+    
+    plt.figure()
+    plt.hist(gen_variances, bins=30, alpha=0.5, label="Generated Image Variance")
+    plt.hist(real_variances, bins=30, alpha=0.5, label="Real Image Variance")
+    plt.xlabel("Variance")
+    plt.ylabel("Frequency")
+    plt.title("Histogram of Image Variances")
+    plt.legend()
+    plt.savefig(save_path)
+    plt.close()
 
 
 def show_two_rows(src_images, gen_images, title, savepath=None):
@@ -577,31 +597,6 @@ def vae_multmod(old_images, generated_images, model_names, save=False, save_path
     plt.savefig(save_path, bbox_inches='tight', pad_inches=0) if save else plt.show()
     plt.close()
 
-
-
-###############################################
-################ TOOL PLOTS ##################
-###############################################
-
-def plot_histogram(image1, image2=None, bins=30, alpha=0.7):
-    
-    train_pixels = image1.flatten()
-    test_pixels = image2.flatten()
-
-    fig, axs = plt.subplots(1, 2, figsize=(14, 5), sharey=True)
-
-    axs[0].hist(train_pixels, bins=30, color='blue', alpha=0.7)
-    axs[0].set_title('Histogram of Normalized Training Image Pixels')
-    axs[0].set_xlabel('Pixel Intensity')
-    axs[0].set_ylabel('Frequency')
-    axs[0].set_yscale('log')
-
-    axs[1].hist(test_pixels, bins=30, color='red', alpha=0.7)
-    axs[1].set_title('Histogram of Normalized Test Image Pixels')
-    axs[1].set_xlabel('Pixel Intensity')
-
-    plt.tight_layout()
-    plt.show()
 
 ###############################################
 ################ LOSS PLOTS ##################

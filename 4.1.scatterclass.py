@@ -2,15 +2,14 @@ import numpy as np
 import torch
 import time
 import torch.nn as nn
-from torch.utils.data import TensorDataset, DataLoader, Subset
+from torch.utils.data import TensorDataset, DataLoader, Subset, Dataset
 from torchsummary import summary
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, roc_curve, auc
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score 
 from utils.data_loader import load_galaxies, get_classes, augment_images
 from utils.classifiers import RustigeClassifier, ProjectModel, MLPClassifier, DualClassifier
 from utils.training_tools import EarlyStopping, reset_weights
-from utils.scatter_reduction import lavg, ldiff
 from utils.calc_tools import normalize_to_0_1, normalize_to_minus1_1, cluster_metrics, get_model_name, generate_from_noise, load_model
-from utils.plotting import plot_images, plot_histograms, plot_images_by_class, plot_image_grid
+from utils.plotting import plot_histograms, plot_images_by_class, plot_image_grid
 from utils.GAN_models import load_gan_generator
 from torchvision.utils import make_grid, save_image
 from kymatio.torch import Scattering2D
@@ -37,19 +36,19 @@ classes = get_classes()
 #galaxy_classes = [31, 32, 33, 34, 35, 36]  # Classes to classify
 galaxy_classes = [10, 11, 12, 13]  # Classes to classify
 max_num_galaxies = 100000  # Upper limit for the all-classes combined training data before classical augmentation
-dataset_portions = [1]  # Portions of complete dataset for the accuracy vs dataset size
+dataset_portions = [0.01, 0.1, 1]  # Portions of complete dataset for the accuracy vs dataset size
 J, L, order = 2, 12, 2  # Scatter transform parameters
-classifier = ["ProjectModel", "Rustige", "ScatterNet", "ScatterDual"][3]  # Choose one classifier model model
-gen_model_names = ['GAN'] #['GAN', 'Dual', 'CNN', 'STMLP', 'lavgSTMLP', 'ldiffSTMLP'] # Specify the generative model_name
+classifier = ["ProjectModel", "Rustige", "ScatterNet", "ScatterDual"][0]  # Choose one classifier model model
+gen_model_names = ['DDPM'] #['GAN', 'Dual', 'CNN', 'STMLP', 'lavgSTMLP', 'ldiffSTMLP'] # Specify the generative model_name
 num_epochs_cuda = 200
 num_epochs_cpu = 100
 batch_size = 250
 learning_rates = [1e-3]  # Learning rates
-regularization_params = [1e-1]  # Regularisation parameters
+regularization_params = [0, 1e-1]  # Regularisation parameters
 img_shape = (1, 128, 128)
 num_experiments = 1
-folds = [0, 1, 2, 3, 4] # 0-4 for 5-fold cross validation, 5 for only one training
-lambda_values = [0, 0.25, 0.5, 1, 2, 3]  # Ratio between generated images and original images per class. 8 is reserfved for TESTONGENERATED
+folds = [5] # 0-4 for 5-fold cross validation, 5 for only one training
+lambda_values = [0, 0.25, 0.5, 1]  # Ratio between generated images and original images per class. 8 is reserfved for TESTONGENERATED
 
 ES, patience = True, 10  # Use early stopping
 IMGCHECK = True  # Check the input images (Tool for control)
@@ -60,8 +59,9 @@ NORMALISESCS = False  # Normalise scattering coefficients to [0, 1]
 NORMALISESCSTOPM = False  # Normalise scattering coefficients to [-1, 1]
 USE_CLASS_WEIGHTS = True  # Set to False to disable class weights
 TESTONGENERATED = False  # Use generated data as testdata
-FILTERED = True  # Remove in training, validation and test data for the classifier
+FILTERED = False  # Remove in training, validation and test data for the classifier
 FILTERGEN = False  # Remove generated images that are too similar to other generated images
+USE_MEMMAP = False  # Use memmap for scattering coefficients
 
 # -------------------------- NEW GAN CONFIGURATION --------------------------
 gan_epoch = 500           # e.g., epoch number to load from
@@ -72,9 +72,9 @@ lr_gen = 1e-3
 lr_disc = 1e-4
 gan_adam_beta = (0.5, 0.999)
 gan_weight_decay = 0.0
-gan_label_smoothing = 0.7
-gan_lambda_div = 0.5
-gan_data_version = 'clean'
+gan_label_smoothing = 0.9
+gan_lambda_div = 0.1
+gan_data_version = ['full', 'clean'][0] 
 gan_type = ['Simple', 'Advanced'][0]
 # -------------------------------------------------------------------------
 
@@ -208,6 +208,60 @@ def cache_scattering(images, scattering, cache_path, batch_size=128, device='cpu
         torch.save(scat_coeffs, cache_path)
     return scat_coeffs
 
+
+# First, when you compute and save the scattering coefficients,
+# write them to a memmap file instead of saving a full tensor.
+def cache_scattering_memmap(images, scattering, cache_path, batch_size=128, device="cpu"):
+    num_images = len(images)
+    # Determine the shape for one sample
+    with torch.no_grad():
+        sample = scattering(images[:batch_size].to(device)).detach()
+        if sample.shape[1] == 1:
+            sample = sample.squeeze(1)
+        sample_shape = sample.shape[1:]  # e.g., (C, H, W)
+    full_shape = (num_images,) + sample_shape
+    
+    if not os.path.exists(cache_path):
+        print("Computing and writing scattering coefficients to memmap at", cache_path)
+        # Create a memmap array in write mode
+        memmap_array = np.memmap(cache_path, dtype=np.float32, mode='w+', shape=full_shape)
+        with torch.no_grad():
+            for i in range(0, num_images, batch_size):
+                batch = images[i:i+batch_size].to(device)
+                batch_scat = scattering(batch).detach()
+                if batch_scat.shape[1] == 1:
+                    batch_scat = batch_scat.squeeze(1)
+                memmap_array[i:i+batch_size] = batch_scat.cpu().numpy()
+        # Flush changes to disk
+        memmap_array.flush()
+    else:
+        print("Memmap cache found at", cache_path)
+    return cache_path, full_shape
+
+# Then, create a custom dataset that loads scattering coefficients from the memmap file.
+class CachedScatterDataset(Dataset):
+    def __init__(self, images, labels, cache_file, scatter_shape):
+        self.images = images  # still in memory
+        self.labels = labels
+        self.cache_file = cache_file
+        self.scatter_shape = scatter_shape
+        # Open the memmap in read mode; this does not load everything into RAM.
+        self.scat_memmap = np.memmap(cache_file, dtype=np.float32, mode='r', shape=scatter_shape)
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        image = self.images[idx]
+        label = self.labels[idx]
+        # Only load the scattering coefficient for the current index.
+        scat = torch.tensor(self.scat_memmap[idx]).float()
+        if NORMALISESCS:
+            scat = normalize_to_0_1(scat)  # or normalize_to_minus1_1(scat)
+            if NORMALISESCSTOPM:
+                scat = normalize_to_minus1_1(scat)
+
+        return image, scat, label
 def custom_collate(batch):
     if len(batch) < 3:  # Drop the batch if it contains fewer than 3 images
         return None
@@ -350,7 +404,28 @@ for gen_model_name in gen_model_names:
                         model = load_gan_generator(gan_path, latent_dim=gan_latent_dim)
                         #print("Loaded model from gan_path: ", gan_path)
                         latent_dim = gan_latent_dim
-                    else:
+                    elif gen_model_name == 'DDPM':
+                        ddpm_file_map = {
+                            10: "generated_fr1.npy",
+                            11: "generated_fr2.npy",
+                            12: "generated_bent.npy",
+                            13: "generated_compact.npy"
+                        }
+                        ddpm_path = f"/users/mbredber/data/DDPM/{ddpm_file_map[cls]}"
+                        print(f"Loading DDPM data for class {cls} from {ddpm_path}")
+                        ddpm_data = np.load(ddpm_path)  # shape assumed (N, 128, 128)
+                        ddpm_data = torch.from_numpy(ddpm_data).unsqueeze(1).float()  # (N, 1, 128, 128)
+                        
+                        # Use as many samples as num_generate, or all if fewer exist
+                        if ddpm_data.shape[0] < num_generate:
+                            num_generate = ddpm_data.shape[0]
+                        ddpm_data = ddpm_data[:num_generate]
+                        
+                        # Append to the lists (do not overwrite!)
+                        generated_images_list.append(ddpm_data)
+                        generated_labels_list.append(torch.ones(num_generate, dtype=torch.long) * (cls - min(galaxy_classes)))
+
+                    else: # VAE
                         path = get_model_name(cls, VAE_train_size[cls], gen_model_name, fold=fold)
                         model = load_model(path, scatshape=scatshape,
                                     hidden_dim1=hidden_dim1,
@@ -364,28 +439,29 @@ for gen_model_name in gen_model_names:
                     exit(1)
                     
                 # Optionally, set the model to evaluation mode and disable gradients
-                model.eval()
-                batch_size_generate = 500  
-                num_generate = 100  # This number needs to be motivated with convergence analysis
-                num_batches = (num_generate + batch_size_generate - 1) // batch_size_generate
-                generated_images_list = []
-                generated_labels_list = []
-                for batch_idx in range(num_batches):
-                    current_batch = min(batch_size_generate, num_generate - batch_idx * batch_size_generate)
-                    generated_labels = torch.ones(current_batch, dtype=torch.long) * (cls - min(galaxy_classes))
-                    with torch.no_grad():
-                        generated_batch = generate_from_noise(
-                            model,
-                            latent_dim=latent_dim,
-                            num_samples=current_batch,
-                            DEVICE='cpu')
-                    # Ensure the batch dimension is first:
-                    if generated_batch.shape[0] != current_batch:
-                        generated_batch = generated_batch.permute(1, 0, 2, 3)
-                    generated_batch = generated_batch.to(train_images.device)
-                    generated_labels = generated_labels.to(train_labels.device)
-                    generated_images_list.append(generated_batch)
-                    generated_labels_list.append(generated_labels)
+                if gen_model_name != 'DDPM':
+                    model.eval()
+                    batch_size_generate = 500  
+                    num_generate = 100  # This number needs to be motivated with convergence analysis
+                    num_batches = (num_generate + batch_size_generate - 1) // batch_size_generate
+                    generated_images_list = []
+                    generated_labels_list = []
+                    for batch_idx in range(num_batches):
+                        current_batch = min(batch_size_generate, num_generate - batch_idx * batch_size_generate)
+                        generated_labels = torch.ones(current_batch, dtype=torch.long) * (cls - min(galaxy_classes))
+                        with torch.no_grad():
+                            generated_batch = generate_from_noise(
+                                model,
+                                latent_dim=latent_dim,
+                                num_samples=current_batch,
+                                DEVICE='cpu')
+                        # Ensure the batch dimension is first:
+                        if generated_batch.shape[0] != current_batch:
+                            generated_batch = generated_batch.permute(1, 0, 2, 3)
+                        generated_batch = generated_batch.to(train_images.device)
+                        generated_labels = generated_labels.to(train_labels.device)
+                        generated_images_list.append(generated_batch)
+                        generated_labels_list.append(generated_labels)
                 all_test_images.append(torch.cat(generated_images_list, dim=0))
                 all_test_labels.append(torch.cat(generated_labels_list, dim=0))
             test_images = torch.cat(all_test_images, dim=0)
@@ -474,6 +550,29 @@ for gen_model_name in gen_model_names:
                         gan_path = f"./GAN/generators/generator_{gan_type}_latent{gan_latent_dim}_cl{cls}_lrgen{lr_gen}_lrdisc{lr_disc}_gl{gan_gen_loss}_dl{gan_disc_loss}_ab{gan_adam_beta}_wd{gan_weight_decay}_ls{gan_label_smoothing}_ld{gan_lambda_div}_dv{gan_data_version}_ep{gan_epoch}_f{gan_fold}.pth"
                         model = load_gan_generator(gan_path, latent_dim=gan_latent_dim)
                         latent_dim = gan_latent_dim
+                    elif gen_model_name == 'DDPM':
+                        # Map numeric class IDs to the correct DDPM .npy file
+                        ddpm_file_map = {
+                            10: "generated_fr1.npy",
+                            11: "generated_fr2.npy",
+                            12: "generated_bent.npy",
+                            13: "generated_compact.npy"
+                        }
+                        ddpm_path = f"/users/mbredber/data/DDPM/{ddpm_file_map[cls]}"
+                        print(f"Loading DDPM data for class {cls} from {ddpm_path}")
+                        ddpm_data = np.load(ddpm_path)  # shape assumed (N, 128, 128)
+                        ddpm_data = torch.from_numpy(ddpm_data).unsqueeze(1).float()  # (N,1,128,128)
+
+                        # Use as many samples as num_generate, or all if fewer exist
+                        if ddpm_data.shape[0] < num_generate:
+                            num_generate = ddpm_data.shape[0]
+                        else:
+                            print(f"Warning: Only {ddpm_data.shape[0]} samples available for class {cls}.")
+                        ddpm_data = ddpm_data[:num_generate]
+
+                        generated_batch = ddpm_data
+                        generated_labels = torch.ones(num_generate, dtype=torch.long) * (cls - min(galaxy_classes))
+                
                     else:
                         path = get_model_name(cls, VAE_train_size[cls], gen_model_name, fold=fold)
                         model = load_model(path, scatshape=scatshape,
@@ -486,93 +585,98 @@ for gen_model_name in gen_model_names:
                     print(f"Model not found for class: {cls}. Error: {e}")
                     exit(1)
 
-                model.eval()
-                num_batches = (num_generate + batch_size_generate - 1) // batch_size_generate
-                total_generated = 0
-                total_unique = 0
-                generated_images_list = []
-                generated_labels_list = []
-                tol = 1e-3  # Tolerance for duplicate comparison
+                if gen_model_name != 'DDPM':
+                    model.eval()
+                    num_batches = (num_generate + batch_size_generate - 1) // batch_size_generate
+                    total_generated = 0
+                    total_unique = 0
+                    generated_images_list = []
+                    generated_labels_list = []
+                    tol = 1e-3  # Tolerance for duplicate comparison
 
-                for batch_idx in range(num_batches):
-                    current_batch = min(batch_size_generate, num_generate - batch_idx * batch_size_generate)
-                    total_generated += current_batch
+                    for batch_idx in range(num_batches):
+                        current_batch = min(batch_size_generate, num_generate - batch_idx * batch_size_generate)
+                        total_generated += current_batch
 
-                    generated_labels = torch.ones(current_batch, dtype=torch.long) * (cls - min(galaxy_classes))
-                    with torch.no_grad():
-                        generated_batch = generate_from_noise(
-                            model,
-                            latent_dim=latent_dim,
-                            num_samples=current_batch,
-                            DEVICE='cpu')
-                    # Ensure the tensor is [batch_size, channels, H, W]
-                    if generated_batch.shape[0] != current_batch:
-                        generated_batch = generated_batch.permute(1, 0, 2, 3)
+                        generated_labels = torch.ones(current_batch, dtype=torch.long) * (cls - min(galaxy_classes))
+                        with torch.no_grad():
+                            generated_batch = generate_from_noise(
+                                model,
+                                latent_dim=latent_dim,
+                                num_samples=current_batch,
+                                DEVICE='cpu')
+                        # Ensure the tensor is [batch_size, channels, H, W]
+                        if generated_batch.shape[0] != current_batch:
+                            generated_batch = generated_batch.permute(1, 0, 2, 3)
 
-                    if FILTERGEN and cls != 12:
-                        # --------------------------
-                        # (1) Remove duplicates *within* the new batch
-                        # --------------------------
-                        flat = generated_batch.view(current_batch, -1)  # flatten each image
-                        dists = torch.cdist(flat, flat, p=2)
-                        dists.fill_diagonal_(1e6)  # ignore self-comparisons
-                        unique_mask = torch.ones(current_batch, dtype=torch.bool, device=generated_batch.device)
-                        for i in range(current_batch):
-                            if unique_mask[i]:
-                                # Mark subsequent images that are too close as duplicates
-                                unique_mask[i+1:] &= ~(dists[i, i+1:] < tol)
+                        if FILTERGEN and cls != 12:
+                            # --------------------------
+                            # (1) Remove duplicates *within* the new batch
+                            # --------------------------
+                            flat = generated_batch.view(current_batch, -1)  # flatten each image
+                            dists = torch.cdist(flat, flat, p=2)
+                            dists.fill_diagonal_(1e6)  # ignore self-comparisons
+                            unique_mask = torch.ones(current_batch, dtype=torch.bool, device=generated_batch.device)
+                            for i in range(current_batch):
+                                if unique_mask[i]:
+                                    # Mark subsequent images that are too close as duplicates
+                                    unique_mask[i+1:] &= ~(dists[i, i+1:] < tol)
 
-                        batch_unique_images = generated_batch[unique_mask]
-                        batch_unique_labels = generated_labels[unique_mask]
-                        n_unique = len(batch_unique_images)
-
-                        # --------------------------
-                        # (2) Remove duplicates *across* previously accepted images
-                        # --------------------------
-                        if len(generated_images_list) > 0:
-                            # Flatten the newly filtered batch
-                            new_flat = batch_unique_images.view(n_unique, -1)
-
-                            # Flatten everything we've already accepted
-                            prev_accepted = torch.cat(generated_images_list, dim=0)  # shape: [N_accepted, C, H, W]
-                            prev_flat = prev_accepted.view(prev_accepted.size(0), -1)
-
-                            # Compare new vs. all accepted
-                            cross_dists = torch.cdist(new_flat, prev_flat, p=2)
-                            cross_unique_mask = torch.ones(n_unique, dtype=torch.bool, device=batch_unique_images.device)
-                            for i in range(n_unique):
-                                # If the new image is within tol of *any* accepted image, exclude it
-                                if torch.any(cross_dists[i] < tol):
-                                    cross_unique_mask[i] = False
-
-                            batch_unique_images = batch_unique_images[cross_unique_mask]
-                            batch_unique_labels = batch_unique_labels[cross_unique_mask]
+                            batch_unique_images = generated_batch[unique_mask]
+                            batch_unique_labels = generated_labels[unique_mask]
                             n_unique = len(batch_unique_images)
 
-                        # Now everything in batch_unique_* is unique vs. each other & prior batches
-                        total_unique += n_unique
+                            # --------------------------
+                            # (2) Remove duplicates *across* previously accepted images
+                            # --------------------------
+                            if len(generated_images_list) > 0:
+                                # Flatten the newly filtered batch
+                                new_flat = batch_unique_images.view(n_unique, -1)
+
+                                # Flatten everything we've already accepted
+                                prev_accepted = torch.cat(generated_images_list, dim=0)  # shape: [N_accepted, C, H, W]
+                                prev_flat = prev_accepted.view(prev_accepted.size(0), -1)
+
+                                # Compare new vs. all accepted
+                                cross_dists = torch.cdist(new_flat, prev_flat, p=2)
+                                cross_unique_mask = torch.ones(n_unique, dtype=torch.bool, device=batch_unique_images.device)
+                                for i in range(n_unique):
+                                    # If the new image is within tol of *any* accepted image, exclude it
+                                    if torch.any(cross_dists[i] < tol):
+                                        cross_unique_mask[i] = False
+
+                                batch_unique_images = batch_unique_images[cross_unique_mask]
+                                batch_unique_labels = batch_unique_labels[cross_unique_mask]
+                                n_unique = len(batch_unique_images)
+
+                            # Now everything in batch_unique_* is unique vs. each other & prior batches
+                            total_unique += n_unique
+                            
+                            # --------------------------
+                            # (3) Augment the unique images
+                            # --------------------------
+                            
+                            print("Shape of batch_unique_images: ", batch_unique_images.shape)
+                            batch_augmented_images, batch_augmented_labels = augment_images(batch_unique_images, batch_unique_labels, img_shape=img_shape) # Produces 8 versions of each image
+                            generated_images_list.append(batch_augmented_images)
+                            generated_labels_list.append(batch_augmented_labels)
+
+                        else:
+                            # If we're not filtering (or if cls == 12), just accept them all
+                            #batch_augmented_images, batch_augmented_labels = augment_images(batch_unique_images, batch_unique_labels, img_shape=img_shape) # Produces 8 versions of each image
+                            generated_images_list.append(generated_batch)
+                            generated_labels_list.append(generated_labels)
+
+                    # After all batches:
+                    if FILTERGEN and cls != 12:
+                        removal_fraction = (total_generated - total_unique) / total_generated * 100
+                        print(f"Class {cls}: Removed {removal_fraction:.2f}% of images "
+                            f"(Generated: {total_generated}, Unique: {total_unique})")
                         
-                        # --------------------------
-                        # (3) Augment the unique images
-                        # --------------------------
-                        
-                        print("Shape of batch_unique_images: ", batch_unique_images.shape)
-                        batch_augmented_images, batch_augmented_labels = augment_images(batch_unique_images, batch_unique_labels, img_shape=img_shape) # Produces 8 versions of each image
-                        generated_images_list.append(batch_augmented_images)
-                        generated_labels_list.append(batch_augmented_labels)
-
-                    else:
-                        # If we're not filtering (or if cls == 12), just accept them all
-                        #batch_augmented_images, batch_augmented_labels = augment_images(batch_unique_images, batch_unique_labels, img_shape=img_shape) # Produces 8 versions of each image
-                        generated_images_list.append(generated_batch)
-                        generated_labels_list.append(generated_labels)
-
-                # After all batches:
-                if FILTERGEN and cls != 12:
-                    removal_fraction = (total_generated - total_unique) / total_generated * 100
-                    print(f"Class {cls}: Removed {removal_fraction:.2f}% of images "
-                        f"(Generated: {total_generated}, Unique: {total_unique})")
-
+                else:
+                    # For DDPM, we don't need to filter duplicates
+                    generated_images_list = [ddpm_data]
+                    generated_labels_list = [generated_labels]
                 generated_images = torch.cat(generated_images_list, dim=0)
                 generated_labels = torch.cat(generated_labels_list, dim=0)
 
@@ -580,30 +684,29 @@ for gen_model_name in gen_model_names:
                     plot_image_grid(
                         generated_images,
                         num_images=36,
-                        save_path=f"./classifier/{gen_model_name}_{cls}_{num_galaxies}_generated_grid.png"
+                        save_path=f"./classifier/{classifier}_{gen_model_name}_{cls}_{num_galaxies}_f{fold}_generated_grid.png"
                     )
                     # Select train images with a particular class
                     train_images_cls = train_images[train_labels == (cls - min(galaxy_classes))]
-                    # Select the first 36 images
                     train_images_cls = train_images_cls[:36]
-                    # Plot the images
                     plot_image_grid(
-                        train_images,
+                        train_images_cls,
                         num_images=36,
-                        save_path=f"./classifier/{gen_model_name}_{cls}_{num_galaxies}_train_grid.png"
+                        save_path=f"./classifier/{classifier}_{gen_model_name}_{cls}_{num_galaxies}_f{fold}_train_grid.png"
                     )
                     plot_histograms(
                         generated_images,
                         train_images,
                         title1="Generated Images",
                         title2="Train Images",
-                        save_path=f"./classifier/{gen_model_name}_{cls}_{num_galaxies}_generated_hist.png"
+                        save_path=f"./classifier/{classifier}_{gen_model_name}_{cls}_{num_galaxies}_f{fold}_generated_hist.png"
                     )
 
                 # Append the filtered images and labels to your training data:
                 
                 if IMGCHECK and lambda_generate not in [0, 8]:                 
                     pristine_train_images = train_images
+            
                 train_images = torch.cat([train_images, generated_images])
                 train_labels = torch.cat([train_labels.clone().detach(), generated_labels])
 
@@ -636,41 +739,41 @@ for gen_model_name in gen_model_names:
         mock_tensor = torch.zeros_like(train_images)
         valid_mock_tensor = torch.zeros_like(valid_images)
         if classifier in ['ScatterNet', 'ScatterDual']:
+            # Define cache paths (you can adjust these names as needed)
+            train_cache_path = f"./.cache/train_scat_{galaxy_classes}_{fold}_{lambda_generate}_{dataset_portions[0]}_{FILTERED}_{num_galaxies}.npy"
+            valid_cache_path = f"./.cache/valid_scat_{galaxy_classes}_{fold}_{lambda_generate}_{dataset_portions[0]}_{FILTERED}_{num_galaxies}.npy"
             
-            train_cache = f"./.cache/train_scat_{galaxy_classes}_{fold}_{lambda_generate}_{dataset_portions[0]}_{FILTERED}_{num_galaxies}.pt"
-            valid_cache = f"./.cache/valid_scat_{galaxy_classes}_{fold}_{lambda_generate}_{dataset_portions[0]}_{FILTERED}_{num_galaxies}.pt"
-
-            train_scat_coeffs = cache_scattering(train_images, scattering, train_cache, batch_size=128, device="cpu")
-            valid_scat_coeffs = cache_scattering(valid_images, scattering, valid_cache, batch_size=128, device="cpu")
-            
-            if NORMALISESCS:
-                train_scat_coeffs = normalize_to_0_1(train_scat_coeffs)
-                valid_scat_coeffs = normalize_to_0_1(valid_scat_coeffs)
-                if NORMALISESCSTOPM:
-                    train_scat_coeffs = normalize_to_minus1_1(train_scat_coeffs)
-                    valid_scat_coeffs = normalize_to_minus1_1(valid_scat_coeffs)
-            
-            #train_scat_coeffs = compute_scattering_coeffs(train_images)
-            #valid_scat_coeffs = compute_scattering_coeffs(valid_images)
-            scatdim = train_scat_coeffs[0].shape
-        if classifier == "ScatterNet":
-            print("Shape of mock_tensor: ", mock_tensor.shape)
-            print("Shape of train_scat_coeffs: ", train_scat_coeffs.shape)
-            print("Shape of train_labels: ", train_labels.shape)
-            train_dataset = TensorDataset(mock_tensor, train_scat_coeffs, train_labels)
-            valid_dataset = TensorDataset(valid_mock_tensor, valid_scat_coeffs, valid_labels)
-        if classifier == 'ScatterDual':
-            print("Shape of train_images: ", train_images.shape)
-            print("Shape of train_scat_coeffs: ", train_scat_coeffs.shape)
-            print("Shape of train_labels: ", train_labels.shape)
-            train_dataset = TensorDataset(train_images, train_scat_coeffs, train_labels)
-            valid_dataset = TensorDataset(valid_images, valid_scat_coeffs, valid_labels)
-        else: 
-            print("Shape of train_images: ", train_images.shape)
-            print("Shape of train_labels: ", train_labels.shape)
-            print("Shape of mock_tensor: ", mock_tensor.shape)
+            if USE_MEMMAP:
+                # Use memmap-based caching (from script 1)
+                train_cache_file, train_full_shape = cache_scattering_memmap(train_images, scattering, train_cache_path, batch_size=128, device="cpu")
+                valid_cache_file, valid_full_shape = cache_scattering_memmap(valid_images, scattering, valid_cache_path, batch_size=128, device="cpu")
+                # Create dataset using the memmap cache
+                train_dataset = CachedScatterDataset(train_images, train_labels, train_cache_file, train_full_shape)
+                valid_dataset = CachedScatterDataset(valid_images, valid_labels, valid_cache_file, valid_full_shape)
+                scatdim = train_full_shape[1:]  # e.g., (C, H, W)
+            else:
+                # Use standard caching (from script 2)
+                train_cache = f"./.cache/train_scat_{galaxy_classes}_{fold}_{lambda_generate}_{dataset_portions[0]}_{FILTERED}_{num_galaxies}.pt"
+                valid_cache = f"./.cache/valid_scat_{galaxy_classes}_{fold}_{lambda_generate}_{dataset_portions[0]}_{FILTERED}_{num_galaxies}.pt"
+                train_scat_coeffs = cache_scattering(train_images, scattering, train_cache, batch_size=128, device="cpu")
+                valid_scat_coeffs = cache_scattering(valid_images, scattering, valid_cache, batch_size=128, device="cpu")
+                if NORMALISESCS:
+                    train_scat_coeffs = normalize_to_0_1(train_scat_coeffs)
+                    valid_scat_coeffs = normalize_to_0_1(valid_scat_coeffs)
+                    if NORMALISESCSTOPM:
+                        train_scat_coeffs = normalize_to_minus1_1(train_scat_coeffs)
+                        valid_scat_coeffs = normalize_to_minus1_1(valid_scat_coeffs)
+                scatdim = train_scat_coeffs[0].shape
+                if classifier == "ScatterNet":
+                    train_dataset = TensorDataset(mock_tensor, train_scat_coeffs, train_labels)
+                    valid_dataset = TensorDataset(valid_mock_tensor, valid_scat_coeffs, valid_labels)
+                else: # classifier == "ScatterDual"
+                    train_dataset = TensorDataset(train_images, train_scat_coeffs, train_labels)
+                    valid_dataset = TensorDataset(valid_images, valid_scat_coeffs, valid_labels)
+        else:
             train_dataset = TensorDataset(train_images, mock_tensor, train_labels) 
             valid_dataset = TensorDataset(valid_images, valid_mock_tensor, valid_labels)
+
 
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=custom_collate, drop_last=True)
         valid_loader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=custom_collate, drop_last=True)

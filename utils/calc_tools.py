@@ -1,5 +1,4 @@
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import random
 from lpips import LPIPS
@@ -9,7 +8,7 @@ from sklearn.metrics import pairwise_distances
 from scipy.ndimage import label
 from utils.models import get_model
 from sklearn.metrics import mean_squared_error
-from torchvision.models import inception_v3
+from torchvision.models import inception_v3, Inception_V3_Weights
 from scipy import linalg
 
 
@@ -105,7 +104,7 @@ def get_inception_features(images, model, batch_size=32, device='cpu'):
     return np.concatenate(activations, axis=0)
 
 def calculate_fid(real_images, gen_images, device='cpu'):
-    inception = inception_v3(pretrained=True, transform_input=False).to(device)
+    inception = inception_v3(weights=Inception_V3_Weights.DEFAULT, transform_input=False).to(device)
     inception.eval()
     real_act = get_inception_features(real_images, inception, device=device)
     gen_act = get_inception_features(gen_images, inception, device=device)

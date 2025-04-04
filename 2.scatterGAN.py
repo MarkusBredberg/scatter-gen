@@ -6,82 +6,94 @@ import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 from utils.data_loader import load_galaxies
-from utils.GAN_models import DCGANDiscriminator, DCGANGenerator, GANDiscriminator, AdvancedGenerator, load_gan_generator
-from utils.plotting import plot_GAN_losses, plot_histograms, save_images_tensorboard
-from utils.GAN_loss_functions import (
-    d_loss_bce, d_loss_hinge, d_loss_lsgan, d_loss_mse, d_loss_wgan,
-    g_loss_bce, g_loss_hinge, g_loss_lsgan, g_loss_mse, g_loss_wgan
-)
+from utils.GAN_models import DCGANDiscriminator, DCGANGenerator, GANDiscriminator, DualInputDiscriminator, AdvancedGenerator
+from utils.plotting import plot_GAN_losses, plot_histograms, save_images_tensorboard, plot_variance_histograms
+from utils.GAN_loss_functions import pick_gan_loss_functions
 from utils.calc_tools import (
     bhattacharyya_coefficient, total_variation_distance, histogram_intersection,
     calculate_fid, calculate_lpips_diversity, calculate_cmmd, change_images, cluster_metrics    
 )
 import itertools
 from tqdm import tqdm
-import matplotlib.pyplot as plt
-import matplotlib.image as mpimg
-import math
 import pandas as pd
 import torch.nn.functional as F
-
-
+from kymatio.torch import Scattering2D
 
 # -------------------------------
 # Fixed parameters for hyperparameter optimization
 # -------------------------------
-REMOVEOUTLIERS = True  # Sets dv to 'clean' if True and 'full' otherwise
 galaxy_class = 10
 folds = [5]
 batch_size = 256
-epochs = 500
+epochs = 10
 image_size = 128
 save_interval = 100
 output_dir = "GAN"
-gan_type = ["Simple", "Advanced"][0]
+gan_type = ["Simple", "ScatterDualGAN", "Advanced"][0]
+if gan_type == "ScatterDualGAN":
+    J, L, order = 4, 6, 2
+    batch_size = 1024  # The bigger the faster
 
-# Grid of hyperparameters to search over
+# Hyperparameter grid (grid_filter controls REMOVEOUTLIERS)
 grid_latent_dim = [128]
 grid_lr_gen = [1e-3]       # Separate learning rate for generator
 grid_lr_disc = [1e-4]      # Separate learning rate for discriminator
 grid_gen_loss = ["MSE"]
-grid_disc_loss = ["BCE"]   # Discriminator loss
-grid_adam_betas = [(0.5, 0.999)]  # Beta values for Adam optimizer
-grid_weight_decay = [0.0]         # Weight decay options
-grid_label_smoothing = [0.7]        # Label smoothing values for BCE loss
-grid_lambda_div = [0.01]        # Weight for diversity loss
-
-#######################
+grid_disc_loss = ["BCE"]
+grid_adam_betas = [(0.5, 0.999)]
+grid_weight_decay = [0.0]
+grid_label_smoothing = [0.7, 0.9]  # Label smoothing for generator
+grid_lambda_div = [0]      
+grid_filter = [True, False]   # REMOVEOUTLIERS option
 
 # Set random seed for reproducibility
 SEED = 1
 torch.manual_seed(SEED)
 np.random.seed(SEED)
 
-if REMOVEOUTLIERS:
-    print("Removing outliers. Dataset will be cleaned")
-    data_version = 'clean'
-else:
-    data_version = 'full'
-
 print("Running ScatterGAN with gan type", gan_type)
-
 os.makedirs(output_dir, exist_ok=True)
 os.makedirs(os.path.join(output_dir, "generators"), exist_ok=True)
 os.makedirs(os.path.join(output_dir, "discriminators"), exist_ok=True)
 
-# Setup logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 logging.info(f"Using device: {device}")
 if torch.cuda.is_available():
     torch.backends.cudnn.benchmark = True
 
-fixed_noise = torch.randn(36, grid_latent_dim[0], 1, 1, device=device)
+# If using ScatterDualGAN, initialize the scattering transform.
+if gan_type == "ScatterDualGAN":
+    scattering = Scattering2D(J=J, L=L, shape=(image_size, image_size), max_order=order)
+    def compute_scattering_coeffs(images, scattering, batch_size, grad_mode=False, output_device=None):
+        # Always compute on CPU.
+        scat_coeffs_list = []
+        context = torch.enable_grad() if grad_mode else torch.no_grad()
+        with context:
+            for i in range(0, len(images), batch_size):
+                batch = images[i:i + batch_size].cpu().contiguous()
+                batch_scat = scattering(batch)
+                if not grad_mode:
+                    batch_scat = batch_scat.detach()
+                if batch_scat.shape[1] == 1:
+                    batch_scat = batch_scat.squeeze(1)
+                scat_coeffs_list.append(batch_scat)
+        scat_coeffs = torch.cat(scat_coeffs_list, dim=0)
+        if output_device is not None:
+            scat_coeffs = scat_coeffs.to(output_device)
+        return scat_coeffs
 
 
-def run_experiment(latent_dim, fold, lr_gen, lr_disc, gen_loss, disc_loss, adam_betas, weight_decay, label_smoothing, lambda_div):
-    # Create a unique experiment name from the hyperparameters
-    exp_name = f"latent{latent_dim}_cl{galaxy_class}_lrgen{lr_gen}_lrdisc{lr_disc}_gl{gen_loss}_dl{disc_loss}_ab{adam_betas}_wd{weight_decay}_ls{label_smoothing}_ld{lambda_div}_dv{data_version}"
+def run_experiment(latent_dim, fold, lr_gen, lr_disc, gen_loss, disc_loss,
+                   adam_betas, weight_decay, label_smoothing, lambda_div, REMOVEOUTLIERS):
+    if REMOVEOUTLIERS:
+        print("Removing outliers. Dataset will be cleaned")
+        data_version = 'clean'
+    else:
+        data_version = 'full'
+    exp_name = (f"latent{latent_dim}_cl{galaxy_class}_lrgen{lr_gen}_lrdisc{lr_disc}_"
+                f"gl{gen_loss}_dl{disc_loss}_ab{adam_betas}_wd{weight_decay}_"
+                f"ls{label_smoothing}_ld{lambda_div}_dv{data_version}")
     exp_dir = os.path.join(output_dir, gan_type, f"{exp_name}_f{folds[-1]}")
     os.makedirs(exp_dir, exist_ok=True)
     logging.info(f"Starting experiment: {exp_name}")
@@ -96,63 +108,39 @@ def run_experiment(latent_dim, fold, lr_gen, lr_disc, gen_loss, disc_loss, adam_
         train=True
     )
     train_images, _, _, _ = data
-    
-    # Shuffle the data
     perm = torch.randperm(len(train_images))
     train_images = train_images[perm].float()
-    
-    # Normalize to [-1, 1]
+    # Normalize images to [-1, 1] because of the tanh activation in the generator
     train_images = 2 * (train_images - train_images.min()) / (train_images.max() - train_images.min()) - 1
-    dataset = TensorDataset(train_images)
-    train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-    # Save example real images for reference (using 36 images arranged in 6x6 grid)
-    save_images_tensorboard(train_images[:36], os.path.join(exp_dir, "ScatterGAN_example_real_images.png"), nrow=6)
-
-    # Initialize models
-    if gan_type == 'Simple':
+    # Choose dataset and initialize models depending on gan_type
+    if gan_type == "ScatterDualGAN":
+        train_scat = compute_scattering_coeffs(train_images, scattering=scattering, batch_size=1024, grad_mode=False, output_device=device)
+        train_dataset = TensorDataset(train_images, train_scat)
+        img_shape = (1, image_size, image_size)
+        scat_shape = train_scat.shape[1:]
         generator = DCGANGenerator(latent_dim=latent_dim, ngf=64, nc=1).to(device)
-        discriminator = DCGANDiscriminator(ndf=64, nc=1).to(device)
-    elif gan_type == 'Advanced':
+        discriminator = DualInputDiscriminator(img_shape, scat_shape, output_dim=1, dropout_rate=0.3, J=J).to(device)
+    elif gan_type == "Advanced":
+        train_dataset = TensorDataset(train_images)
         generator = AdvancedGenerator(latent_dim=latent_dim, ngf=64, nc=1).to(device)
         discriminator = GANDiscriminator(ndf=64, nc=1).to(device)
+    elif gan_type == "Simple":
+        train_dataset = TensorDataset(train_images)
+        generator = DCGANGenerator(latent_dim=latent_dim, ngf=64, nc=1).to(device)
+        discriminator = DCGANDiscriminator(ndf=64, nc=1).to(device)
     else:
-        raise ValueError("No chosen gan_type")
-        
+        raise ValueError("Unknown gan_type")
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    # Save example real images (6x6 grid)
+    save_images_tensorboard(train_images[:36], os.path.join(exp_dir, "ScatterGAN_example_real_images.png"), nrow=6)
+
     optimizer_G = optim.Adam(generator.parameters(), lr=lr_gen, betas=adam_betas, weight_decay=weight_decay)
     optimizer_D = optim.Adam(discriminator.parameters(), lr=lr_disc, betas=adam_betas, weight_decay=weight_decay)
 
-    # Choose loss functions
-    real_label_val = label_smoothing
-    fake_label_val = 0.0
+    gen_loss_fn, disc_loss_fn = pick_gan_loss_functions(gen_loss=gen_loss, disc_loss=disc_loss, real_label_val=label_smoothing, fake_label_val=0.0)
 
-    if disc_loss == "BCE":
-        disc_loss_fn = lambda real, fake: d_loss_bce(real, fake, real_label_val, fake_label_val)
-    elif disc_loss == "MSE":
-        disc_loss_fn = d_loss_mse
-    elif disc_loss == "LSGAN":
-        disc_loss_fn = d_loss_lsgan
-    elif disc_loss == "HINGE":
-        disc_loss_fn = d_loss_hinge
-    elif disc_loss == "WGAN":
-        disc_loss_fn = d_loss_wgan
-    else:
-        raise ValueError(f"Unknown discriminator loss type: {disc_loss}")
-
-    if gen_loss == "BCE":
-        gen_loss_fn = lambda fake: g_loss_bce(fake, real_label_val)
-    elif gen_loss == "MSE":
-        gen_loss_fn = g_loss_mse
-    elif gen_loss == "LSGAN":
-        gen_loss_fn = g_loss_lsgan
-    elif gen_loss == "HINGE":
-        gen_loss_fn = g_loss_hinge
-    elif gen_loss == "WGAN":
-        gen_loss_fn = g_loss_wgan
-    else:
-        raise ValueError(f"Unknown generator loss type: {gen_loss}")
-
-    # Initialize loss tracking
     g_loss_history, d_loss_history = [], []
     log_interval = max(1, epochs // 10)
     with logging_redirect_tqdm():
@@ -160,29 +148,42 @@ def run_experiment(latent_dim, fold, lr_gen, lr_disc, gen_loss, disc_loss, adam_
             epoch_d_loss = 0.0
             epoch_g_loss = 0.0
             num_batches = 0
-
             for batch in train_loader:
-                real_batch = batch[0].to(device)
-                b_size = real_batch.size(0)
-
-                # Train Discriminator / Critic
+                if gan_type == "ScatterDualGAN":
+                    images, scat_coeffs = batch
+                    images = images.to(device)
+                    scat_coeffs = scat_coeffs.to(device)
+                else:
+                    images = batch[0].to(device)
+                b_size = images.size(0)
                 optimizer_D.zero_grad()
-                real_pred = discriminator(real_batch)
-                z = torch.randn(b_size, latent_dim, 1, 1, device=device)                
+                if gan_type == "ScatterDualGAN":
+                    real_pred = discriminator(images, scat_coeffs)
+                else:
+                    real_pred = discriminator(images)
+                z = torch.randn(b_size, latent_dim, 1, 1, device=device)
                 fake_images = generator(z)
-                fake_images = change_images(fake_images)  # Apply random transformations
+                fake_images = change_images(fake_images) # Apply random transformation to stabilize training
+                if gan_type == "ScatterDualGAN":
+                    fake_scat_disc = compute_scattering_coeffs(
+                        fake_images, scattering=scattering, batch_size=batch_size, grad_mode=False, output_device=device)
+                    fake_pred = discriminator(fake_images.detach(), fake_scat_disc)
+                else:
+                    fake_pred = discriminator(fake_images.detach()) 
                 fake_flat = fake_images.reshape(b_size, -1)
                 pairwise_dists = torch.pdist(fake_flat, p=2)
                 diversity_loss = -torch.mean(pairwise_dists)
-
-                fake_pred = discriminator(fake_images.detach())
                 d_loss = disc_loss_fn(real_pred, fake_pred)
                 d_loss.backward()
                 optimizer_D.step()
 
-                # Train Generator
                 optimizer_G.zero_grad()
-                fake_pred_for_g = discriminator(fake_images)
+                if gan_type == "ScatterDualGAN":
+                    fake_scat_gen = compute_scattering_coeffs(
+                        fake_images, scattering=scattering, batch_size=batch_size, grad_mode=True, output_device=device)
+                    fake_pred_for_g = discriminator(fake_images, fake_scat_gen)
+                else:
+                    fake_pred_for_g = discriminator(fake_images)
                 g_loss = gen_loss_fn(fake_pred_for_g) + lambda_div * diversity_loss
                 g_loss.backward()
                 optimizer_G.step()
@@ -205,124 +206,260 @@ def run_experiment(latent_dim, fold, lr_gen, lr_disc, gen_loss, disc_loss, adam_
                     test_z = torch.randn(16, latent_dim, 1, 1, device=device)
                     gen_sample = generator(test_z).cpu()
                 generator.train()
-
                 img_file = os.path.join(exp_dir, f"ScatterGAN_generated_epoch_{epoch}.png")
                 save_images_tensorboard(gen_sample, img_file, nrow=4)
                 logging.info(f"Saved generated images to {img_file}")
-
-                if len(grid_adam_betas) == 1:  # Save model checkpoints only if there is a single beta value.
+                if len(grid_adam_betas) == 1:
                     torch.save(generator.state_dict(), f"./GAN/generators/generator_{gan_type}_{exp_name}_ep{epoch}_f{fold}.pth")
                     torch.save(discriminator.state_dict(), f"./GAN/discriminators/discriminator_{gan_type}_{exp_name}_ep{epoch}_f{fold}.pth")
                 logging.info(f"Saved model checkpoints for epoch {epoch}")
 
     plot_GAN_losses(exp_dir, galaxy_class, g_loss_history, d_loss_history, gen_loss, disc_loss)
     logging.info(f"Training complete for {exp_name}. Loss plot saved.")
-    
-    # Plot histograms of the generated images
-    gen_sample = generator(fixed_noise).cpu()    
-    plot_histograms(
-    gen_sample,
-    train_images,
-    title1="Generated Images",
-    title2="Train Images",
-    save_path=os.path.join(exp_dir, "histograms.png"))
 
     generator.eval()
     with torch.no_grad():
-        rep_generated = generator(fixed_noise).cpu()
+        noise = torch.randn(36, grid_latent_dim[0], 1, 1, device=device)  # Specific random input for generating images
+        rep_generated = generator(noise).cpu()
     rep_img_path = os.path.join(exp_dir, "rep_generated.png")
     save_images_tensorboard(rep_generated, rep_img_path, nrow=6)
     
-    # Evaluate the generator
-    with torch.no_grad():
-        div_noise = torch.randn(len(train_images), latent_dim, 1, 1, device=device)
-        # Generate diverse images using the generator
-        generated_div_images = generator(div_noise).cpu()
-        generated_features = generated_div_images.cpu().reshape(len(train_images), -1)
+    # Evaluation metrics
+    
+    seeds = [0, 1, 2, 3, 4]
+    all_metrics = []
+
+    for seed in seeds:
+        torch.manual_seed(seed)
         
-    subset_size = 100
-    real_subset = train_images[:subset_size]
-    gen_subset = generated_div_images[:subset_size]
-    cluster_error, cluster_distance, cluster_std_dev = cluster_metrics(generated_features, n_clusters=galaxy_class)
-    bhatta = bhattacharyya_coefficient(real_subset.cpu().numpy().flatten(), gen_subset.cpu().numpy().flatten())
-    tv_dist = total_variation_distance(real_subset.cpu().numpy().flatten(), gen_subset.cpu().numpy().flatten())
-    hist_int = histogram_intersection(real_subset.cpu().numpy().flatten(), gen_subset.cpu().numpy().flatten())
-    fid_score = calculate_fid(real_subset, gen_subset, device=device)
-    mse_score = F.mse_loss(gen_subset.to(device), real_subset.to(device)).item()
-    cmmd_score = calculate_cmmd(real_subset.to(device), gen_subset.to(device))
-    diversity_score = calculate_lpips_diversity(gen_subset)  # LPIPS already samples a subset internally
+        with torch.no_grad():
+            eval_noise = torch.randn(len(train_images), latent_dim, 1, 1, device=device)
+            gen_sample = generator(eval_noise).detach().cpu()   
+            
+        if seed == 0:
+            plot_histograms(gen_sample, train_images, title1="Generated Images", title2="Train Images",
+                save_path=os.path.join(exp_dir, "histograms.png"))
+            plot_variance_histograms(gen_sample, train_images,
+                save_path=os.path.join(exp_dir, "variance_histograms.png"))   
+        
+        subset_size = 100
+        real_subset = train_images[:subset_size]
+        gen_subset = gen_sample[:subset_size]
+        
+        print('Length of real_subset:', len(real_subset))
+        print('Length of gen_subset:', len(gen_subset))
+        flattened_features = gen_sample.view(gen_sample.size(0), -1)
+        cluster_error, cluster_distance, cluster_std_dev = cluster_metrics(flattened_features, n_clusters=galaxy_class)
+        bhatta = bhattacharyya_coefficient(real_subset.cpu().numpy().flatten(), gen_subset.cpu().numpy().flatten())
+        tv_dist = total_variation_distance(real_subset.cpu().numpy().flatten(), gen_subset.cpu().numpy().flatten())
+        hist_int = histogram_intersection(real_subset.cpu().numpy().flatten(), gen_subset.cpu().numpy().flatten())
+        fid_score = calculate_fid(real_subset, gen_subset, device=device)
+        mse_score = F.mse_loss(gen_subset.to(device), real_subset.to(device)).item()
+        cmmd_score = calculate_cmmd(real_subset.to(device), gen_subset.to(device))
+        diversity_score = calculate_lpips_diversity(gen_subset)
+        
+        # --- NEW: Evaluate on variance histograms ---
+        # Compute the per-image standard deviation (variance) for real and generated images.
+        with torch.no_grad():
+            real_variances = train_images.view(train_images.size(0), -1).std(dim=1, unbiased=False)
+            gen_variances = gen_sample.view(gen_sample.size(0), -1).std(dim=1, unbiased=False)
+        subset_size_var = 100
+        real_var_subset = real_variances[:subset_size_var]
+        gen_var_subset = gen_variances[:subset_size_var]
+        var_mse = F.mse_loss(gen_var_subset.to(device), real_var_subset.to(device)).item()
+        var_bhattacharyya = bhattacharyya_coefficient(real_var_subset.cpu().numpy(), gen_var_subset.cpu().numpy())
+        var_tv_distance = total_variation_distance(real_var_subset.cpu().numpy(), gen_var_subset.cpu().numpy())
+        var_hist_int = histogram_intersection(real_var_subset.cpu().numpy(), gen_var_subset.cpu().numpy())
+ 
+        
+        metrics = {
+            "fid_score": fid_score,  # calculated in your snippet
+            "mse_score": mse_score,
+            "lpips_diversity": diversity_score,
+            "bhattacharyya": bhatta,
+            "tv_distance": tv_dist,
+            "hist_intersection": hist_int,
+            "cmmd_score": cmmd_score,
+            "cluster_error": cluster_error,
+            "cluster_distance": cluster_distance,
+            "cluster_std_dev": cluster_std_dev,
+            "var_mse": var_mse,
+            "var_bhattacharyya": var_bhattacharyya,
+            "var_tv_distance": var_tv_distance,
+            "var_hist_intersection": var_hist_int,
+        }
+        all_metrics.append(metrics)
 
+    # Now, compute mean and std for each metric:
+    aggregated_metrics = {}
+    for key in all_metrics[0]:
+        values = [m[key] for m in all_metrics]
+        aggregated_metrics[key + '_mean'] = np.mean(values)
+        aggregated_metrics[key + '_std'] = np.std(values)
 
+    print(aggregated_metrics)
+    
+    
     return {
-        "exp_name": exp_name,
+        "exp_name": exp_name,  # Kept for logging but will be dropped from the table
         "exp_dir": exp_dir,
         "rep_image_path": rep_img_path,
         "final_generator_loss": g_loss_history[-1],
-        "lpips_diversity": diversity_score,
-        "mse_score": mse_score,
-        "fid_score": fid_score,
-        "bhattacharyya": bhatta,
-        "tv_distance": tv_dist,
-        "hist_intersection": hist_int,
-        "cmmd_score": cmmd_score,  
-        "cluster_error": cluster_error,
-        "cluster_distance": cluster_distance,
-        "cluster_std_dev": cluster_std_dev,
-        "latent_dim": latent_dim,
+        "final_discriminator_loss": d_loss_history[-1],
+        "aggregated_metrics": aggregated_metrics,  # Metrics
+        "latent_dim": latent_dim,                # Hyperparameters
         "lr_gen": lr_gen,
         "lr_disc": lr_disc,
         "gen_loss": gen_loss,
-        "disc_loss": disc_loss
+        "disc_loss": disc_loss,
+        "label_smoothing": label_smoothing,
+        "lambda_div": lambda_div,
+        "REMOVEOUTLIERS": REMOVEOUTLIERS
     }
 
+print(list(itertools.product(grid_latent_dim, folds, grid_lr_gen, grid_lr_disc, grid_gen_loss, grid_disc_loss, grid_adam_betas, grid_weight_decay, grid_label_smoothing, grid_lambda_div, grid_filter)))
 
 results = []
-for latent_dim, fold, lr_gen, lr_disc, gen_loss, disc_loss, adam_betas, weight_decay, label_smoothing, lambda_div in itertools.product(
-    grid_latent_dim, folds, grid_lr_gen, grid_lr_disc, grid_gen_loss, grid_disc_loss, grid_adam_betas, grid_weight_decay, grid_label_smoothing, grid_lambda_div
+for latent_dim, fold, lr_gen, lr_disc, gen_loss, disc_loss, adam_betas, weight_decay, label_smoothing, lambda_div, REMOVEOUTLIERS in itertools.product(
+    grid_latent_dim, folds, grid_lr_gen, grid_lr_disc, grid_gen_loss, grid_disc_loss, grid_adam_betas, grid_weight_decay, grid_label_smoothing, grid_lambda_div, grid_filter
 ):
-    res = run_experiment(latent_dim, fold, lr_gen, lr_disc, gen_loss, disc_loss, adam_betas, weight_decay, label_smoothing, lambda_div)
+    res = run_experiment(latent_dim, fold, lr_gen, lr_disc, gen_loss, disc_loss, adam_betas, weight_decay, label_smoothing, lambda_div, REMOVEOUTLIERS)
     results.append(res)
 
-# Print out the hyperparameter combination that yielded the most diverse generated images
-best_experiment = max(results, key=lambda x: x["lpips_diversity"])
-print(f"Best hyperparameters based on diversity: {best_experiment['exp_name']} with LPIPS diversity score: {best_experiment['lpips_diversity']:.4f}")
-
-# Create and print a summary table of all experiments
+# Create the summary table:
 df = pd.DataFrame(results)
-df = df.sort_values(by='fid_score', ascending=True)
-cols = ['exp_name', 'final_generator_loss', 'lpips_diversity', 'mse_score', 'fid_score', 'cmmd_score', 'bhattacharyya', 'tv_distance', 'hist_intersection', 
-        'latent_dim', 'lr_gen', 'lr_disc', 'gen_loss', 'disc_loss', 'cluster_error', 'cluster_distance', 'cluster_std_dev']
-print("\nSummary of all experiments (sorted by increasing FID):")
-print(df[cols].to_string(index=False))
+## Flatten the aggregated_metrics column into individual columns
+df = pd.concat([df.drop(columns=['aggregated_metrics']), df['aggregated_metrics'].apply(pd.Series)], axis=1)
+
+# Drop the exp_name column so it does not appear in the table.
+if 'exp_name' in df.columns:
+    df = df.drop(columns=['exp_name'])
+# Define the order of columns, including label_smoothing, lambda_div, and the new variance metrics.
 
 
-# Save that table as a log file
-summary_path = os.path.join(output_dir, "hyperparam_summary.csv")
-df.to_csv(summary_path, index=False)
-logging.info(f"Summary table saved to {summary_path}")
+# Suppose df is your DataFrame with aggregated metrics for each experiment.
+# First, define which metrics are "lower is better"
+lower_is_better = [
+    'fid_score_mean', 'mse_score_mean', 'cmmd_score_mean', 'cluster_error_mean', 
+    'cluster_distance_mean', 'cluster_std_dev_mean', 'bhattacharyya_mean', 
+    'tv_distance_mean', 'hist_intersection_mean', 'var_mse_mean', 
+    'var_bhattacharyya_mean', 'var_tv_distance_mean', 'var_hist_intersection_mean'
+]
 
-n_experiments = len(results)
-cols_plot = min(6, n_experiments)
-rows_plot = math.ceil(n_experiments / cols_plot)
+# Normalize each metric column across experiments.
+df_norm = df.copy()
+for col in lower_is_better:
+    # Invert these metrics so higher is better.
+    df_norm[col] = -df_norm[col]
 
-fig, axs = plt.subplots(rows_plot, cols_plot, figsize=(cols_plot * 3, rows_plot * 3))
-axs = axs.flatten() if n_experiments > 1 else [axs]
+# Then, for each metric, compute a z-score:
+for col in df_norm.columns:
+    if col not in ['exp_dir', 'rep_image_path', 'REMOVEOUTLIERS']:
+        if pd.api.types.is_numeric_dtype(df_norm[col]):
+            df_norm[col] = (df_norm[col] - df_norm[col].mean()) / (df_norm[col].std() + 1e-8)
 
-for ax in axs[n_experiments:]:
-    fig.delaxes(ax)
+# Exclude losses from composite score computation:
+exclude_cols = ['exp_dir', 'rep_image_path', 'REMOVEOUTLIERS', 'label_smoothing', 'lambda_div', 'latent_dim', 'lr_gen', 'lr_disc', 'gen_loss', 'disc_loss',
+                'final_generator_loss', 'final_discriminator_loss']
+metric_cols = [col for col in df_norm.columns if col not in exclude_cols]
+numeric_metric_cols = [col for col in metric_cols if pd.api.types.is_numeric_dtype(df_norm[col])]
+df['composite_score'] = df_norm[numeric_metric_cols].mean(axis=1)
 
-for idx, res in enumerate(results):
-    img = mpimg.imread(res["rep_image_path"])
-    ax = axs[idx]
-    ax.imshow(img)
-    ax.axis('off')
-    title = (f"{res['exp_name']}\nG_loss: {res['final_generator_loss']:.4f}\n"
-             f"Diversity: {res['lpips_diversity']:.4f}\nMSE: {res['mse_score']:.4f}")
-    ax.set_title(title, fontsize=8)
+# Now sort the DataFrame by the composite score (assuming higher is better)
+df = df.sort_values(by='composite_score', ascending=False)
 
-fig.suptitle("Hyperparameter Optimization Summary", fontsize=16)
-plt.tight_layout()
-summary_path = os.path.join(output_dir, "hyperparam_summary.png")
-plt.savefig(summary_path)
-plt.close()
-logging.info(f"Summary grid saved to {summary_path}")
+print("Best overall experiment based on composite score:")
+print(df.iloc[0])
+
+# Optionally, update your columns list to include the composite score
+cols = [
+    'final_generator_loss', 'final_discriminator_loss', 'mse_score_mean', 'lpips_diversity_mean',
+    'fid_score_mean', 'cmmd_score_mean', 'cluster_error_mean', 'cluster_distance_mean', 'cluster_std_dev_mean',
+    'bhattacharyya_mean', 'tv_distance_mean', 'hist_intersection_mean',
+    'var_mse_mean', 'var_bhattacharyya_mean', 'var_tv_distance_mean', 'var_hist_intersection_mean',
+    'latent_dim', 'lr_gen', 'lr_disc', 'gen_loss', 'disc_loss', 'label_smoothing',
+    'lambda_div', 'REMOVEOUTLIERS', 'composite_score'
+]
+
+print("\nSummary of all experiments (sorted by composite score):")
+print(df[cols].to_string())
+
+# Group metrics into "mean ± std" format for LaTeX
+mean_std_pairs = [
+    ("fid_score_mean", "fid_score_std"),
+    ("mse_score_mean", "mse_score_std"),
+    ("lpips_diversity_mean", "lpips_diversity_std"),
+    ("cmmd_score_mean", "cmmd_score_std"),
+    ("cluster_error_mean", "cluster_error_std"),
+    ("cluster_distance_mean", "cluster_distance_std"),
+    ("cluster_std_dev_mean", "cluster_std_dev_std"),
+    ("bhattacharyya_mean", "bhattacharyya_std"),
+    ("tv_distance_mean", "tv_distance_std"),
+    ("hist_intersection_mean", "hist_intersection_std"),
+    ("var_mse_mean", "var_mse_std"),
+    ("var_bhattacharyya_mean", "var_bhattacharyya_std"),
+    ("var_tv_distance_mean", "var_tv_distance_std"),
+    ("var_hist_intersection_mean", "var_hist_intersection_std"),
+]
+
+# Create a new DataFrame with the formatted metrics
+latex_df = df.copy()
+
+for mean_col, std_col in mean_std_pairs:
+    if mean_col in latex_df and std_col in latex_df:
+        latex_df[mean_col.replace("_mean", "")] = latex_df.apply(
+            lambda row: f"{row[mean_col]:.3f} ± {row[std_col]:.3f}", axis=1
+        )
+
+# Keep only relevant columns (remove stds, keep formatted means)
+drop_cols = [std for _, std in mean_std_pairs]
+latex_df = latex_df.drop(columns=drop_cols)
+
+# Define final columns to keep and their order (add any you want)
+final_cols = [
+    'latent_dim', 'lr_gen', 'lr_disc', 'label_smoothing', 'lambda_div', 'REMOVEOUTLIERS',
+    'FID', 'MSE', 'LPIPS', 'CMMD', 'Cluster Error', 'Cluster Dist', 'Cluster Std',
+    'Bhattacharyya', 'TV Dist', 'Hist Int',
+    'Var MSE', 'Var Bhatt', 'Var TV', 'Var Hist',
+    'composite_score'
+]
+
+
+# Some renaming for nice LaTeX headers (optional)
+latex_df = latex_df.rename(columns={
+    'fid_score': 'FID',
+    'mse_score': 'MSE',
+    'lpips_diversity': 'LPIPS',
+    'cmmd_score': 'CMMD',
+    'cluster_error': 'Cluster Error',
+    'cluster_distance': 'Cluster Dist',
+    'cluster_std_dev': 'Cluster Std',
+    'bhattacharyya': 'Bhattacharyya',
+    'tv_distance': 'TV Dist',
+    'hist_intersection': 'Hist Int',
+    'var_mse': 'Var MSE',
+    'var_bhattacharyya': 'Var Bhatt',
+    'var_tv_distance': 'Var TV',
+    'var_hist_intersection': 'Var Hist',
+})
+
+# Output LaTeX-ready table
+latex_output = latex_df[final_cols].to_latex(index=False, escape=False)
+with open(os.path.join(output_dir, "summary_table_latex.tex"), "w") as f:
+    f.write(latex_output)
+print("Saved LaTeX-formatted summary table.")
+
+# Create a vertical version of the best experiment row for LaTeX
+best_row = latex_df[final_cols].iloc[[0]].T.reset_index()
+best_row.columns = ['Metric', 'Value']
+vertical_latex = best_row.to_latex(index=False, escape=False)
+
+with open(os.path.join(output_dir, "summary_table_vertical.tex"), "w") as f:
+    f.write(vertical_latex)
+print("Saved vertical LaTeX-formatted table.")
+
+
+# Now, the experiment with the highest composite score could be considered the best overall.
+best_experiment = df.loc[df['composite_score'].idxmax()]
+print("Best overall experiment based on composite score:")
+print(best_experiment[['latent_dim', 'lr_gen', 'lr_disc', 'gen_loss', 'disc_loss', 'label_smoothing', 'lambda_div', 'REMOVEOUTLIERS', 'composite_score']])

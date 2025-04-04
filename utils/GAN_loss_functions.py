@@ -99,3 +99,33 @@ def d_loss_wgan(real_pred, fake_pred):
 def g_loss_wgan(fake_pred):
     """Generator wants to maximize D(fake), so we minimize -mean(D(fake))."""
     return -torch.mean(fake_pred)
+
+
+def pick_gan_loss_functions(gen_loss='MSE', disc_loss='BCE', real_label_val=1.0, fake_label_val=0.0):
+    if gen_loss == "BCE":
+        gen_loss_fn = lambda fake: g_loss_bce(fake, real_label_val)
+    elif gen_loss == "MSE":
+        gen_loss_fn = g_loss_mse
+    elif gen_loss == "LSGAN":
+        gen_loss_fn = g_loss_lsgan
+    elif gen_loss == "HINGE":
+        gen_loss_fn = g_loss_hinge
+    elif gen_loss == "WGAN":
+        gen_loss_fn = g_loss_wgan
+    else:
+        raise ValueError(f"Unknown generator loss type: {gen_loss}")
+    
+    if disc_loss == "BCE":
+        disc_loss_fn = lambda real, fake: d_loss_bce(real, fake, real_label_val, fake_label_val)
+    elif disc_loss == "MSE":
+        disc_loss_fn = d_loss_mse
+    elif disc_loss == "LSGAN":
+        disc_loss_fn = d_loss_lsgan
+    elif disc_loss == "HINGE":
+        disc_loss_fn = d_loss_hinge
+    elif disc_loss == "WGAN":
+        disc_loss_fn = d_loss_wgan
+    else:
+        raise ValueError(f"Unknown discriminator loss type: {disc_loss}")
+    
+    return  gen_loss_fn, disc_loss_fn,
