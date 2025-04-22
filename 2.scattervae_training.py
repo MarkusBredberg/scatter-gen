@@ -29,8 +29,7 @@ import matplotlib.pyplot as plt
 
 #encoder_list = ['CDual', 'CCNN', 'CSTMLP', 'CldiffSTMLP', 'ClavgSTMLP']
 #encoder_list = ['CNN', 'STMLP', 'lavgSTMLP', 'ldiffSTMLP']
-encoder_list = ['Dual', 'CNN']
-#encoder_list = ['STMLP', 'lavgSTMLP', 'ldiffSTMLP']
+encoder_list = ['Dual', 'CNN', 'STMLP', 'lavgSTMLP', 'ldiffSTMLP']
 #encoder_list = ['ldiffSTMLP']
 
 FFCV = True               # Use five-fold cross-validation
@@ -47,7 +46,7 @@ REMOVEOUTLIERS = True     # Filter away problematic images
 F = 8 #Choose the loss function to use
 
 #galaxy_classes = [[10, 11, 12, 13]] #Use double square parenthesis for conditional VAEs
-galaxy_classes = [10]
+galaxy_classes = [13]
 hidden_dim1 = [256]
 hidden_dim2 = [128]
 latent_dims = [64]

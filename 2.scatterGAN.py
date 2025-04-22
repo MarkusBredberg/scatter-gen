@@ -22,10 +22,10 @@ from kymatio.torch import Scattering2D
 # -------------------------------
 # Fixed parameters for hyperparameter optimization
 # -------------------------------
-galaxy_class = 10
+galaxy_class = 13
 folds = [5]
 batch_size = 256
-epochs = 10
+epochs = 500
 image_size = 128
 save_interval = 100
 output_dir = "GAN"
@@ -42,8 +42,8 @@ grid_gen_loss = ["MSE"]
 grid_disc_loss = ["BCE"]
 grid_adam_betas = [(0.5, 0.999)]
 grid_weight_decay = [0.0]
-grid_label_smoothing = [0.7, 0.9]  # Label smoothing for generator
-grid_lambda_div = [0]      
+grid_label_smoothing = [0.7, 0.9, 1]  # Label smoothing for generator
+grid_lambda_div = [0, 0.01, 0.1, 0.5]      
 grid_filter = [True, False]   # REMOVEOUTLIERS option
 
 # Set random seed for reproducibility
@@ -103,7 +103,7 @@ def run_experiment(latent_dim, fold, lr_gen, lr_disc, gen_loss, disc_loss,
         galaxy_class=galaxy_class,
         fold=fold,
         img_shape=(1, image_size, image_size),
-        sample_size=1000,
+        sample_size=100000,
         REMOVEOUTLIERS=REMOVEOUTLIERS,
         train=True
     )

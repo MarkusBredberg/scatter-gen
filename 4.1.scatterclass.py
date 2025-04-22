@@ -38,20 +38,19 @@ galaxy_classes = [10, 11, 12, 13]  # Classes to classify
 max_num_galaxies = 100000  # Upper limit for the all-classes combined training data before classical augmentation
 dataset_portions = [0.01, 0.1, 1]  # Portions of complete dataset for the accuracy vs dataset size
 J, L, order = 2, 12, 2  # Scatter transform parameters
-classifier = ["ProjectModel", "Rustige", "ScatterNet", "ScatterDual"][0]  # Choose one classifier model model
+classifier = ["ProjectModel", "Rustige", "ScatterNet", "ScatterDual"][1]  # Choose one classifier model model
 gen_model_names = ['DDPM'] #['GAN', 'Dual', 'CNN', 'STMLP', 'lavgSTMLP', 'ldiffSTMLP'] # Specify the generative model_name
 num_epochs_cuda = 200
 num_epochs_cpu = 100
 batch_size = 250
 learning_rates = [1e-3]  # Learning rates
-regularization_params = [0, 1e-1]  # Regularisation parameters
+regularization_params = [0]  # Regularisation parameters
 img_shape = (1, 128, 128)
-num_experiments = 1
+num_experiments = 10
 folds = [5] # 0-4 for 5-fold cross validation, 5 for only one training
-lambda_values = [0, 0.25, 0.5, 1]  # Ratio between generated images and original images per class. 8 is reserfved for TESTONGENERATED
+lambda_values = [0, 0.25, 0.5, 1, 2, 3, 5]  # Ratio between generated images and original images per class. 8 is reserfved for TESTONGENERATED
 
 ES, patience = True, 10  # Use early stopping
-IMGCHECK = True  # Check the input images (Tool for control)
 SHOWIMGS = True  # Show some generated images for each class (Tool for control)
 NORMALISEIMGS = True  # Normalise images to [0, 1]
 NORMALISEIMGSTOPM = False  # Normalise images to [-1, 1] 
@@ -59,7 +58,7 @@ NORMALISESCS = False  # Normalise scattering coefficients to [0, 1]
 NORMALISESCSTOPM = False  # Normalise scattering coefficients to [-1, 1]
 USE_CLASS_WEIGHTS = True  # Set to False to disable class weights
 TESTONGENERATED = False  # Use generated data as testdata
-FILTERED = False  # Remove in training, validation and test data for the classifier
+FILTERED = True  # Remove in training, validation and test data for the classifier
 FILTERGEN = False  # Remove generated images that are too similar to other generated images
 USE_MEMMAP = False  # Use memmap for scattering coefficients
 
@@ -81,7 +80,7 @@ gan_type = ['Simple', 'Advanced'][0]
 #########################################################################################################################
 
 if lambda_values != [0]:
-    VAE_train_size = {galaxy_classes[0]: 1101028, galaxy_classes[1]: 1101028, galaxy_classes[2]: 1101028, galaxy_classes[3]: 1101028}
+    VAE_train_size = {galaxy_classes[0]: 1101128, galaxy_classes[1]: 1101128, galaxy_classes[2]: 1101128, galaxy_classes[3]: 1101128}
     forbidden_classes = [galaxy_classes[3]]  # Generated bent sources look awful
 
 if TESTONGENERATED:
@@ -362,6 +361,8 @@ for gen_model_name in gen_model_names:
 
     FIRSTTIME = True  # Set to True to print model summaries only once
     param_combinations = list(itertools.product(folds, learning_rates, regularization_params, lambda_values))
+    print(f"DEBUG → folds = {folds}")
+    print(f"DEBUG → param_combinations (first 10) = {param_combinations[:10]}  (total {len(param_combinations)})")
     for fold, lr, reg, lambda_generate in param_combinations:
         gan_fold = fold
         torch.cuda.empty_cache()
@@ -406,16 +407,16 @@ for gen_model_name in gen_model_names:
                         latent_dim = gan_latent_dim
                     elif gen_model_name == 'DDPM':
                         ddpm_file_map = {
-                            10: "generated_fr1.npy",
-                            11: "generated_fr2.npy",
-                            12: "generated_bent.npy",
-                            13: "generated_compact.npy"
+                            10: "generated_fr1_8k.npy",
+                            11: "generated_fr2_8k.npy",
+                            12: "generated_compact_8k.npy",
+                            13: "generated_bent_8k.npy"
                         }
                         ddpm_path = f"/users/mbredber/data/DDPM/{ddpm_file_map[cls]}"
                         print(f"Loading DDPM data for class {cls} from {ddpm_path}")
                         ddpm_data = np.load(ddpm_path)  # shape assumed (N, 128, 128)
                         ddpm_data = torch.from_numpy(ddpm_data).unsqueeze(1).float()  # (N, 1, 128, 128)
-                        
+
                         # Use as many samples as num_generate, or all if fewer exist
                         if ddpm_data.shape[0] < num_generate:
                             num_generate = ddpm_data.shape[0]
@@ -438,7 +439,7 @@ for gen_model_name in gen_model_names:
                     print(f"Model error for class: {cls}. Error: {e}")
                     exit(1)
                     
-                # Optionally, set the model to evaluation mode and disable gradients
+                # If using a GAN or VAE, generate images
                 if gen_model_name != 'DDPM':
                     model.eval()
                     batch_size_generate = 500  
@@ -541,37 +542,37 @@ for gen_model_name in gen_model_names:
             print("Old training data size: ", train_images.size())
             print('Number of images to generate for each class: ', num_generate)
             
-            # Normalise the train images to [-1, 1] because the GAN generator outputs images in this range
-            train_images = train_images * 2 - 1
-            
             for cls in galaxy_classes:
                 try:
                     if gen_model_name == 'GAN':
                         gan_path = f"./GAN/generators/generator_{gan_type}_latent{gan_latent_dim}_cl{cls}_lrgen{lr_gen}_lrdisc{lr_disc}_gl{gan_gen_loss}_dl{gan_disc_loss}_ab{gan_adam_beta}_wd{gan_weight_decay}_ls{gan_label_smoothing}_ld{gan_lambda_div}_dv{gan_data_version}_ep{gan_epoch}_f{gan_fold}.pth"
                         model = load_gan_generator(gan_path, latent_dim=gan_latent_dim)
                         latent_dim = gan_latent_dim
+                        
                     elif gen_model_name == 'DDPM':
                         # Map numeric class IDs to the correct DDPM .npy file
                         ddpm_file_map = {
                             10: "generated_fr1.npy",
                             11: "generated_fr2.npy",
-                            12: "generated_bent.npy",
-                            13: "generated_compact.npy"
+                            12: "generated_compact.npy",
+                            13: "generated_bent.npy"
                         }
                         ddpm_path = f"/users/mbredber/data/DDPM/{ddpm_file_map[cls]}"
                         print(f"Loading DDPM data for class {cls} from {ddpm_path}")
                         ddpm_data = np.load(ddpm_path)  # shape assumed (N, 128, 128)
                         ddpm_data = torch.from_numpy(ddpm_data).unsqueeze(1).float()  # (N,1,128,128)
+                        ddpm_data = normalize_to_0_1(ddpm_data)
+                        ddpm_data = normalize_to_minus1_1(ddpm_data)
 
                         # Use as many samples as num_generate, or all if fewer exist
                         if ddpm_data.shape[0] < num_generate:
                             num_generate = ddpm_data.shape[0]
                         else:
                             print(f"Warning: Only {ddpm_data.shape[0]} samples available for class {cls}.")
-                        ddpm_data = ddpm_data[:num_generate]
-
-                        generated_batch = ddpm_data
+                        generated_batch = ddpm_data[:num_generate]
                         generated_labels = torch.ones(num_generate, dtype=torch.long) * (cls - min(galaxy_classes))
+                        generated_images_list = [ddpm_data]
+                        generated_labels_list = [generated_labels]
                 
                     else:
                         path = get_model_name(cls, VAE_train_size[cls], gen_model_name, fold=fold)
@@ -673,38 +674,12 @@ for gen_model_name in gen_model_names:
                         print(f"Class {cls}: Removed {removal_fraction:.2f}% of images "
                             f"(Generated: {total_generated}, Unique: {total_unique})")
                         
-                else:
-                    # For DDPM, we don't need to filter duplicates
-                    generated_images_list = [ddpm_data]
-                    generated_labels_list = [generated_labels]
                 generated_images = torch.cat(generated_images_list, dim=0)
                 generated_labels = torch.cat(generated_labels_list, dim=0)
 
-                if SHOWIMGS:
-                    plot_image_grid(
-                        generated_images,
-                        num_images=36,
-                        save_path=f"./classifier/{classifier}_{gen_model_name}_{cls}_{num_galaxies}_f{fold}_generated_grid.png"
-                    )
-                    # Select train images with a particular class
-                    train_images_cls = train_images[train_labels == (cls - min(galaxy_classes))]
-                    train_images_cls = train_images_cls[:36]
-                    plot_image_grid(
-                        train_images_cls,
-                        num_images=36,
-                        save_path=f"./classifier/{classifier}_{gen_model_name}_{cls}_{num_galaxies}_f{fold}_train_grid.png"
-                    )
-                    plot_histograms(
-                        generated_images,
-                        train_images,
-                        title1="Generated Images",
-                        title2="Train Images",
-                        save_path=f"./classifier/{classifier}_{gen_model_name}_{cls}_{num_galaxies}_f{fold}_generated_hist.png"
-                    )
-
                 # Append the filtered images and labels to your training data:
                 
-                if IMGCHECK and lambda_generate not in [0, 8]:                 
+                if SHOWIMGS and lambda_generate not in [0, 8]:                 
                     pristine_train_images = train_images
             
                 train_images = torch.cat([train_images, generated_images])
@@ -728,8 +703,33 @@ for gen_model_name in gen_model_names:
                     if lambda_generate not in [0, 8]:
                         pristine_train_images = normalize_to_minus1_1(pristine_train_images)
                         generated_images = normalize_to_minus1_1(generated_images)
+                        
+        # ── SANITY‑CHECK PLOTS ON FIRST FOLD ONLY ──
+        if fold == folds[0] and SHOWIMGS and lambda_generate not in [0, 8]:
+            for cls in galaxy_classes:
+                cls_idx = cls - min(galaxy_classes)
+                gen_cls  = generated_images[generated_labels == cls_idx]
+                orig_cls = train_images   [train_labels == cls_idx][:36]
 
+                plot_image_grid(
+                    gen_cls,
+                    num_images=36,
+                    save_path=f"./classifier/{classifier}_{gen_model_name}_{cls}_{num_galaxies}_f{fold}_generated_grid.png"
+                )
+                plot_image_grid(
+                    orig_cls,
+                    num_images=36,
+                    save_path=f"./classifier/{classifier}_{gen_model_name}_{cls}_{num_galaxies}_f{fold}_train_grid.png"
+                )
+                plot_histograms(
+                    gen_cls,
+                    orig_cls,
+                    title1="Generated Images",
+                    title2="Train Images",
+                    save_path=f"./classifier/{classifier}_{gen_model_name}_{cls}_{num_galaxies}_f{fold}_generated_hist.png"
+                )
 
+                        
         ###### RELABEL ######
         min_label = train_labels.min()
         train_labels = train_labels - min_label
@@ -780,7 +780,7 @@ for gen_model_name in gen_model_names:
         
         print(f"Train dataset size: {len(train_dataset)}, Validation dataset size: {len(valid_dataset)}")
 
-        if IMGCHECK and lambda_generate not in [0, 8]: 
+        if SHOWIMGS and lambda_generate not in [0, 8]: 
             if classifier in ['ProjectModel', 'Rustige', 'ScatterDual']:
                 #save_images_tensorboard(generated_images[:36], save_path=f"./classifier/{gen_model_name}_{galaxy_classes}_{num_galaxies}_generated.png", nrow=6)
                 plot_histograms(pristine_train_images, valid_images, title1="Train images", title2="Valid images", imgs3=generated_images, imgs4=test_images, title3='Generated images', title4='Test images', save_path=f"./classifier/{gen_model_name}_{galaxy_classes}_{num_galaxies}_histograms.png")
