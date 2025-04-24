@@ -1,20 +1,28 @@
 import numpy as np
+import pickle
+import torch
 from sklearn.metrics import accuracy_score, confusion_matrix, roc_curve, auc
 from sklearn.preprocessing import label_binarize
-from utils.data_loader import get_classes
+from utils.data_loader import get_classes, load_galaxies, get_synthetic
+import itertools
 from collections import defaultdict
-import pickle
+from sklearn.manifold import TSNE
+from torch.utils.data import TensorDataset, DataLoader
 import matplotlib.pyplot as plt
 from matplotlib import colormaps  # For newer Matplotlib versions
 import matplotlib.lines as mlines  # <-- For creating custom line legend entries
 from matplotlib.colors import LinearSegmentedColormap
-import itertools
 import seaborn as sns
 import os
 os.makedirs('./classifier/trained_models', exist_ok=True)
 os.makedirs('./classifier/trained_models_filtered', exist_ok=True)
 
 print("Running script 4.2")
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+seed = 42
+torch.manual_seed(seed)
+np.random.seed(seed)
 
 ###############################################
 ################ CONFIGURATION ################
@@ -28,13 +36,11 @@ galaxy_classes = [10, 11, 12, 13]
 #galaxy_classes = [31, 32, 33, 34, 35, 36]
 learning_rates = [1e-3]
 regularization_params = [0]
-lambda_values = [0, 0.25, 0.5, 1, 2, 3, 10]
-num_experiments = 10
-folds = [5]
+lambda_values = [0, 0.25, 0.5, 1, 2, 5, 10, 20, 50, 100]
+num_experiments = 20
+folds = [5] # Number of folds for cross-validation
 generators = ['DDPM']
 classifier = ["ProjectModel", "Rustige", "ScatterNet", "ScatterDual"][1]  # Choose one classifier model model
-
-
 
 # Define consistent color mapping
 colors = {
@@ -59,9 +65,12 @@ if galaxy_classes == [31, 32, 33, 34, 35, 36]:
 elif galaxy_classes == [10, 11, 12, 13]:
     if FILTERED:
         if max(folds) == 5:
-            dataset_sizes = [[139, 1393, 13936], [139, 1393, 13936], [139, 1393, 13936], [139, 1393, 13936], [139, 1393, 13936], [139, 1393, 13936]] # Need length = folds[0] = 1
+            #dataset_sizes = [[200], [200], [200], [200], [200], [200]] # Used for faster trouble shooting
+            dataset_sizes = [[13936], [13936], [13936], [13936], [13936], [13936]] 
+            #dataset_sizes = [[139, 1393, 13936], [139, 1393, 13936], [139, 1393, 13936], [139, 1393, 13936], [139, 1393, 13936], [139, 1393, 13936]] # Need length = folds[0] = 1
         else:
-            dataset_sizes = [[12368], [12336], [12368], [12368], [12368]] 
+            #dataset_sizes = [[12368], [12336], [12368], [12368], [12368]] 
+            dataset_sizes = [[200], [200], [200], [200], [200], [200]]
     elif max(folds) == 5:
         #dataset_sizes = [[140, 1406, 14064], [140, 1406, 14064], [140, 1406, 14064], [140, 1406, 14064], [140, 1406, 14064], [140, 1406, 14064]] # Used for faster trouble shooting
         dataset_sizes = [[139, 1393, 13936], [139, 1393, 13936], [139, 1393, 13936], [139, 1393, 13936], [139, 1393, 13936], [139, 1393, 13936]] # Need length = folds[0] = 1
@@ -135,7 +144,7 @@ for lambda_generate in lambda_values:
                 #metrics_read_path = f'{directory}{galaxy_classes}_{generator}_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}_metrics_data.pkl'
                 with open(metrics_read_path, 'rb') as f:
                     metrics_data = pickle.load(f)
-                    #models = metrics_data["models"] # Classifier models
+                    clf_models = metrics_data["models"] # Classifier models
                     history = metrics_data["history"]
                     loaded_metrics = metrics_data["metrics"]
                     metric_colors = metrics_data["metric_colors"]
@@ -168,6 +177,84 @@ metrics = tot_metrics
 ###############################################
 ########### PLOTTING FUNCTIONS ################
 ###############################################
+
+
+def visualize_tsne_by_class(model, real_loader, gen_loader, device='cpu', save_path="./classifier/tsne_by_class.png"):
+    model = model.to(device).eval()
+    def extract_feats(loader):
+        feats = []
+        handle = model.fc1.register_forward_hook(lambda m, inp, out: feats.append(out.detach().cpu()))
+        for x, _, y in loader:
+            _ = model(x.to(device))
+        handle.remove()
+        return torch.cat(feats,0).numpy()
+
+    real_feats = extract_feats(real_loader)
+    real_labels = real_loader.dataset.tensors[2].numpy()   # assuming your DataLoader stores labels
+
+    gen_feats  = extract_feats(gen_loader)
+    gen_labels = gen_loader.dataset.tensors[2].numpy()     # same here
+
+    # combine
+    X   = np.vstack([real_feats, gen_feats])
+    y   = np.concatenate([real_labels, gen_labels])
+    X2d = TSNE(perplexity=30, max_iter=2000, random_state=42).fit_transform(X)
+
+    plt.figure(figsize=(6,6))
+    scatter = plt.scatter(X2d[:,0], X2d[:,1], c=y, cmap='tab10', alpha=0.7)
+    plt.legend(*scatter.legend_elements(), title="Galaxy class")
+    plt.title("t-SNE of penultimate-layer features, colored by class")
+    plt.savefig(save_path)
+
+
+def visualize_feature_tsne(model, real_loader, gen_loader,
+                           device='cpu',
+                           perplexity=30, n_iter=1000,
+                           save_path="./classifier/tsne_by_truth.png"):
+    """
+    Extracts penultimate‐layer features (fc1) from real & generated images,
+    runs t-SNE, and saves a scatter plot.
+    """
+    model = model.to(device).eval()
+
+    def extract_feats(loader):
+        feats = []
+        # register hook on fc1
+        def hook_fn(module, inp, out):
+            feats.append(out.detach().cpu())
+        handle = model.fc1.register_forward_hook(hook_fn)
+
+        # run data through the network
+        with torch.no_grad():
+            for imgs, _, _ in loader:
+                _ = model(imgs.to(device))
+        handle.remove()
+
+        # concatenate all batches
+        return torch.cat(feats, dim=0).numpy()
+
+    # extract
+    real_feats = extract_feats(real_loader)
+    gen_feats  = extract_feats(gen_loader)
+
+    # stack & fit TSNE
+    X     = np.vstack([real_feats, gen_feats])
+    X_emb = TSNE(perplexity=perplexity, max_iter=n_iter,random_state=42).fit_transform(X)
+
+    # plot
+    n_real = real_feats.shape[0]
+    plt.figure(figsize=(6,6))
+    plt.scatter(X_emb[:n_real, 0], X_emb[:n_real, 1],
+                alpha=0.6, label='real')
+    plt.scatter(X_emb[n_real:, 0], X_emb[n_real:, 1],
+                alpha=0.6, label='generated')
+    plt.legend()
+    plt.title('t-SNE of penultimate-layer features (RustigeClassifier)')
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    plt.savefig(save_path)
+    plt.close()
+    print(f"Saved t-SNE plot to {save_path}")
 
 def plot_accuracy_vs_lambda(lambda_values, metrics, generator, dataset_sizes=dataset_sizes,
                             folds=folds, num_experiments=num_experiments,
@@ -233,51 +320,64 @@ def plot_accuracy_vs_lambda(lambda_values, metrics, generator, dataset_sizes=dat
     print(f"Saved overlayed accuracy vs. lambda plot to {plot_path}")
     
 
-def plot_all_metrics_vs_dataset_size(metrics, generators, merge_map={249: "250", 250: "250", 2492: "2500", 2505: "2500", 24928: "25000", 25056: "25000"},
-    dataset_sizes=dataset_sizes,  folds= folds, num_experiments=num_experiments,
-    learning_rates=learning_rates, regularization_params=regularization_params, save_dir='./classifier'):
-    metric_names = ["accuracy", "precision", "recall", "f1_score"]
+def plot_all_metrics_vs_dataset_size(
+    metrics,
+    generators,
+    merge_map={249: "250", 250: "250", 2492: "2500", 2505: "2500", 24928: "25000", 25056: "25000"},
+    dataset_sizes=dataset_sizes,
+    folds=folds,
+    num_experiments=num_experiments,
+    learning_rates=learning_rates,
+    regularization_params=regularization_params,
+    lambda_values=lambda_values,
+    save_dir='./classifier'):
+    metric_names  = ["accuracy", "precision", "recall", "f1_score"]
     metric_titles = ["Accuracy", "Precision", "Recall", "F1 Score"]
 
     for generator in generators:
         for metric, title in zip(metric_names, metric_titles):
             plt.figure(figsize=(10, 6))
-            labels = [f'λ={lambda_val}' for lambda_val in lambda_values]
-            for i, (lr, reg, lambda_generate) in enumerate(itertools.product(learning_rates, regularization_params, lambda_values)):
-                metric_values_per_category = {}
-                for exp in range(num_experiments):
-                    for fold in folds:
-                        for subset_size in dataset_sizes[fold]:
-                            if subset_size not in merge_map:
-                                continue
-                             
-                            category = merge_map[subset_size]
-                            if category not in metric_values_per_category:
-                                metric_values_per_category[category] = []
-                            key = f"{generator}_{metric}_{subset_size}_{fold}_{exp}_{lr}_{reg}_{lambda_generate}"
-                            if key in metrics and metrics[key]:
-                                metric_values_per_category[category].append(metrics[key][-1])
+
+            # one line per λ
+            for λ in lambda_values:
+                # collect values per merged category
+                metric_values_per_category = defaultdict(list)
+
+                # iterate over all combinations
+                for lr, reg, exp, fold in itertools.product(
+                    learning_rates, regularization_params,
+                    range(num_experiments), folds
+                ):
+                    for subset_size in dataset_sizes[fold]:
+                        if subset_size not in merge_map:
+                            continue
+                        key = f"{generator}_{metric}_{subset_size}_{fold}_{exp}_{lr}_{reg}_{λ}"
+                        if key in metrics and metrics[key]:
+                            metric_values_per_category[merge_map[subset_size]].append(metrics[key][-1])
+
+                # sort categories and compute mean±std
                 categories = sorted(metric_values_per_category.keys(), key=lambda x: int(x))
-                avg_values = []
-                std_values = []
-                for category in categories:
-                    values = metric_values_per_category[category]
-                    if values:
-                        avg_values.append(np.mean(values))
-                        std_values.append(np.std(values))
-                if avg_values:
-                    avg_values = np.array(avg_values)
-                    std_values = np.array(std_values)
-                    plt.plot(categories, avg_values, marker='o', linestyle='-', label=f"λ={lambda_generate}")
-                    plt.fill_between(categories, avg_values - std_values, avg_values + std_values, alpha=0.2)
+                means = [ np.mean(metric_values_per_category[c]) for c in categories ]
+                stds  = [ np.std (metric_values_per_category[c]) for c in categories ]
+
+                # plot
+                plt.plot(categories, means, marker='o', linestyle='-', label=f"λ={λ}")
+                plt.fill_between(categories,
+                                 np.array(means) - np.array(stds),
+                                 np.array(means) + np.array(stds),
+                                 alpha=0.2)
+
+            # now that all λ-lines are drawn, add legend
             plt.legend(title='Lambda Values', fontsize=12, loc='best')
             plt.title(f'{title} vs Dataset Size ({generator})', fontsize=16)
             plt.xlabel('Training Dataset Size', fontsize=14)
             plt.ylabel(title, fontsize=14)
             plt.grid(True, linestyle='--', alpha=0.5)
             plt.tight_layout()
-            plot_path = f'{save_dir}/{galaxy_classes}_{classifier}_{generator}_{max(merge_map)}_{lr}_{reg}_{metric}_vs_dataset_size.png'
-            plt.savefig(plot_path)
+
+            os.makedirs(save_dir, exist_ok=True)
+            fname = f'{save_dir}/{galaxy_classes}_{classifier}_{generator}_{final_subset_size}_{metric}_vs_dataset_size.png'
+            plt.savefig(fname)
             plt.close()
 
 def plot_avg_roc_curves(metrics, generators, dataset_sizes=dataset_sizes, merge_map=merge_map, 
@@ -677,7 +777,7 @@ def plot_loss(
                   ncol=2, columnspacing=1.2, handletextpad=0.7)
 
         plt.tight_layout()
-        plt.savefig(f"./classifier/{galaxy_classes}_{classifier}_{generator}_loss.png")
+        plt.savefig(f"./classifier/{galaxy_classes}_{classifier}_{generator}_{dataset_sizes[-1][-1]}_loss.png")
         plt.close(fig)
 
 def old_plot_loss(
@@ -874,3 +974,90 @@ plot_accuracy_vs_lambda(lambda_values, metrics, generator)
 #plot_confusion_matrix(metrics, generator)
 plot_avg_std_confusion_matrix(metrics, generators, merge_map=merge_map, metric_stats=metric_stats)
 plot_diff_avg_std_confusion_matrix(metrics, generators, merge_map=merge_map, metric_stats=metric_stats)
+
+# --- build real‐data loader (test set) ---
+_, _, test_images, test_labels = load_galaxies(
+    galaxy_class=galaxy_classes, fold=5,
+    img_shape=(1,128,128), sample_size=None,
+    REMOVEOUTLIERS=FILTERED, train=False
+)
+real_ds = TensorDataset(test_images, torch.zeros_like(test_images), test_labels)
+real_loader = DataLoader(real_ds, batch_size=256, shuffle=False)
+
+
+# --- build generated‐data loader using get_synthetic() ---
+all_imgs, all_labels = [], []
+
+if generators == ['GAN']:   
+    model_kwargs = {
+        'gan_type': 'GAN',
+        'gan_latent_dim': 64,
+        'lr_gen': 1e-4,
+        'lr_disc': 1e-4,
+        'gan_gen_loss': 'MSE',
+        'gan_disc_loss': 'BCE',
+        'gan_adam_beta': 0.9,
+        'gan_weight_decay': 0.0,
+        'gan_label_smoothing': 0.0,
+        'gan_lambda_div': 0.0,
+        'gan_data_version': 0,
+        'gan_epoch': 100}
+
+elif generators == ['Dual']:
+    from kymatio.torch import Scattering2D
+    scattering = Scattering2D(J=2, L=12, shape=(128, 128), max_order=2)   
+    scat_coeffs = scattering(test_images[:5])    
+    model_kwargs = {
+        'scatshape': np.shape(scat_coeffs)[1:],
+        'hidden_dim1': 128,
+        'hidden_dim2': 128,
+        'latent_dim': 64,
+        'vae_latent_dim': 64}
+
+else:
+    model_kwargs = {}
+    
+for cls in galaxy_classes:
+    imgs_list, labels_list = get_synthetic(
+        num_generate=len(test_images),
+        gen_model_name='DDPM',
+        cls=cls,
+        galaxy_classes=galaxy_classes,
+        batch_size=256,
+        img_shape=(1,128,128),
+        FILTERGEN=FILTERED,
+        model_kwargs=model_kwargs,
+        fold=5,
+        device=device
+    )
+    all_imgs   .extend(imgs_list)
+    all_labels .extend(labels_list)
+
+gen_images = torch.cat(all_imgs,   dim=0)
+gen_labels = torch.cat(all_labels, dim=0)
+gen_ds     = TensorDataset(gen_images, torch.zeros_like(gen_images), gen_labels)
+gen_loader = DataLoader(gen_ds, batch_size=256, shuffle=False)
+
+print("clf_models type:", type(clf_models))
+if isinstance(clf_models, dict):
+    print("clf_models keys:", list(clf_models.keys()))
+else:
+    print(clf_models)
+
+from utils.classifiers import RustigeClassifier
+
+wrapper = clf_models['RustigeClassifier']   # this is a dict with key "model"
+model   = wrapper['model']                 # the actual nn.Module you trained
+model   = model.to(device).eval()
+visualize_feature_tsne(
+    model,
+    real_loader,
+    gen_loader,
+    device=device,
+    perplexity=30,
+    n_iter=1000,
+    save_path=f"./classifier/{galaxy_classes}_{classifier}_{generator}_{final_subset_size}_tsne.png"
+)
+visualize_tsne_by_class(model, real_loader, gen_loader, device=device,
+                        save_path=f"./classifier/{galaxy_classes}_{classifier}_{generator}_{final_subset_size}_tsne_by_class.png"
+)

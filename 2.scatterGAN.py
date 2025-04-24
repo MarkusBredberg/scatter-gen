@@ -22,11 +22,12 @@ from kymatio.torch import Scattering2D
 # -------------------------------
 # Fixed parameters for hyperparameter optimization
 # -------------------------------
-galaxy_class = 13
+galaxy_class = 10
 folds = [5]
 batch_size = 256
-epochs = 500
+epochs = 5000
 image_size = 128
+sample_size = 100 # Number of images to sample from the dataset
 save_interval = 100
 output_dir = "GAN"
 gan_type = ["Simple", "ScatterDualGAN", "Advanced"][0]
@@ -42,9 +43,13 @@ grid_gen_loss = ["MSE"]
 grid_disc_loss = ["BCE"]
 grid_adam_betas = [(0.5, 0.999)]
 grid_weight_decay = [0.0]
-grid_label_smoothing = [0.7, 0.9, 1]  # Label smoothing for generator
-grid_lambda_div = [0, 0.01, 0.1, 0.5]      
-grid_filter = [True, False]   # REMOVEOUTLIERS option
+grid_label_smoothing = [0.7]  # Label smoothing for generator
+grid_lambda_div = [0]      
+grid_filter = [True]   # REMOVEOUTLIERS option
+
+EVALUATE = False  # Set to True to evaluate the model after training
+
+############################################################################################
 
 # Set random seed for reproducibility
 SEED = 1
@@ -91,8 +96,7 @@ def run_experiment(latent_dim, fold, lr_gen, lr_disc, gen_loss, disc_loss,
         data_version = 'clean'
     else:
         data_version = 'full'
-    exp_name = (f"latent{latent_dim}_cl{galaxy_class}_lrgen{lr_gen}_lrdisc{lr_disc}_"
-                f"gl{gen_loss}_dl{disc_loss}_ab{adam_betas}_wd{weight_decay}_"
+    exp_name = (f"ss{sample_size}_cl{galaxy_class}_lrgen{lr_gen}_lrdisc{lr_disc}_gl{gen_loss}_dl{disc_loss}_"
                 f"ls{label_smoothing}_ld{lambda_div}_dv{data_version}")
     exp_dir = os.path.join(output_dir, gan_type, f"{exp_name}_f{folds[-1]}")
     os.makedirs(exp_dir, exist_ok=True)
@@ -103,7 +107,7 @@ def run_experiment(latent_dim, fold, lr_gen, lr_disc, gen_loss, disc_loss,
         galaxy_class=galaxy_class,
         fold=fold,
         img_shape=(1, image_size, image_size),
-        sample_size=100000,
+        sample_size=sample_size,
         REMOVEOUTLIERS=REMOVEOUTLIERS,
         train=True
     )
@@ -133,8 +137,7 @@ def run_experiment(latent_dim, fold, lr_gen, lr_disc, gen_loss, disc_loss,
         raise ValueError("Unknown gan_type")
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    # Save example real images (6x6 grid)
-    save_images_tensorboard(train_images[:36], os.path.join(exp_dir, "ScatterGAN_example_real_images.png"), nrow=6)
+    save_images_tensorboard(train_images[:36], os.path.join(exp_dir, "ScatterGAN_example_real_images.png"), nrow=6)     # Save example real images (6x6 grid)
 
     optimizer_G = optim.Adam(generator.parameters(), lr=lr_gen, betas=adam_betas, weight_decay=weight_decay)
     optimizer_D = optim.Adam(discriminator.parameters(), lr=lr_disc, betas=adam_betas, weight_decay=weight_decay)
@@ -226,79 +229,96 @@ def run_experiment(latent_dim, fold, lr_gen, lr_disc, gen_loss, disc_loss,
     
     # Evaluation metrics
     
-    seeds = [0, 1, 2, 3, 4]
-    all_metrics = []
-
-    for seed in seeds:
-        torch.manual_seed(seed)
-        
-        with torch.no_grad():
-            eval_noise = torch.randn(len(train_images), latent_dim, 1, 1, device=device)
-            gen_sample = generator(eval_noise).detach().cpu()   
-            
-        if seed == 0:
-            plot_histograms(gen_sample, train_images, title1="Generated Images", title2="Train Images",
-                save_path=os.path.join(exp_dir, "histograms.png"))
-            plot_variance_histograms(gen_sample, train_images,
-                save_path=os.path.join(exp_dir, "variance_histograms.png"))   
-        
-        subset_size = 100
-        real_subset = train_images[:subset_size]
-        gen_subset = gen_sample[:subset_size]
-        
-        print('Length of real_subset:', len(real_subset))
-        print('Length of gen_subset:', len(gen_subset))
-        flattened_features = gen_sample.view(gen_sample.size(0), -1)
-        cluster_error, cluster_distance, cluster_std_dev = cluster_metrics(flattened_features, n_clusters=galaxy_class)
-        bhatta = bhattacharyya_coefficient(real_subset.cpu().numpy().flatten(), gen_subset.cpu().numpy().flatten())
-        tv_dist = total_variation_distance(real_subset.cpu().numpy().flatten(), gen_subset.cpu().numpy().flatten())
-        hist_int = histogram_intersection(real_subset.cpu().numpy().flatten(), gen_subset.cpu().numpy().flatten())
-        fid_score = calculate_fid(real_subset, gen_subset, device=device)
-        mse_score = F.mse_loss(gen_subset.to(device), real_subset.to(device)).item()
-        cmmd_score = calculate_cmmd(real_subset.to(device), gen_subset.to(device))
-        diversity_score = calculate_lpips_diversity(gen_subset)
-        
-        # --- NEW: Evaluate on variance histograms ---
-        # Compute the per-image standard deviation (variance) for real and generated images.
-        with torch.no_grad():
-            real_variances = train_images.view(train_images.size(0), -1).std(dim=1, unbiased=False)
-            gen_variances = gen_sample.view(gen_sample.size(0), -1).std(dim=1, unbiased=False)
-        subset_size_var = 100
-        real_var_subset = real_variances[:subset_size_var]
-        gen_var_subset = gen_variances[:subset_size_var]
-        var_mse = F.mse_loss(gen_var_subset.to(device), real_var_subset.to(device)).item()
-        var_bhattacharyya = bhattacharyya_coefficient(real_var_subset.cpu().numpy(), gen_var_subset.cpu().numpy())
-        var_tv_distance = total_variation_distance(real_var_subset.cpu().numpy(), gen_var_subset.cpu().numpy())
-        var_hist_int = histogram_intersection(real_var_subset.cpu().numpy(), gen_var_subset.cpu().numpy())
- 
-        
-        metrics = {
-            "fid_score": fid_score,  # calculated in your snippet
-            "mse_score": mse_score,
-            "lpips_diversity": diversity_score,
-            "bhattacharyya": bhatta,
-            "tv_distance": tv_dist,
-            "hist_intersection": hist_int,
-            "cmmd_score": cmmd_score,
-            "cluster_error": cluster_error,
-            "cluster_distance": cluster_distance,
-            "cluster_std_dev": cluster_std_dev,
-            "var_mse": var_mse,
-            "var_bhattacharyya": var_bhattacharyya,
-            "var_tv_distance": var_tv_distance,
-            "var_hist_intersection": var_hist_int,
-        }
-        all_metrics.append(metrics)
-
-    # Now, compute mean and std for each metric:
-    aggregated_metrics = {}
-    for key in all_metrics[0]:
-        values = [m[key] for m in all_metrics]
-        aggregated_metrics[key + '_mean'] = np.mean(values)
-        aggregated_metrics[key + '_std'] = np.std(values)
-
-    print(aggregated_metrics)
+    if EVALUATE:
     
+        seeds = [0, 1, 2, 3, 4]
+        all_metrics = []
+
+        for seed in seeds:
+            torch.manual_seed(seed)
+            
+            with torch.no_grad():
+                eval_noise = torch.randn(len(train_images), latent_dim, 1, 1, device=device)
+                gen_sample = generator(eval_noise).detach().cpu()   
+                
+            if seed == 0:
+                plot_histograms(gen_sample, train_images, title1="Generated Images", title2="Train Images",
+                    save_path=os.path.join(exp_dir, "histograms.png"))
+                plot_variance_histograms(gen_sample, train_images,
+                    save_path=os.path.join(exp_dir, "variance_histograms.png"))   
+            
+            subset_size = 100
+            real_subset = train_images[:subset_size]
+            gen_subset = gen_sample[:subset_size]
+            
+            flattened_features = gen_sample.view(gen_sample.size(0), -1)
+            cluster_error, cluster_distance, cluster_std_dev = cluster_metrics(flattened_features, n_clusters=galaxy_class)
+            bhatta = bhattacharyya_coefficient(real_subset.cpu().numpy().flatten(), gen_subset.cpu().numpy().flatten())
+            tv_dist = total_variation_distance(real_subset.cpu().numpy().flatten(), gen_subset.cpu().numpy().flatten())
+            hist_int = histogram_intersection(real_subset.cpu().numpy().flatten(), gen_subset.cpu().numpy().flatten())
+            fid_score = calculate_fid(real_subset, gen_subset, device=device)
+            mse_score = F.mse_loss(gen_subset.to(device), real_subset.to(device)).item()
+            cmmd_score = calculate_cmmd(real_subset.to(device), gen_subset.to(device))
+            diversity_score = calculate_lpips_diversity(gen_subset)
+            
+            # --- NEW: Evaluate on variance histograms ---
+            # Compute the per-image standard deviation (variance) for real and generated images.
+            with torch.no_grad():
+                real_variances = train_images.view(train_images.size(0), -1).std(dim=1, unbiased=False)
+                gen_variances = gen_sample.view(gen_sample.size(0), -1).std(dim=1, unbiased=False)
+            subset_size_var = 100
+            real_var_subset = real_variances[:subset_size_var]
+            gen_var_subset = gen_variances[:subset_size_var]
+            var_mse = F.mse_loss(gen_var_subset.to(device), real_var_subset.to(device)).item()
+            var_bhattacharyya = bhattacharyya_coefficient(real_var_subset.cpu().numpy(), gen_var_subset.cpu().numpy())
+            var_tv_distance = total_variation_distance(real_var_subset.cpu().numpy(), gen_var_subset.cpu().numpy())
+            var_hist_int = histogram_intersection(real_var_subset.cpu().numpy(), gen_var_subset.cpu().numpy())
+    
+            
+            metrics = {
+                "fid_score": fid_score,  # calculated in your snippet
+                "mse_score": mse_score,
+                "lpips_diversity": diversity_score,
+                "bhattacharyya": bhatta,
+                "tv_distance": tv_dist,
+                "hist_intersection": hist_int,
+                "cmmd_score": cmmd_score,
+                "cluster_error": cluster_error,
+                "cluster_distance": cluster_distance,
+                "cluster_std_dev": cluster_std_dev,
+                "var_mse": var_mse,
+                "var_bhattacharyya": var_bhattacharyya,
+                "var_tv_distance": var_tv_distance,
+                "var_hist_intersection": var_hist_int,
+            }
+            all_metrics.append(metrics)
+            
+        # Now, compute mean and std for each metric:
+        aggregated_metrics = {}
+        for key in all_metrics[0]:
+            values = [m[key] for m in all_metrics]
+            aggregated_metrics[key + '_mean'] = np.mean(values)
+            aggregated_metrics[key + '_std'] = np.std(values)
+
+    else:
+        # If EVALUATE is False, we skip the evaluation metrics
+        logging.info("Skipping evaluation metrics as EVALUATE is set to False.")
+        aggregated_metrics = {
+            "fid_score_mean": None,
+            "mse_score_mean": None,
+            "lpips_diversity_mean": None,
+            "cmmd_score_mean": None,
+            "cluster_error_mean": None,
+            "cluster_distance_mean": None,
+            "cluster_std_dev_mean": None,
+            "bhattacharyya_mean": None,
+            "tv_distance_mean": None,
+            "hist_intersection_mean": None,
+            "var_mse_mean": None,
+            "var_bhattacharyya_mean": None,
+            "var_tv_distance_mean": None,
+            "var_hist_intersection_mean": None
+        }
     
     return {
         "exp_name": exp_name,  # Kept for logging but will be dropped from the table
@@ -326,140 +346,140 @@ for latent_dim, fold, lr_gen, lr_disc, gen_loss, disc_loss, adam_betas, weight_d
     res = run_experiment(latent_dim, fold, lr_gen, lr_disc, gen_loss, disc_loss, adam_betas, weight_decay, label_smoothing, lambda_div, REMOVEOUTLIERS)
     results.append(res)
 
-# Create the summary table:
-df = pd.DataFrame(results)
-## Flatten the aggregated_metrics column into individual columns
-df = pd.concat([df.drop(columns=['aggregated_metrics']), df['aggregated_metrics'].apply(pd.Series)], axis=1)
+if EVALUATE:
+    # Create the summary table:
+    df = pd.DataFrame(results)
+    ## Flatten the aggregated_metrics column into individual columns
+    df = pd.concat([df.drop(columns=['aggregated_metrics']), df['aggregated_metrics'].apply(pd.Series)], axis=1)
 
-# Drop the exp_name column so it does not appear in the table.
-if 'exp_name' in df.columns:
-    df = df.drop(columns=['exp_name'])
-# Define the order of columns, including label_smoothing, lambda_div, and the new variance metrics.
+    # Drop the exp_name column so it does not appear in the table.
+    if 'exp_name' in df.columns:
+        df = df.drop(columns=['exp_name'])
+    # Define the order of columns, including label_smoothing, lambda_div, and the new variance metrics.
 
+    # Suppose df is your DataFrame with aggregated metrics for each experiment.
+    # First, define which metrics are "lower is better"
+    lower_is_better = [
+        'fid_score_mean', 'mse_score_mean', 'cmmd_score_mean', 'cluster_error_mean', 
+        'cluster_distance_mean', 'cluster_std_dev_mean', 'bhattacharyya_mean', 
+        'tv_distance_mean', 'hist_intersection_mean', 'var_mse_mean', 
+        'var_bhattacharyya_mean', 'var_tv_distance_mean', 'var_hist_intersection_mean'
+    ]
 
-# Suppose df is your DataFrame with aggregated metrics for each experiment.
-# First, define which metrics are "lower is better"
-lower_is_better = [
-    'fid_score_mean', 'mse_score_mean', 'cmmd_score_mean', 'cluster_error_mean', 
-    'cluster_distance_mean', 'cluster_std_dev_mean', 'bhattacharyya_mean', 
-    'tv_distance_mean', 'hist_intersection_mean', 'var_mse_mean', 
-    'var_bhattacharyya_mean', 'var_tv_distance_mean', 'var_hist_intersection_mean'
-]
+    # Normalize each metric column across experiments.
+    df_norm = df.copy()
+    for col in lower_is_better:
+        # Invert these metrics so higher is better.
+        df_norm[col] = -df_norm[col]
 
-# Normalize each metric column across experiments.
-df_norm = df.copy()
-for col in lower_is_better:
-    # Invert these metrics so higher is better.
-    df_norm[col] = -df_norm[col]
+    # Then, for each metric, compute a z-score:
+    for col in df_norm.columns:
+        if col not in ['exp_dir', 'rep_image_path', 'REMOVEOUTLIERS']:
+            if pd.api.types.is_numeric_dtype(df_norm[col]):
+                df_norm[col] = (df_norm[col] - df_norm[col].mean()) / (df_norm[col].std() + 1e-8)
 
-# Then, for each metric, compute a z-score:
-for col in df_norm.columns:
-    if col not in ['exp_dir', 'rep_image_path', 'REMOVEOUTLIERS']:
-        if pd.api.types.is_numeric_dtype(df_norm[col]):
-            df_norm[col] = (df_norm[col] - df_norm[col].mean()) / (df_norm[col].std() + 1e-8)
+    # Exclude losses from composite score computation:
+    exclude_cols = ['exp_dir', 'rep_image_path', 'REMOVEOUTLIERS', 'label_smoothing', 'lambda_div', 'latent_dim', 'lr_gen', 'lr_disc', 'gen_loss', 'disc_loss',
+                    'final_generator_loss', 'final_discriminator_loss']
+    metric_cols = [col for col in df_norm.columns if col not in exclude_cols]
+    numeric_metric_cols = [col for col in metric_cols if pd.api.types.is_numeric_dtype(df_norm[col])]
+    df['composite_score'] = df_norm[numeric_metric_cols].mean(axis=1)
 
-# Exclude losses from composite score computation:
-exclude_cols = ['exp_dir', 'rep_image_path', 'REMOVEOUTLIERS', 'label_smoothing', 'lambda_div', 'latent_dim', 'lr_gen', 'lr_disc', 'gen_loss', 'disc_loss',
-                'final_generator_loss', 'final_discriminator_loss']
-metric_cols = [col for col in df_norm.columns if col not in exclude_cols]
-numeric_metric_cols = [col for col in metric_cols if pd.api.types.is_numeric_dtype(df_norm[col])]
-df['composite_score'] = df_norm[numeric_metric_cols].mean(axis=1)
+    # Now sort the DataFrame by the composite score (assuming higher is better)
+    df = df.sort_values(by='composite_score', ascending=False)
 
-# Now sort the DataFrame by the composite score (assuming higher is better)
-df = df.sort_values(by='composite_score', ascending=False)
+    print("Best overall experiment based on composite score:")
+    print(df.iloc[0])
 
-print("Best overall experiment based on composite score:")
-print(df.iloc[0])
+    # Optionally, update your columns list to include the composite score
+    cols = [
+        'final_generator_loss', 'final_discriminator_loss', 'mse_score_mean', 'lpips_diversity_mean',
+        'fid_score_mean', 'cmmd_score_mean', 'cluster_error_mean', 'cluster_distance_mean', 'cluster_std_dev_mean',
+        'bhattacharyya_mean', 'tv_distance_mean', 'hist_intersection_mean',
+        'var_mse_mean', 'var_bhattacharyya_mean', 'var_tv_distance_mean', 'var_hist_intersection_mean',
+        'latent_dim', 'lr_gen', 'lr_disc', 'gen_loss', 'disc_loss', 'label_smoothing',
+        'lambda_div', 'REMOVEOUTLIERS', 'composite_score'
+    ]
 
-# Optionally, update your columns list to include the composite score
-cols = [
-    'final_generator_loss', 'final_discriminator_loss', 'mse_score_mean', 'lpips_diversity_mean',
-    'fid_score_mean', 'cmmd_score_mean', 'cluster_error_mean', 'cluster_distance_mean', 'cluster_std_dev_mean',
-    'bhattacharyya_mean', 'tv_distance_mean', 'hist_intersection_mean',
-    'var_mse_mean', 'var_bhattacharyya_mean', 'var_tv_distance_mean', 'var_hist_intersection_mean',
-    'latent_dim', 'lr_gen', 'lr_disc', 'gen_loss', 'disc_loss', 'label_smoothing',
-    'lambda_div', 'REMOVEOUTLIERS', 'composite_score'
-]
+    print("\nSummary of all experiments (sorted by composite score):")
+    print(df[cols].to_string())
 
-print("\nSummary of all experiments (sorted by composite score):")
-print(df[cols].to_string())
+    # Group metrics into "mean ± std" format for LaTeX
+    mean_std_pairs = [
+        ("fid_score_mean", "fid_score_std"),
+        ("mse_score_mean", "mse_score_std"),
+        ("lpips_diversity_mean", "lpips_diversity_std"),
+        ("cmmd_score_mean", "cmmd_score_std"),
+        ("cluster_error_mean", "cluster_error_std"),
+        ("cluster_distance_mean", "cluster_distance_std"),
+        ("cluster_std_dev_mean", "cluster_std_dev_std"),
+        ("bhattacharyya_mean", "bhattacharyya_std"),
+        ("tv_distance_mean", "tv_distance_std"),
+        ("hist_intersection_mean", "hist_intersection_std"),
+        ("var_mse_mean", "var_mse_std"),
+        ("var_bhattacharyya_mean", "var_bhattacharyya_std"),
+        ("var_tv_distance_mean", "var_tv_distance_std"),
+        ("var_hist_intersection_mean", "var_hist_intersection_std"),
+    ]
 
-# Group metrics into "mean ± std" format for LaTeX
-mean_std_pairs = [
-    ("fid_score_mean", "fid_score_std"),
-    ("mse_score_mean", "mse_score_std"),
-    ("lpips_diversity_mean", "lpips_diversity_std"),
-    ("cmmd_score_mean", "cmmd_score_std"),
-    ("cluster_error_mean", "cluster_error_std"),
-    ("cluster_distance_mean", "cluster_distance_std"),
-    ("cluster_std_dev_mean", "cluster_std_dev_std"),
-    ("bhattacharyya_mean", "bhattacharyya_std"),
-    ("tv_distance_mean", "tv_distance_std"),
-    ("hist_intersection_mean", "hist_intersection_std"),
-    ("var_mse_mean", "var_mse_std"),
-    ("var_bhattacharyya_mean", "var_bhattacharyya_std"),
-    ("var_tv_distance_mean", "var_tv_distance_std"),
-    ("var_hist_intersection_mean", "var_hist_intersection_std"),
-]
+    # Create a new DataFrame with the formatted metrics
+    latex_df = df.copy()
 
-# Create a new DataFrame with the formatted metrics
-latex_df = df.copy()
+    for mean_col, std_col in mean_std_pairs:
+        if mean_col in latex_df and std_col in latex_df:
+            latex_df[mean_col.replace("_mean", "")] = latex_df.apply(
+                lambda row: f"{row[mean_col]:.3f} ± {row[std_col]:.3f}", axis=1
+            )
 
-for mean_col, std_col in mean_std_pairs:
-    if mean_col in latex_df and std_col in latex_df:
-        latex_df[mean_col.replace("_mean", "")] = latex_df.apply(
-            lambda row: f"{row[mean_col]:.3f} ± {row[std_col]:.3f}", axis=1
-        )
+    # Keep only relevant columns (remove stds, keep formatted means)
+    drop_cols = [std for _, std in mean_std_pairs]
+    latex_df = latex_df.drop(columns=drop_cols)
 
-# Keep only relevant columns (remove stds, keep formatted means)
-drop_cols = [std for _, std in mean_std_pairs]
-latex_df = latex_df.drop(columns=drop_cols)
-
-# Define final columns to keep and their order (add any you want)
-final_cols = [
-    'latent_dim', 'lr_gen', 'lr_disc', 'label_smoothing', 'lambda_div', 'REMOVEOUTLIERS',
-    'FID', 'MSE', 'LPIPS', 'CMMD', 'Cluster Error', 'Cluster Dist', 'Cluster Std',
-    'Bhattacharyya', 'TV Dist', 'Hist Int',
-    'Var MSE', 'Var Bhatt', 'Var TV', 'Var Hist',
-    'composite_score'
-]
-
-
-# Some renaming for nice LaTeX headers (optional)
-latex_df = latex_df.rename(columns={
-    'fid_score': 'FID',
-    'mse_score': 'MSE',
-    'lpips_diversity': 'LPIPS',
-    'cmmd_score': 'CMMD',
-    'cluster_error': 'Cluster Error',
-    'cluster_distance': 'Cluster Dist',
-    'cluster_std_dev': 'Cluster Std',
-    'bhattacharyya': 'Bhattacharyya',
-    'tv_distance': 'TV Dist',
-    'hist_intersection': 'Hist Int',
-    'var_mse': 'Var MSE',
-    'var_bhattacharyya': 'Var Bhatt',
-    'var_tv_distance': 'Var TV',
-    'var_hist_intersection': 'Var Hist',
-})
-
-# Output LaTeX-ready table
-latex_output = latex_df[final_cols].to_latex(index=False, escape=False)
-with open(os.path.join(output_dir, "summary_table_latex.tex"), "w") as f:
-    f.write(latex_output)
-print("Saved LaTeX-formatted summary table.")
-
-# Create a vertical version of the best experiment row for LaTeX
-best_row = latex_df[final_cols].iloc[[0]].T.reset_index()
-best_row.columns = ['Metric', 'Value']
-vertical_latex = best_row.to_latex(index=False, escape=False)
-
-with open(os.path.join(output_dir, "summary_table_vertical.tex"), "w") as f:
-    f.write(vertical_latex)
-print("Saved vertical LaTeX-formatted table.")
+    # Define final columns to keep and their order (add any you want)
+    final_cols = [
+        'latent_dim', 'lr_gen', 'lr_disc', 'label_smoothing', 'lambda_div', 'REMOVEOUTLIERS',
+        'FID', 'MSE', 'LPIPS', 'CMMD', 'Cluster Error', 'Cluster Dist', 'Cluster Std',
+        'Bhattacharyya', 'TV Dist', 'Hist Int',
+        'Var MSE', 'Var Bhatt', 'Var TV', 'Var Hist',
+        'composite_score'
+    ]
 
 
-# Now, the experiment with the highest composite score could be considered the best overall.
-best_experiment = df.loc[df['composite_score'].idxmax()]
-print("Best overall experiment based on composite score:")
-print(best_experiment[['latent_dim', 'lr_gen', 'lr_disc', 'gen_loss', 'disc_loss', 'label_smoothing', 'lambda_div', 'REMOVEOUTLIERS', 'composite_score']])
+    # Some renaming for nice LaTeX headers (optional)
+    latex_df = latex_df.rename(columns={
+        'fid_score': 'FID',
+        'mse_score': 'MSE',
+        'lpips_diversity': 'LPIPS',
+        'cmmd_score': 'CMMD',
+        'cluster_error': 'Cluster Error',
+        'cluster_distance': 'Cluster Dist',
+        'cluster_std_dev': 'Cluster Std',
+        'bhattacharyya': 'Bhattacharyya',
+        'tv_distance': 'TV Dist',
+        'hist_intersection': 'Hist Int',
+        'var_mse': 'Var MSE',
+        'var_bhattacharyya': 'Var Bhatt',
+        'var_tv_distance': 'Var TV',
+        'var_hist_intersection': 'Var Hist',
+    })
+
+    # Output LaTeX-ready table
+    latex_output = latex_df[final_cols].to_latex(index=False, escape=False)
+    with open(os.path.join(output_dir, f"summary_table_latex_{gan_type}_{galaxy_class}_{epochs}.tex"), "w") as f:
+        f.write(latex_output)
+    print("Saved LaTeX-formatted summary table.")
+
+    # Create a vertical version of the best experiment row for LaTeX
+    best_row = latex_df[final_cols].iloc[[0]].T.reset_index()
+    best_row.columns = ['Metric', 'Value']
+    vertical_latex = best_row.to_latex(index=False, escape=False)
+
+    with open(os.path.join(output_dir, f"summary_table_vertical_{gan_type}_{galaxy_class}_{epochs}.tex"), "w") as f:
+        f.write(vertical_latex)
+    print("Saved vertical LaTeX-formatted table.")
+
+
+    # Now, the experiment with the highest composite score could be considered the best overall.
+    best_experiment = df.loc[df['composite_score'].idxmax()]
+    print("Best overall experiment based on composite score:")
+    print(best_experiment[['latent_dim', 'lr_gen', 'lr_disc', 'gen_loss', 'disc_loss', 'label_smoothing', 'lambda_div', 'REMOVEOUTLIERS', 'composite_score']])

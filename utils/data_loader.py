@@ -7,6 +7,10 @@ from sklearn.model_selection import StratifiedKFold
 from scipy.ndimage import label
 import skimage
 from torch.utils.data import DataLoader
+from utils.GAN_models import load_gan_generator
+from utils.calc_tools import get_model_name, normalize_to_0_1, normalize_to_minus1_1
+from utils.calc_tools import generate_from_noise
+from utils.calc_tools import load_model
 import cv2
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
@@ -20,7 +24,6 @@ from PIL import Image
 
 root_path =  '/users/mbredber/scratch/Scripts/data/' #'/home/sysadmin/Scripts/data/'  #
 SEED = 42 
-
 
 ######################################################################################################
 ################################### GENERAL STUFF ####################################################
@@ -80,6 +83,158 @@ def get_classes():
         # MGCLS 1x1034x1024
         {"tag": 40, "length": 12, "description": "MGCLS DCRE"}
     ]
+
+
+########################################################################################################
+####################################### LOAD ARTIFICIAL DATA ###########################################
+########################################################################################################
+
+def get_synthetic(
+    num_generate,
+    gen_model_name,
+    cls,
+    galaxy_classes = [10, 11, 12, 13],
+    batch_size = 256,
+    img_shape=(1, 128, 128),
+    FILTERGEN=False,
+    model_kwargs = {},
+    fold=0,
+    device='cpu'
+):
+    """
+    Returns two lists: generated_images_list and generated_labels_list
+    following the GAN, DDPM or VAE branch & optional duplicate‑filtering.
+    """
+    try:
+        if gen_model_name == 'GAN':
+            gan_path = (
+                f"./GAN/generators/generator_"
+                f"{model_kwargs['gan_type']}_latent{model_kwargs['gan_latent_dim']}"
+                f"_cl{cls}_lrgen{model_kwargs['lr_gen']}"
+                f"_lrdisc{model_kwargs['lr_disc']}_gl{model_kwargs['gan_gen_loss']}"
+                f"_dl{model_kwargs['gan_disc_loss']}_ab{model_kwargs['gan_adam_beta']}"
+                f"_wd{model_kwargs['gan_weight_decay']}_ls{model_kwargs['gan_label_smoothing']}"
+                f"_ld{model_kwargs['gan_lambda_div']}_dv{model_kwargs['gan_data_version']}"
+                f"_ep{model_kwargs['gan_epoch']}_f{fold}.pth"
+            )
+            model = load_gan_generator(
+                gan_path,
+                latent_dim=model_kwargs['gan_latent_dim']
+            )
+            latent_dim = model_kwargs['gan_latent_dim']
+
+        elif gen_model_name == 'DDPM':
+            ddpm_file_map = {
+                10: "generated_fr1_8k.npy",
+                11: "generated_fr2_8k.npy",
+                12: "generated_compact_8k.npy",
+                13: "generated_bent_8k.npy"
+            }
+            ddpm_path = f"/users/mbredber/data/DDPM/{ddpm_file_map[cls]}"
+            ddpm_data = np.load(ddpm_path)                 # (N,128,128)
+            ddpm_data = torch.from_numpy(ddpm_data)        # (N,128,128)
+            ddpm_data = ddpm_data.unsqueeze(1).float()     # (N,1,128,128)
+            ddpm_data = normalize_to_0_1(ddpm_data)
+            ddpm_data = normalize_to_minus1_1(ddpm_data)
+
+            if ddpm_data.shape[0] < num_generate:
+                print(f"Warning: num_generate ({num_generate}) is larger than available data ({ddpm_data.shape[0]}). Reducing to available data.")
+                num_generate = ddpm_data.shape[0]
+            else:
+                ddpm_data = ddpm_data[:num_generate]
+            batch = ddpm_data[:num_generate]
+            labels = torch.ones(num_generate, dtype=torch.long) * (cls - min(galaxy_classes))
+            return [batch], [labels]
+
+        else:  # VAE
+            path = get_model_name(
+                cls,
+                model_kwargs['VAE_train_size'][cls],
+                gen_model_name,
+                fold=fold
+            )
+            model = load_model(
+                path,
+                scatshape=model_kwargs['scatshape'],
+                hidden_dim1=model_kwargs['hidden_dim1'],
+                hidden_dim2=model_kwargs['hidden_dim2'],
+                latent_dim=model_kwargs['vae_latent_dim'],
+                num_classes=len(galaxy_classes)
+            )
+            latent_dim = model_kwargs['vae_latent_dim']
+
+    except Exception as e:
+        print(f"Model not found for class: {cls}. Error: {e}")
+        exit(1)
+
+    model.eval()
+    num_batches = (num_generate + batch_size - 1) // batch_size
+    total_generated = 0
+    total_unique = 0
+    generated_images_list = []
+    generated_labels_list = []
+    tol = 1e-3
+
+    for batch_idx in range(num_batches):
+        current_batch = min(batch_size, num_generate - batch_idx * batch_size)
+        total_generated += current_batch
+        labels = torch.ones(current_batch, dtype=torch.long) * (cls - min(galaxy_classes))
+
+        with torch.no_grad():
+            batch = generate_from_noise(
+                model,
+                latent_dim=latent_dim,
+                num_samples=current_batch,
+                DEVICE=device
+            )
+
+        if batch.shape[0] != current_batch:
+            batch = batch.permute(1, 0, 2, 3)
+
+        if FILTERGEN and cls != 12:
+            # (1) remove duplicates within this batch
+            flat = batch.view(current_batch, -1)
+            dists = torch.cdist(flat, flat, p=2)
+            dists.fill_diagonal_(1e6)
+            mask = torch.ones(current_batch, dtype=torch.bool, device=batch.device)
+            for i in range(current_batch):
+                if mask[i]:
+                    mask[i+1:] &= ~(dists[i, i+1:] < tol)
+            uniq_imgs = batch[mask]
+            uniq_lbls = labels[mask]
+            n_unique = len(uniq_imgs)
+
+            # (2) remove duplicates vs. prior batches
+            if generated_images_list:
+                new_flat = uniq_imgs.view(n_unique, -1)
+                prev = torch.cat(generated_images_list, dim=0)
+                prev_flat = prev.view(prev.size(0), -1)
+                cross = torch.cdist(new_flat, prev_flat, p=2)
+                keep = torch.ones(n_unique, dtype=torch.bool, device=uniq_imgs.device)
+                for i in range(n_unique):
+                    if torch.any(cross[i] < tol):
+                        keep[i] = False
+                uniq_imgs = uniq_imgs[keep]
+                uniq_lbls = uniq_lbls[keep]
+                n_unique = len(uniq_imgs)
+
+            total_unique += n_unique
+            print("Shape of batch_unique_images:", uniq_imgs.shape)
+
+            # (3) augment
+            aug_imgs, aug_lbls = augment_images(uniq_imgs, uniq_lbls, img_shape=img_shape)
+            generated_images_list.append(aug_imgs)
+            generated_labels_list.append(aug_lbls)
+        else:
+            generated_images_list.append(batch)
+            generated_labels_list.append(labels)
+
+    if FILTERGEN and cls != 12:
+        frac = (total_generated - total_unique) / total_generated * 100
+        print(f"Class {cls}: Removed {frac:.2f}% of images "
+              f"(Generated: {total_generated}, Unique: {total_unique})")
+
+    return generated_images_list, generated_labels_list
 
 
 ######################################################################################################
@@ -1070,8 +1225,11 @@ def load_FIRST(path=None, fold=0, target_classes=None, img_shape=(1, 300, 300), 
             # Convert from list to tensor
             train_images = torch.stack(train_images)
             eval_images = torch.stack(eval_images)
-            
-        return train_images, train_labels, eval_images, eval_labels # Note that eval contains valid if train else test images
+            train_labels = torch.tensor(train_labels, dtype=torch.long)
+            eval_labels  = torch.tensor(eval_labels,  dtype=torch.long)
+
+        return train_images, train_labels, eval_images, eval_labels
+
     else:
         raise ValueError("Fold must be an integer between 0 and 5")
 

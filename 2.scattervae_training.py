@@ -1,16 +1,13 @@
 import itertools
 import os
 from utils.data_loader import load_galaxies, get_classes
-#from utils.data_loader2 import load_galaxies, get_classes
 from torch.utils.data import DataLoader, TensorDataset, random_split
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import LambdaLR
 from kymatio.torch import Scattering2D
 from utils.models import get_model
-#from utils.models2 import get_model
 from utils.calc_tools import normalize_to_minus1_1, normalize_to_0_1
 from utils.custom_mse import NormalisedWeightedMSELoss, CustomMSELoss, WeightedMSELoss, RadialWeightedMSELoss, CustomIntensityWeightedMSELoss, MaxIntensityMSELoss, StandardMSELoss, CombinedMSELoss, ExperimentalMSELoss, BasicMSELoss
 from utils.scatter_reduction import lavg, ldiff
