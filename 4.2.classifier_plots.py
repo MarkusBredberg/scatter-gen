@@ -37,7 +37,7 @@ galaxy_classes = [10, 11, 12, 13]
 learning_rates = [1e-3]
 regularization_params = [0]
 lambda_values = [0, 0.25, 0.5, 1, 2, 5, 10, 20, 50, 100]
-num_experiments = 20
+num_experiments = 5
 folds = [5] # Number of folds for cross-validation
 generators = ['DDPM']
 classifier = ["ProjectModel", "Rustige", "ScatterNet", "ScatterDual"][1]  # Choose one classifier model model
@@ -65,8 +65,8 @@ if galaxy_classes == [31, 32, 33, 34, 35, 36]:
 elif galaxy_classes == [10, 11, 12, 13]:
     if FILTERED:
         if max(folds) == 5:
-            #dataset_sizes = [[200], [200], [200], [200], [200], [200]] # Used for faster trouble shooting
-            dataset_sizes = [[13936], [13936], [13936], [13936], [13936], [13936]] 
+            dataset_sizes = [[200], [200], [200], [200], [200], [200]] # Used for faster trouble shooting
+            #dataset_sizes = [[13936], [13936], [13936], [13936], [13936], [13936]] 
             #dataset_sizes = [[139, 1393, 13936], [139, 1393, 13936], [139, 1393, 13936], [139, 1393, 13936], [139, 1393, 13936], [139, 1393, 13936]] # Need length = folds[0] = 1
         else:
             #dataset_sizes = [[12368], [12336], [12368], [12368], [12368]] 
@@ -179,6 +179,7 @@ metrics = tot_metrics
 ###############################################
 
 
+
 def visualize_tsne_by_class(model, real_loader, gen_loader, device='cpu', save_path="./classifier/tsne_by_class.png"):
     model = model.to(device).eval()
     def extract_feats(loader):
@@ -201,10 +202,31 @@ def visualize_tsne_by_class(model, real_loader, gen_loader, device='cpu', save_p
     X2d = TSNE(perplexity=30, max_iter=2000, random_state=42).fit_transform(X)
 
     plt.figure(figsize=(6,6))
-    scatter = plt.scatter(X2d[:,0], X2d[:,1], c=y, cmap='tab10', alpha=0.7)
-    plt.legend(*scatter.legend_elements(), title="Galaxy class")
+    plt.scatter(X2d[:,0], X2d[:,1], c=y, cmap='tab10', alpha=0.7)
+
+    # define names in index‐order
+    # names by index
+    class_names = ['FRI', 'FRII', 'Compact', 'Bent']
+    n_real = real_feats.shape[0]
+    is_real = np.concatenate([np.ones(n_real, bool), np.zeros(len(gen_feats), bool)])
+    cmap = plt.get_cmap('tab10')
+    norm = plt.Normalize(vmin=0, vmax=len(class_names)-1)
+
+    plt.figure(figsize=(6,6))
+    for cls in np.unique(y):
+        for flag, marker in [(True,'o'), (False,'x')]:
+            idx = np.where((y==cls) & (is_real==flag))
+            plt.scatter(
+                X2d[idx,0], X2d[idx,1],
+                c=[cmap(norm(cls))],
+                marker=marker,
+                label=f"{class_names[int(cls)]} {'Real' if flag else 'Fake'}",
+                alpha=0.6
+            )
+    plt.legend(ncol=2, title="Class + Source")
     plt.title("t-SNE of penultimate-layer features, colored by class")
     plt.savefig(save_path)
+
 
 
 def visualize_feature_tsne(model, real_loader, gen_loader,

@@ -1,7 +1,6 @@
 #Works for J=2,3,4 Dual, MLP, CNN
 import torch
 import torch.nn as nn
-import os
 
 NORM = ['NONE', 'BATCH', 'GROUP'][1]
 if NORM=='NONE':

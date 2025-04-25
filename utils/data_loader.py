@@ -14,7 +14,7 @@ from utils.calc_tools import load_model
 import cv2
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
-from collections import defaultdict
+from collections import defaultdict, Counter
 import os
 from PIL import Image
 
@@ -536,14 +536,15 @@ def filter_away_faintest(images, labels, region=(128, 128), threshold=0.1, save_
             filtered_images.append(img)
             filtered_labels.append(label)
 
-    # Print how many images were removed
-    total_images = len(images)
+    total_per_class = Counter(labels)
+    removed_per_class = Counter(lbl for _, lbl, _ in removed_images)
+
+    for cls, total_cnt in total_per_class.items():
+        removed_cnt = removed_per_class.get(cls, 0)
+        fraction = removed_cnt / total_cnt * 100 if total_cnt else 0
+        print(f"Class {cls}: removed {removed_cnt}/{total_cnt} images ({fraction:.2f}%)")
+
     removed_count = len(removed_images)
-    if total_images > 0:
-        portion_removed = (removed_count / total_images) * 100
-        print(f"Removed {removed_count} out of {total_images} images ({portion_removed:.2f}%).")
-    else:
-        print("No images to filter.")
 
     # Plot removed images
     if removed_count > 0:
@@ -564,8 +565,6 @@ def filter_away_faintest(images, labels, region=(128, 128), threshold=0.1, save_
         print("No images were filtered away.")
 
     return filtered_images, filtered_labels
-
-
 
 
 def remove_outliers(images, labels, threshold=0.1, peak_threshold=0.6, intensity_threshold=200.0, max_regions=3, region_size=(64, 64), v="training", PLOTFILTERED=False):

@@ -499,10 +499,6 @@ for gen_model_name in gen_model_names:
                     if NORMALISESCSTOPM:
                         test_scat_coeffs = normalize_to_minus1_1(test_scat_coeffs)
 
-            ###### RELABEL ######
-            min_label = test_labels.min()
-            test_labels = test_labels - min_label
-
             # Prepare input data
             mock_tensor = torch.zeros_like(test_images)
             if classifier in ['ScatterNet', 'ScatterDual']:
@@ -539,7 +535,8 @@ for gen_model_name in gen_model_names:
             print("Classes used: ", galaxy_classes)
 
         if fold == 0:
-            plot_images_by_class(train_images, labels=train_labels, num_images=5, save_path=f"./classifier/{gen_model_name}_{galaxy_classes}_{num_galaxies}_example_inputs.png")
+            print("Random train_labels: ", train_labels[:10] + 10)
+            plot_images_by_class(train_images, labels=train_labels+10, num_images=5, save_path=f"./classifier/{classifier}_{gen_model_name}_{galaxy_classes}_{num_galaxies}_example_originals.pdf")
 
         ##########################################################
         ############# ARTIFICIAL AUGMENTATION ####################

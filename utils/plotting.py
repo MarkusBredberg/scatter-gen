@@ -1,6 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from torchvision.utils import make_grid, save_image
+from utils.data_loader import get_classes
 import torch
 import os
 
@@ -96,23 +97,42 @@ def plot_images_by_class(images, labels, num_images=5, save_path="./classifier/u
     Plots a specified number of input images in a row for each class with the class label as a title.
     """
     unique_labels = np.unique(labels)
-    fig, axes = plt.subplots(len(unique_labels), num_images, figsize=(num_images * 3, len(unique_labels) * 3))
-    
+    fig, axes = plt.subplots(len(unique_labels), num_images,
+                         figsize=(num_images * 3, len(unique_labels) * 3),
+                         constrained_layout=True)
+
+
+    # make room on the left for the row labels
+    fig.subplots_adjust(left=0.2)
+
+    # right after fig, build a tag→description map
+    classes = get_classes()
+    class_map = {c["tag"]: c["description"] for c in classes}
+
     for i, label in enumerate(unique_labels):
         label_images = images[labels == label][:num_images]
-        
-        # Set the class label as the row title
-        axes[i, 0].set_ylabel(f"Class {label}", fontsize=14, labelpad=10)
-        
+
+        # use the description instead of the tag number
+        axes[i, 0].set_ylabel(
+            class_map[label],
+            fontsize=20,
+            rotation=0,
+            ha="right",
+            va="center"
+        )
+
         for j in range(num_images):
             ax = axes[i, j]
-            ax.imshow(label_images[j].squeeze(), cmap='gray')
-            ax.axis('off')
-    
-    plt.tight_layout()
+            ax.imshow(label_images[j].squeeze(), cmap="gray")
+            # always clear ticks
+            ax.set_xticks([]); ax.set_yticks([])
+            # only fully turn off the non‐first columns
+            if j > 0:
+                ax.axis("off")
+
+    fig.subplots_adjust(left=0.2, top=0.95, bottom=0.05, hspace=0.15)
     plt.savefig(save_path)
     plt.close()
-
 
 def plot_original_images(data_loader, image_size, grid_size, save_path=None, save=True):
     # Initialize an empty container to hold the grid of images
