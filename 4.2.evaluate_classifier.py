@@ -2,6 +2,7 @@ import numpy as np
 import pickle
 import torch
 from sklearn.metrics import accuracy_score, confusion_matrix, roc_curve, auc
+from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import label_binarize
 from utils.data_loader import get_classes, load_galaxies, get_synthetic
 import itertools
@@ -36,11 +37,12 @@ galaxy_classes = [10, 11, 12, 13]
 #galaxy_classes = [31, 32, 33, 34, 35, 36]
 learning_rates = [1e-3]
 regularization_params = [0]
-lambda_values = [0, 0.25, 0.5, 1, 2, 5, 10, 20, 50, 100]
+lambda_values = [0, 0.25, 0.5, 1, 2]
 num_experiments = 5
 folds = [5] # Number of folds for cross-validation
 generators = ['DDPM']
-classifier = ["ProjectModel", "Rustige", "ScatterNet", "ScatterDual"][1]  # Choose one classifier model model
+classifier = ["ProjectModel", "Rustige", "DANN", "ScatterNet", "ScatterDual"][1]  # Choose one classifier model model
+print("Classifier:", classifier)
 
 # Define consistent color mapping
 colors = {
@@ -65,15 +67,15 @@ if galaxy_classes == [31, 32, 33, 34, 35, 36]:
 elif galaxy_classes == [10, 11, 12, 13]:
     if FILTERED:
         if max(folds) == 5:
-            dataset_sizes = [[200], [200], [200], [200], [200], [200]] # Used for faster trouble shooting
+            #dataset_sizes = [[200], [200], [200], [200], [200], [200]] # Used for faster trouble shooting
             #dataset_sizes = [[13936], [13936], [13936], [13936], [13936], [13936]] 
-            #dataset_sizes = [[139, 1393, 13936], [139, 1393, 13936], [139, 1393, 13936], [139, 1393, 13936], [139, 1393, 13936], [139, 1393, 13936]] # Need length = folds[0] = 1
+            dataset_sizes = [[139, 1393, 13936], [139, 1393, 13936], [139, 1393, 13936], [139, 1393, 13936], [139, 1393, 13936], [139, 1393, 13936]] 
         else:
-            #dataset_sizes = [[12368], [12336], [12368], [12368], [12368]] 
-            dataset_sizes = [[200], [200], [200], [200], [200], [200]]
+            dataset_sizes = [[123, 1236, 12368], [123, 1233, 12336], [123, 1236, 12368], [123, 1236, 12368], [123, 1236, 12368]] 
+            #dataset_sizes = [[200], [200], [200], [200], [200], [200]]
     elif max(folds) == 5:
         #dataset_sizes = [[140, 1406, 14064], [140, 1406, 14064], [140, 1406, 14064], [140, 1406, 14064], [140, 1406, 14064], [140, 1406, 14064]] # Used for faster trouble shooting
-        dataset_sizes = [[139, 1393, 13936], [139, 1393, 13936], [139, 1393, 13936], [139, 1393, 13936], [139, 1393, 13936], [139, 1393, 13936]] # Need length = folds[0] = 1
+        dataset_sizes = [[139, 1393, 13936], [139, 1393, 13936], [139, 1393, 13936], [139, 1393, 13936], [139, 1393, 13936], [139, 1393, 13936]]
         #dataset_sizes = [[281, 2812, 14064, 28128], [281, 2812, 14064, 28128], [281, 2812, 14064, 28128], 
         #                    [281, 2812, 14064, 28128], [281, 2812, 14064, 28128], [281, 2812, 14064, 28128]] #Need length = folds[0] = 1
     else:
@@ -81,7 +83,7 @@ elif galaxy_classes == [10, 11, 12, 13]:
         dataset_sizes = [[12464], [12464], [12464], [12464], [12528]]
 
 if 'GAN' in generators:
-    latent_dim = 64 
+    latent_dim = 128 
 
 if TESTONGENERATED:
     lambda_values = [8]  # To identify and distinguish TESTONGENERATED from other runs
@@ -179,12 +181,84 @@ metrics = tot_metrics
 ###############################################
 
 
-
-def visualize_tsne_by_class(model, real_loader, gen_loader, device='cpu', save_path="./classifier/tsne_by_class.png"):
+def visualize_tsne_by_class(model, real_loader, gen_loader, wrappername, perplexity=30, n_iter=2000, device='cpu', save_path="./classifier/tsne_by_class.png"):
     model = model.to(device).eval()
     def extract_feats(loader):
         feats = []
-        handle = model.fc1.register_forward_hook(lambda m, inp, out: feats.append(out.detach().cpu()))
+        # pick the penultimate feature‐vector layer automatically
+        if hasattr(model, 'feature_extractor'):
+            penult = model.feature_extractor
+        elif hasattr(model, 'fc1'):
+            penult = model.fc1
+        elif hasattr(model, 'fc2'):
+            penult = model.fc2
+        elif hasattr(model, 'classifier'):
+            # ProjectModel puts its hidden Linear at classifier[1]
+            penult = model.classifier[1]
+        else:
+            raise RuntimeError(f"Can't find a penultimate layer to hook in {model.__class__.__name__}")
+        handle = penult.register_forward_hook(lambda m, inp, out: feats.append(out.detach().cpu()))
+
+        for x, _, y in loader:
+            _ = model(x.to(device))
+        handle.remove()
+        return torch.cat(feats,0).numpy()
+
+    real_feats = extract_feats(real_loader)
+    real_labels = real_loader.dataset.tensors[2].numpy()   # assuming your DataLoader stores labels
+
+    gen_feats  = extract_feats(gen_loader)
+    gen_labels = gen_loader.dataset.tensors[2].numpy()     # same here
+
+    # stack & fit TSNE
+    y   = np.concatenate([real_labels, gen_labels])
+    X     = np.vstack([real_feats, gen_feats])
+    X_emb = TSNE(perplexity=perplexity, max_iter=n_iter, random_state=42).fit_transform(X)
+
+    # split back into real vs gen
+    n_real = real_feats.shape[0]
+    real_2d, gen_2d = X_emb[:n_real], X_emb[n_real:]
+
+    # 1) scatter as before
+    plt.figure(figsize=(6,6))
+    plt.scatter(real_2d[:,0], real_2d[:,1], alpha=0.6, label='real')
+    plt.scatter(gen_2d [:,0], gen_2d [:,1], alpha=0.6, label='generated')
+    plt.legend()
+    plt.title(f't-SNE of penultimate-layer features ({wrappername})')
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    plt.savefig(save_path)
+    plt.close()
+
+    # 2) now heatmap density
+    plot_tsne_density(
+        real_2d, gen_2d,
+        bins=100,
+        save_path=save_path.replace(".png","_density.png")
+    )
+
+    print(f"Saved t-SNE plots to {save_path} and density to {save_path.replace('.png','_density.png')}")
+
+
+
+def old_visualize_tsne_by_class(model, real_loader, gen_loader, wrappername, device='cpu', save_path="./classifier/tsne_by_class.png"):
+    model = model.to(device).eval()
+    def extract_feats(loader):
+        feats = []
+        # pick the penultimate feature‐vector layer automatically
+        if hasattr(model, 'feature_extractor'):
+            penult = model.feature_extractor
+        elif hasattr(model, 'fc1'):
+            penult = model.fc1
+        elif hasattr(model, 'fc2'):
+            penult = model.fc2
+        elif hasattr(model, 'classifier'):
+            # ProjectModel puts its hidden Linear at classifier[1]
+            penult = model.classifier[1]
+        else:
+            raise RuntimeError(f"Can't find a penultimate layer to hook in {model.__class__.__name__}")
+        handle = penult.register_forward_hook(lambda m, inp, out: feats.append(out.detach().cpu()))
+
         for x, _, y in loader:
             _ = model(x.to(device))
         handle.remove()
@@ -224,12 +298,12 @@ def visualize_tsne_by_class(model, real_loader, gen_loader, device='cpu', save_p
                 alpha=0.6
             )
     plt.legend(ncol=2, title="Class + Source")
-    plt.title("t-SNE of penultimate-layer features, colored by class")
+    plt.title(f"t-SNE of penultimate-layer features ({wrappername}), colored by class")
     plt.savefig(save_path)
 
 
 
-def visualize_feature_tsne(model, real_loader, gen_loader,
+def visualize_feature_tsne(model, real_loader, gen_loader, wrappername,
                            device='cpu',
                            perplexity=30, n_iter=1000,
                            save_path="./classifier/tsne_by_truth.png"):
@@ -241,19 +315,26 @@ def visualize_feature_tsne(model, real_loader, gen_loader,
 
     def extract_feats(loader):
         feats = []
-        # register hook on fc1
-        def hook_fn(module, inp, out):
-            feats.append(out.detach().cpu())
-        handle = model.fc1.register_forward_hook(hook_fn)
+        # pick the penultimate layer automatically
+        if hasattr(model, 'feature_extractor'):
+            penult = model.feature_extractor
+        elif hasattr(model, 'fc1'):
+            penult = model.fc1
+        elif hasattr(model, 'classifier'):
+            penult = model.classifier[1]
+        else:
+            raise RuntimeError(f"No penultimate layer found in {type(model).__name__}")
 
-        # run data through the network
+        handle = penult.register_forward_hook(lambda m, inp, out: feats.append(out.detach().cpu()))
         with torch.no_grad():
             for imgs, _, _ in loader:
                 _ = model(imgs.to(device))
         handle.remove()
 
-        # concatenate all batches
+        if not feats:
+            raise RuntimeError("No features were captured by the hook—check that your loader and model are on the same device.")
         return torch.cat(feats, dim=0).numpy()
+
 
     # extract
     real_feats = extract_feats(real_loader)
@@ -271,12 +352,97 @@ def visualize_feature_tsne(model, real_loader, gen_loader,
     plt.scatter(X_emb[n_real:, 0], X_emb[n_real:, 1],
                 alpha=0.6, label='generated')
     plt.legend()
-    plt.title('t-SNE of penultimate-layer features (RustigeClassifier)')
+    plt.title(f't-SNE of penultimate-layer features ({wrappername})')
     plt.tight_layout()
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     plt.savefig(save_path)
     plt.close()
     print(f"Saved t-SNE plot to {save_path}")
+    
+def plot_tsne_density(real_coords, gen_coords, bins=100, save_path="./classifier/tsne_density.png"):
+    """
+    real_coords / gen_coords: np.array of shape (N,2) from your TSNE embedding
+    """
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    
+    h1 = ax1.hist2d(real_coords[:,0], real_coords[:,1],
+                    bins=bins, cmap='viridis')
+    ax1.set_title("Real t-SNE density")
+    fig.colorbar(h1[3], ax=ax1)
+    
+    h2 = ax2.hist2d(gen_coords[:,0], gen_coords[:,1],
+                    bins=bins, cmap='viridis')
+    ax2.set_title("Generated t-SNE density")
+    fig.colorbar(h2[3], ax=ax2)
+    
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close(fig)
+    
+
+def plot_overlap_image_grids(model, real_loader, gen_loader,
+                             device='cpu',
+                             top_k=25,
+                             save_dir="./classifier"):
+    """
+    Finds the top_k generated images whose penultimate‐layer features
+    are closest / furthest to any real feature, and plots each as a 5×5 grid.
+    """
+    model = model.to(device).eval()
+
+    # reuse your extract_feats hook to grab features
+    def extract_feats_and_imgs(loader):
+        feats, imgs = [], []
+        # hook on penult
+        if hasattr(model, 'feature_extractor'):
+            penult = model.feature_extractor
+        elif hasattr(model, 'fc1'):
+            penult = model.fc1
+        elif hasattr(model, 'classifier'):
+            penult = model.classifier[1]
+        else:
+            raise RuntimeError("No penultimate layer found")
+        handle = penult.register_forward_hook(lambda m, inp, out: feats.append(out.detach().cpu()))
+        for x, _, _ in loader:
+            imgs.append(x.cpu())
+            _ = model(x.to(device))
+        handle.remove()
+        X = torch.cat(imgs, dim=0).numpy()      # (N,1,H,W)
+        F = torch.cat(feats, dim=0).numpy()     # (N,D)
+        return F, X
+
+    real_feats, _      = extract_feats_and_imgs(real_loader)
+    gen_feats, gen_imgs = extract_feats_and_imgs(gen_loader)
+
+    # build NN on real feats
+    nn = NearestNeighbors(n_neighbors=1).fit(real_feats)
+    dists, _ = nn.kneighbors(gen_feats)
+    dists = dists.ravel()
+    order = np.argsort(dists)
+
+    def plot_grid(imgs, title, fname):
+        fig, axes = plt.subplots(5, 5, figsize=(5, 5))
+        for ax, im in zip(axes.flat, imgs):
+            ax.imshow(im.squeeze(), cmap='gray')
+            ax.axis('off')
+        fig.suptitle(title)
+        plt.tight_layout()
+        os.makedirs(save_dir, exist_ok=True)
+        plt.savefig(f"{save_dir}/{fname}")
+        plt.close(fig)
+
+    # closest
+    closest_idx = order[:top_k]
+    plot_grid(gen_imgs[closest_idx],
+              "Top 25 Generated ➞ Real‐like",
+              f"{galaxy_classes}_{classifier}_{generator}_{dataset_sizes[folds[-1]][-1]}_gen_top25_real_like.png")
+
+    # furthest
+    furthest_idx = order[-top_k:]
+    plot_grid(gen_imgs[furthest_idx],
+              "Top 25 Generated ➞ Outliers",
+              f"{galaxy_classes}_{classifier}_{generator}_{dataset_sizes[folds[-1]][-1]}_gen_top25_outliers.png")
 
 def plot_accuracy_vs_lambda(lambda_values, metrics, generator, dataset_sizes=dataset_sizes,
                             folds=folds, num_experiments=num_experiments,
@@ -398,7 +564,7 @@ def plot_all_metrics_vs_dataset_size(
             plt.tight_layout()
 
             os.makedirs(save_dir, exist_ok=True)
-            fname = f'{save_dir}/{galaxy_classes}_{classifier}_{generator}_{final_subset_size}_{metric}_vs_dataset_size.png'
+            fname = f'{save_dir}/{galaxy_classes}_{classifier}_{generator}_{dataset_sizes[folds[-1]][-1]}_{metric}_vs_dataset_size.png'
             plt.savefig(fname)
             plt.close()
 
@@ -934,15 +1100,14 @@ metric_stats = defaultdict(lambda: defaultdict(list))
 for lambda_generate in lambda_values:
     try:
         for fold in folds:
-            final_subset_size = dataset_sizes[fold][-1]
             for experiment in range(num_experiments):
                 for lr in learning_rates:
                     for reg in regularization_params:
                         for metric in metric_rankings.keys():
-                            key = f"{generator}_{metric}_{final_subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}"
+                            key = f"{generator}_{metric}_{dataset_sizes[folds[-1]][-1]}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}"
                             try:
                                 value = metrics[key]
-                                metric_rankings[metric].append((value, fold, final_subset_size, experiment, lr, reg, lambda_generate))
+                                metric_rankings[metric].append((value, fold, dataset_sizes[folds[-1]][-1], experiment, lr, reg, lambda_generate))
                                 metric_stats[lambda_generate][metric].append(value)
                             except KeyError:
                                 continue
@@ -967,11 +1132,11 @@ for lambda_generate in lambda_values:
 print("\nTraining Times:")
 # Aggregate training times per merged category
 merged_times = {}
-for subset_size, folds in training_times.items():
+for subset_size, train_folds in training_times.items():
     # Only process keys that are in merge_map
     if subset_size in merge_map:
         category = merge_map[subset_size]
-        for fold, elapsed_times in folds.items():
+        for _, elapsed_times in train_folds.items():
             if not elapsed_times:
                 continue
             if category not in merged_times:
@@ -988,6 +1153,116 @@ if "25000" in merged_times and merged_times["25000"]:
 else:
     print("No training times recorded for merged category '25000'.")
 
+
+for generator in generators:
+
+    # --- build real‐data loader (test set) ---
+    _, _, test_images, test_labels = load_galaxies(
+        galaxy_class=galaxy_classes, fold=5,
+        img_shape=(1,128,128), sample_size=None,
+        REMOVEOUTLIERS=FILTERED, train=False
+    )
+    real_ds = TensorDataset(test_images, torch.zeros_like(test_images), test_labels)
+    real_loader = DataLoader(real_ds, batch_size=256, shuffle=False)
+
+
+    # --- build generated‐data loader using get_synthetic() ---
+    all_imgs, all_labels = [], []
+
+    if generators == ['GAN']:   
+        model_kwargs = {
+            'NORMALISEIMGS': False,  # Normalise images to [0, 1]
+            'NORMALISEIMGSTOPM': False,  # Normalise images to [-1, 1] 
+            'gan_type': 'GAN',
+            'gan_latent_dim': 64,
+            'lr_gen': 1e-4,
+            'lr_disc': 1e-4,
+            'gan_gen_loss': 'MSE',
+            'gan_disc_loss': 'BCE',
+            'gan_adam_beta': 0.9,
+            'gan_weight_decay': 0.0,
+            'gan_label_smoothing': 0.0,
+            'gan_lambda_div': 0.0,
+            'gan_data_version': 0,
+            'gan_epoch': 100}
+
+    elif generators == ['Dual']:
+        from kymatio.torch import Scattering2D
+        scattering = Scattering2D(J=2, L=12, shape=(128, 128), max_order=2)   
+        scat_coeffs = scattering(test_images[:5])    
+        model_kwargs = {
+            'NORMALISEIMGS': False,  # Normalise images to [0, 1]
+            'NORMALISEIMGSTOPM': False,  # Normalise images to [-1, 1] 
+            'scatshape': np.shape(scat_coeffs)[1:],
+            'hidden_dim1': 128,
+            'hidden_dim2': 128,
+            'latent_dim': 64,
+            'vae_latent_dim': 64}
+
+    else:
+        model_kwargs = {}
+        
+
+        
+    for cls in galaxy_classes:
+        imgs_list, labels_list = get_synthetic(
+            num_generate=len(test_images),
+            gen_model_name=generator,
+            cls=cls,
+            galaxy_classes=galaxy_classes,
+            batch_size=256,
+            img_shape=(1,128,128),
+            FILTERGEN=FILTERED,
+            model_kwargs=model_kwargs,
+            fold=5,
+            device=device
+        )
+        all_imgs   .extend(imgs_list)
+        all_labels .extend(labels_list)
+
+    gen_images = torch.cat(all_imgs,   dim=0)
+    gen_labels = torch.cat(all_labels, dim=0)
+    gen_ds     = TensorDataset(gen_images, torch.zeros_like(gen_images), gen_labels)
+    gen_loader = DataLoader(gen_ds, batch_size=256, shuffle=False)
+
+    print("clf_models type:", type(clf_models))
+    if isinstance(clf_models, dict):
+        print("clf_models keys:", list(clf_models.keys()))
+    else:
+        print(clf_models)
+
+    print("clf_models", clf_models)
+
+    # RustigeClassifier, ProjectModel, MLPClassifier, DualClassifier, DANNClassifier
+    if classifier == 'Rustige':
+        wrappername = 'RustigeClassifier'
+    elif classifier == 'ProjectModel':
+        wrappername = 'ProjectModel'
+    elif classifier == 'DANN':
+        wrappername = 'DANNClassifier'
+
+    # pick the one and only model wrapper you saved
+    wrappername = next(iter(clf_models))
+    wrapper     = clf_models[wrappername]
+    model   = wrapper['model']                 # the actual nn.Module you trained
+    model   = model.to(device).eval()
+
+    visualize_feature_tsne(
+        model,
+        real_loader,
+        gen_loader,
+        wrappername,
+        device=device,
+        perplexity=30,
+        n_iter=1000,
+        save_path=f"./classifier/{galaxy_classes}_{classifier}_{generator}_{dataset_sizes[folds[-1]][-1]}_tsne.png"
+    )
+    visualize_tsne_by_class(model, real_loader, gen_loader, wrappername, device=device,
+                            save_path=f"./classifier/{galaxy_classes}_{classifier}_{generator}_{dataset_sizes[folds[-1]][-1]}_tsne_by_class.png"
+    )
+
+    plot_overlap_image_grids(model, real_loader, gen_loader, device=device)
+
 plot_loss(generators, history=history)
 #plot_roc_curves(metrics, generator)
 plot_avg_roc_curves(metrics, generators, merge_map=merge_map)
@@ -996,90 +1271,3 @@ plot_accuracy_vs_lambda(lambda_values, metrics, generator)
 #plot_confusion_matrix(metrics, generator)
 plot_avg_std_confusion_matrix(metrics, generators, merge_map=merge_map, metric_stats=metric_stats)
 plot_diff_avg_std_confusion_matrix(metrics, generators, merge_map=merge_map, metric_stats=metric_stats)
-
-# --- build real‐data loader (test set) ---
-_, _, test_images, test_labels = load_galaxies(
-    galaxy_class=galaxy_classes, fold=5,
-    img_shape=(1,128,128), sample_size=None,
-    REMOVEOUTLIERS=FILTERED, train=False
-)
-real_ds = TensorDataset(test_images, torch.zeros_like(test_images), test_labels)
-real_loader = DataLoader(real_ds, batch_size=256, shuffle=False)
-
-
-# --- build generated‐data loader using get_synthetic() ---
-all_imgs, all_labels = [], []
-
-if generators == ['GAN']:   
-    model_kwargs = {
-        'gan_type': 'GAN',
-        'gan_latent_dim': 64,
-        'lr_gen': 1e-4,
-        'lr_disc': 1e-4,
-        'gan_gen_loss': 'MSE',
-        'gan_disc_loss': 'BCE',
-        'gan_adam_beta': 0.9,
-        'gan_weight_decay': 0.0,
-        'gan_label_smoothing': 0.0,
-        'gan_lambda_div': 0.0,
-        'gan_data_version': 0,
-        'gan_epoch': 100}
-
-elif generators == ['Dual']:
-    from kymatio.torch import Scattering2D
-    scattering = Scattering2D(J=2, L=12, shape=(128, 128), max_order=2)   
-    scat_coeffs = scattering(test_images[:5])    
-    model_kwargs = {
-        'scatshape': np.shape(scat_coeffs)[1:],
-        'hidden_dim1': 128,
-        'hidden_dim2': 128,
-        'latent_dim': 64,
-        'vae_latent_dim': 64}
-
-else:
-    model_kwargs = {}
-    
-for cls in galaxy_classes:
-    imgs_list, labels_list = get_synthetic(
-        num_generate=len(test_images),
-        gen_model_name='DDPM',
-        cls=cls,
-        galaxy_classes=galaxy_classes,
-        batch_size=256,
-        img_shape=(1,128,128),
-        FILTERGEN=FILTERED,
-        model_kwargs=model_kwargs,
-        fold=5,
-        device=device
-    )
-    all_imgs   .extend(imgs_list)
-    all_labels .extend(labels_list)
-
-gen_images = torch.cat(all_imgs,   dim=0)
-gen_labels = torch.cat(all_labels, dim=0)
-gen_ds     = TensorDataset(gen_images, torch.zeros_like(gen_images), gen_labels)
-gen_loader = DataLoader(gen_ds, batch_size=256, shuffle=False)
-
-print("clf_models type:", type(clf_models))
-if isinstance(clf_models, dict):
-    print("clf_models keys:", list(clf_models.keys()))
-else:
-    print(clf_models)
-
-from utils.classifiers import RustigeClassifier
-
-wrapper = clf_models['RustigeClassifier']   # this is a dict with key "model"
-model   = wrapper['model']                 # the actual nn.Module you trained
-model   = model.to(device).eval()
-visualize_feature_tsne(
-    model,
-    real_loader,
-    gen_loader,
-    device=device,
-    perplexity=30,
-    n_iter=1000,
-    save_path=f"./classifier/{galaxy_classes}_{classifier}_{generator}_{final_subset_size}_tsne.png"
-)
-visualize_tsne_by_class(model, real_loader, gen_loader, device=device,
-                        save_path=f"./classifier/{galaxy_classes}_{classifier}_{generator}_{final_subset_size}_tsne_by_class.png"
-)

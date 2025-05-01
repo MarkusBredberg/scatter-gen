@@ -22,8 +22,8 @@ from kymatio.torch import Scattering2D
 # -------------------------------
 # Fixed parameters for hyperparameter optimization
 # -------------------------------
-galaxy_class = 10
-folds = [5]
+galaxy_class = 13
+folds = [0, 1, 2, 3, 4]
 batch_size = 256
 epochs = 5000
 image_size = 128

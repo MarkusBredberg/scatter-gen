@@ -1,6 +1,19 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.autograd import Function
+
+class GradReverse(Function):
+    @staticmethod
+    def forward(ctx, x, lambd):
+        ctx.lambd = lambd
+        return x.clone()
+    @staticmethod
+    def backward(ctx, grad_out):
+        return grad_out.neg() * ctx.lambd, None
+
+def grad_reverse(x, lambd=1.0):
+    return GradReverse.apply(x, lambd)
 
 
 class ProjectModel(nn.Module):
@@ -170,7 +183,47 @@ class RustigeClassifier(nn.Module):
         x = self.softmax(x)
         return x
     
-    
+# DANN classifier
+
+class DANNClassifier(nn.Module):
+    def __init__(self, input_shape, num_classes=4):
+        super(DANNClassifier, self).__init__()
+        
+        # shared feature extractor (conv → norm → act → flatten → FC)
+        C, H, W = input_shape
+        self.feature_extractor = nn.Sequential(
+            nn.Conv2d(C, 8, 3, 2, 1),
+            nn.LayerNorm([8, H//2,  W//2]),
+            nn.LeakyReLU(),
+            nn.Conv2d(8, 16, 3, 2, 1),
+            nn.LayerNorm([16, H//4, W//4]),
+            nn.LeakyReLU(),
+            nn.Conv2d(16, 32, 3, 2, 1),
+            nn.LayerNorm([32, H//8, W//8]),
+            nn.LeakyReLU(),
+            nn.Conv2d(32, 16, 3, 2, 1),
+            nn.LayerNorm([16, H//16, W//16]),
+            nn.LeakyReLU(),
+            nn.Conv2d(16, 16, 2, 2),
+            nn.LayerNorm([16, H//32, W//32]),
+            nn.LeakyReLU(),
+            nn.Flatten(),
+            nn.Linear(16*(H//32)*(W//32), 100),
+            nn.LeakyReLU()
+        )
+
+        # two heads: one for your galaxy‐class, one for real/fake domain
+        self.classifier_head = nn.Linear(100, num_classes)
+        self.domain_head     = nn.Linear(100, 2)
+
+
+    def forward(self, x, alpha=1.0):
+        feat = self.feature_extractor(x)                 # [B,100]
+        class_logits  = self.classifier_head(feat)       # [B,num_classes]
+        dom_feat      = grad_reverse(feat, lambd=alpha)  # GRL on feature
+        domain_logits = self.domain_head(dom_feat)       # [B,2]
+        return class_logits, domain_logits
+
 # Scattering classifier
 class MLPClassifier(nn.Module):
     def __init__(self, input_dim, num_classes=4, hidden_dim=120):

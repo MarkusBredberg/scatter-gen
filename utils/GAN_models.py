@@ -5,7 +5,7 @@ import torch.nn.utils.spectral_norm as spectral_norm
 
 
 def load_gan_generator(path, latent_dim, device='cpu'):
-    generator = DCGANGenerator(latent_dim=latent_dim)
+    generator = DCGANGenerator(latent_dim=latent_dim).to(device)
     state_dict = torch.load(path, map_location=device)
     model_state = generator.state_dict()
     filtered_state_dict = {}

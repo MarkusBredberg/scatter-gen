@@ -97,6 +97,7 @@ def get_synthetic(
     batch_size = 256,
     img_shape=(1, 128, 128),
     FILTERGEN=False,
+    CLIPDDPM=True,
     model_kwargs = {},
     fold=0,
     device='cpu'
@@ -134,8 +135,12 @@ def get_synthetic(
             ddpm_data = np.load(ddpm_path)                 # (N,128,128)
             ddpm_data = torch.from_numpy(ddpm_data)        # (N,128,128)
             ddpm_data = ddpm_data.unsqueeze(1).float()     # (N,1,128,128)
-            ddpm_data = normalize_to_0_1(ddpm_data)
-            ddpm_data = normalize_to_minus1_1(ddpm_data)
+            if CLIPDDPM:
+                ddpm_data = np.clip(ddpm_data, 0, 1)
+            if model_kwargs['NORMALISEIMGS']:
+                ddpm_data = normalize_to_0_1(ddpm_data)
+                if model_kwargs['NORMALISETOPM']:
+                    ddpm_data = normalize_to_minus1_1(ddpm_data)
 
             if ddpm_data.shape[0] < num_generate:
                 print(f"Warning: num_generate ({num_generate}) is larger than available data ({ddpm_data.shape[0]}). Reducing to available data.")

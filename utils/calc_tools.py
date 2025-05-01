@@ -6,7 +6,7 @@ import numpy as np
 from sklearn.cluster import KMeans
 from sklearn.metrics import pairwise_distances
 from scipy.ndimage import label
-from utils.models import get_model
+from utils.VAE_models import get_model
 from sklearn.metrics import mean_squared_error
 from torchvision.models import inception_v3, Inception_V3_Weights
 from scipy import linalg

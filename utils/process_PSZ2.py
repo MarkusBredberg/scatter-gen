@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
-import os, glob, shutil
+
+# Add clipping to the image. One image per time
+
+import os, shutil
 import numpy           as np
 import matplotlib.pyplot as plt
+from scipy.ndimage import gaussian_filter
 
 from astropy.io         import fits
 from astropy.wcs        import WCS
@@ -92,9 +96,37 @@ for slug in os.listdir(FITS_ROOT):
     # make cutout
     cut = Cutout2D(data, (pix_x,pix_y), CROP_SZ, wcs=wcs2d).data
     out_png = os.path.join(CROP_ROOT, f"{slug}_{label}.png")
-    vmin, vmax = np.percentile(cut, [5,95])
-    plt.imsave(out_png, cut, origin='lower', cmap='gray',
-               vmin=vmin, vmax=vmax)
+    # subtract large‐scale background
+    background = gaussian_filter(cut, sigma=50)
+    flat       = cut - background
+
+    # compute the detection floor in "flat" units (~3σ of the smoothed image)
+    # (use the same SIGMA you use in detect_diffuse)
+    local_rms   = np.nanstd(gaussian_filter(cut, sigma=3))
+    detect_floor = SIGMA * local_rms
+    # floor the map at that level (i.e. discard everything below it, but
+    # don’t zero–out *all* pixel values—just clamp them to the floor)
+    floored = np.clip(flat, detect_floor, None)
+
+    # asinh stretch
+    stretch = np.arcsinh(floored / np.nanstd(floored))
+
+    # re‐normalize to 0–1
+    vmin, vmax = np.nanpercentile(stretch, [1,99])
+    normed     = np.clip((stretch - vmin) / (vmax - vmin), 0, 1)
+    
+    # ─── hard‐clip the “noise floor” ───────────────────────────────────────────
+    # find the same threshold level you’d use for detection
+    noise_level = np.nanstd(gaussian_filter(cut, sigma=3))
+    clip_level  = np.arcsinh((SIGMA * noise_level) / np.nanstd(flat))
+    # map that back into the 0–1 range
+    clip_norm   = (clip_level - vmin) / (vmax - vmin)
+    # zero everything below that
+    normed[normed < clip_norm] = 0.0
+
+    # save
+    plt.imsave(out_png, normed, origin='lower', cmap='gray')
+    plt.close()
 
     # lookup metadata
     if slug in meta.index:
