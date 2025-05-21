@@ -11,7 +11,7 @@ from utils.plotting import plot_GAN_losses, plot_histograms, save_images_tensorb
 from utils.GAN_loss_functions import pick_gan_loss_functions
 from utils.calc_tools import (
     bhattacharyya_coefficient, total_variation_distance, histogram_intersection,
-    calculate_fid, calculate_lpips_diversity, calculate_cmmd, change_images, cluster_metrics    
+    calculate_fid, calculate_lpips_diversity, calculate_cmmd, change_images, cluster_metrics, normalise_images    
 )
 import itertools
 from tqdm import tqdm
@@ -19,13 +19,19 @@ import pandas as pd
 import torch.nn.functional as F
 from kymatio.torch import Scattering2D
 
+"""
+This script trains a GAN model that outputs images in the range [-1, 1].
+The model is trained on galaxy images, and the training process includes hyperparameter optimization.
+The script also evaluates the model using various metrics and saves the results in a LaTeX format.
+"""
+
 # -------------------------------
 # Fixed parameters for hyperparameter optimization
 # -------------------------------
-galaxy_class = 13
+galaxy_class = 41
 folds = [0, 1, 2, 3, 4]
 batch_size = 256
-epochs = 5000
+epochs = 500
 image_size = 128
 sample_size = 100 # Number of images to sample from the dataset
 save_interval = 100
@@ -37,17 +43,17 @@ if gan_type == "ScatterDualGAN":
 
 # Hyperparameter grid (grid_filter controls REMOVEOUTLIERS)
 grid_latent_dim = [128]
-grid_lr_gen = [1e-3]       # Separate learning rate for generator
+grid_lr_gen = [1e-3, 1e-4]       # Separate learning rate for generator
 grid_lr_disc = [1e-4]      # Separate learning rate for discriminator
-grid_gen_loss = ["MSE"]
+grid_gen_loss = ["MSE", "BCE"]
 grid_disc_loss = ["BCE"]
 grid_adam_betas = [(0.5, 0.999)]
 grid_weight_decay = [0.0]
-grid_label_smoothing = [0.7]  # Label smoothing for generator
-grid_lambda_div = [0]      
+grid_label_smoothing = [0.7, 0.9, 1]  # Label smoothing for generator
+grid_lambda_div = [0, 0.1]      
 grid_filter = [True]   # REMOVEOUTLIERS option
 
-EVALUATE = False  # Set to True to evaluate the model after training
+EVALUATE = True  # Set to True to evaluate the model after training
 
 ############################################################################################
 
@@ -106,16 +112,18 @@ def run_experiment(latent_dim, fold, lr_gen, lr_disc, gen_loss, disc_loss,
     data = load_galaxies(
         galaxy_class=galaxy_class,
         fold=fold,
-        img_shape=(1, image_size, image_size),
+        downsample_size=(image_size, image_size),
         sample_size=sample_size,
         REMOVEOUTLIERS=REMOVEOUTLIERS,
         train=True
     )
+    
     train_images, _, _, _ = data
     perm = torch.randperm(len(train_images))
     train_images = train_images[perm].float()
-    # Normalize images to [-1, 1] because of the tanh activation in the generator
-    train_images = 2 * (train_images - train_images.min()) / (train_images.max() - train_images.min()) - 1
+    train_images = normalise_images(train_images, -1, 1) # Normalize images to [-1, 1] because of the tanh activation in the generator
+    
+    print("Loaded data for galaxy class", galaxy_class, "with shape", train_images.shape)
 
     # Choose dataset and initialize models depending on gan_type
     if gan_type == "ScatterDualGAN":

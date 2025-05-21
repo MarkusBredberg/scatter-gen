@@ -120,6 +120,203 @@ class NEWRustigeClassifier(nn.Module):
         x = self.softmax(x)
         return x
 
+class BinaryClassifier(nn.Module):
+    def __init__(self, input_shape, num_classes=2):
+        super(BinaryClassifier, self).__init__()
+
+        # Parse (channels, height, width) from input_shape
+        in_channels = input_shape[0]
+        height = input_shape[1]
+        width = input_shape[2]
+
+        # Convolutional block 1
+        self.conv1 = nn.Conv2d(
+            in_channels=in_channels, 
+            out_channels=8, 
+            kernel_size=3, 
+            stride=2, 
+            padding=1
+        )
+        self.bn1 = nn.BatchNorm2d(8)    
+        self.act1 = nn.LeakyReLU()
+        
+        # Convolutional block 2
+        self.conv2 = nn.Conv2d(8, 16, kernel_size=3, stride=2, padding=1)
+        self.bn2 = nn.BatchNorm2d(16)
+        self.act2 = nn.LeakyReLU()
+        
+        # Convolutional block 3
+        self.conv3 = nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1)
+        self.bn3 = nn.BatchNorm2d(32)
+        self.act3 = nn.LeakyReLU()
+        
+        # Convolutional block 4
+        self.conv4 = nn.Conv2d(32, 16, kernel_size=3, stride=2, padding=1)
+        self.bn4 = nn.BatchNorm2d(16)
+        self.act4 = nn.LeakyReLU()
+        
+        # Convolutional block 5
+        self.conv5 = nn.Conv2d(16, 16, kernel_size=2, stride=2)
+        self.bn5 = nn.BatchNorm2d(16)
+        self.act5 = nn.LeakyReLU()
+        
+        # Fully connected layers
+        # For (1, 128, 128) input, final size is (16, 4, 4) => 16 * 4 * 4 = 256
+        self.fc1   = nn.Linear(16 * (height // 32) * (width // 32), 100)
+        self.act6  = nn.LeakyReLU()
+        self.num_classes = num_classes
+        self.fc2 = nn.Linear(100, 1)
+
+    def forward(self, x, activation: bool = False):
+        x = self.act1(self.bn1(self.conv1(x)))
+        x = self.act2(self.bn2(self.conv2(x)))
+        x = self.act3(self.bn3(self.conv3(x)))
+        x = self.act4(self.bn4(self.conv4(x)))
+        x = self.act5(self.bn5(self.conv5(x)))
+        x = x.view(x.size(0), -1)
+        x = self.act6(self.fc1(x))
+        logits = self.fc2(x)
+        return logits.squeeze(1)
+    
+
+if False:
+    class ResidualBlock(nn.Module):
+        def __init__(self, in_ch, out_ch, stride=1):
+            super().__init__()
+            self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=stride, padding=1, bias=False)
+            self.bn1   = nn.BatchNorm2d(out_ch)
+            self.act   = nn.LeakyReLU(inplace=True)
+            self.conv2 = nn.Conv2d(out_ch, out_ch, kernel_size=3, stride=1, padding=1, bias=False)
+            self.bn2   = nn.BatchNorm2d(out_ch)
+            self.down = nn.Sequential()
+            if stride != 1 or in_ch != out_ch:
+                self.down = nn.Sequential(
+                    nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=stride, bias=False),
+                    nn.BatchNorm2d(out_ch)
+                )
+
+        def forward(self, x):
+            identity = self.down(x)
+            out = self.act(self.bn1(self.conv1(x)))
+            out = self.bn2(self.conv2(out))
+            return self.act(out + identity)
+    
+    class BinaryClassifier(nn.Module):
+        def __init__(self, input_shape, num_classes=2):
+            super().__init__()
+            in_channels = input_shape[0]
+
+            self.features = nn.Sequential(
+                nn.Conv2d(in_channels, 32, kernel_size=7, stride=2, padding=3, bias=False),
+                nn.BatchNorm2d(32),
+                nn.LeakyReLU(inplace=True),
+                nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
+
+                ResidualBlock(32,  64, stride=2),
+                ResidualBlock(64, 128, stride=2),
+                ResidualBlock(128,256, stride=2),
+                ResidualBlock(256,256, stride=2),
+            )
+
+            self.gap = nn.AdaptiveAvgPool2d(1)
+            self.fc  = nn.Linear(256, 1)
+
+        def forward(self, x):
+            x = self.features(x)
+            x = self.gap(x).view(x.size(0), -1)
+            return self.fc(x)
+
+else: 
+    if False:
+        class BinaryClassifier(nn.Module):
+            def __init__(self, input_shape, num_classes=2):
+                super(BinaryClassifier, self).__init__()
+
+                # Parse (channels, height, width) from input_shape
+                in_channels = input_shape[0]
+                height = input_shape[1]
+                width = input_shape[2]
+
+                # Convolutional block 1
+                self.conv1 = nn.Conv2d(
+                    in_channels=in_channels, 
+                    out_channels=32, 
+                    kernel_size=3, 
+                    stride=2, 
+                    padding=1
+                )
+                self.bn1 = nn.BatchNorm2d(32)    
+                self.act1 = nn.LeakyReLU()
+                
+                # Convolutional block 2
+                self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1)
+                self.bn2 = nn.BatchNorm2d(64)
+                self.act2 = nn.LeakyReLU()
+                
+                # Convolutional block 3
+                self.conv3 = nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1)
+                self.bn3 = nn.BatchNorm2d(128)
+                self.act3 = nn.LeakyReLU()
+                
+                # Convolutional block 4
+                self.conv4 = nn.Conv2d(128, 64, kernel_size=3, stride=2, padding=1)
+                self.bn4 = nn.BatchNorm2d(64)
+                self.act4 = nn.LeakyReLU()
+                
+                # Convolutional block 5
+                self.conv5 = nn.Conv2d(64, 32, kernel_size=2, stride=2)
+                self.bn5 = nn.BatchNorm2d(32)
+                self.act5 = nn.LeakyReLU()
+                
+                # Fully connected layers
+                # For (1, 128, 128) input, final size is (16, 4, 4) => 16 * 4 * 4 = 256
+                self.fc1 = nn.Linear(32 * (height // 32) * (width // 32), 100)
+                self.act6  = nn.LeakyReLU()
+                self.num_classes = num_classes
+                self.fc2 = nn.Linear(100, 1)
+
+            def forward(self, x, activation: bool = False):
+                x = self.act1(self.bn1(self.conv1(x)))
+                x = self.act2(self.bn2(self.conv2(x)))
+                x = self.act3(self.bn3(self.conv3(x)))
+                x = self.act4(self.bn4(self.conv4(x)))
+                x = self.act5(self.bn5(self.conv5(x)))
+                x = x.view(x.size(0), -1)
+                x = self.act6(self.fc1(x))
+                logits = self.fc2(x)
+                return logits.squeeze(1)
+    else:
+
+        class BinaryClassifier(nn.Module):
+            def __init__(self, input_shape):
+                super(BinaryClassifier, self).__init__()
+                in_channels = input_shape[0]  # should be 1 for grayscale
+
+                self.conv_layers = nn.Sequential(
+                    nn.Conv2d(in_channels, 32, kernel_size=7, stride=2, padding=3),
+                    nn.BatchNorm2d(32),
+                    nn.ReLU(inplace=True),
+                    nn.MaxPool2d(kernel_size=2),
+
+                    nn.Conv2d(32, 64, kernel_size=5, stride=2, padding=2),
+                    nn.BatchNorm2d(64),
+                    nn.ReLU(inplace=True),
+                    nn.MaxPool2d(kernel_size=2),
+
+                    nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+                    nn.BatchNorm2d(128),
+                    nn.ReLU(inplace=True),
+                    # collapse spatial dims to 1×1
+                    nn.AdaptiveAvgPool2d((1, 1))
+                )
+
+                self.classifier = nn.Linear(128, 1)
+
+            def forward(self, x):
+                x = self.conv_layers(x)                 # [B,128,1,1]
+                x = x.view(x.size(0), -1)               # [B,128]
+                return self.classifier(x)               # [B,1]
+
 
 class RustigeClassifier(nn.Module):
     def __init__(self, input_shape, num_classes=4):
@@ -165,24 +362,22 @@ class RustigeClassifier(nn.Module):
         # For (1, 128, 128) input, final size is (16, 4, 4) => 16 * 4 * 4 = 256
         self.fc1   = nn.Linear(16 * (height // 32) * (width // 32), 100)
         self.act6  = nn.LeakyReLU()
-        self.fc2   = nn.Linear(100, num_classes)
-        
-        # Final softmax (omit if you use nn.CrossEntropyLoss)
-        self.softmax = nn.Softmax(dim=1)
+        self.num_classes = num_classes
+        self.fc2 = nn.Linear(100, num_classes)
 
-    def forward(self, x):
+    def forward(self, x, activation: bool = False):
         x = self.act1(self.ln1(self.conv1(x)))
         x = self.act2(self.ln2(self.conv2(x)))
         x = self.act3(self.ln3(self.conv3(x)))
         x = self.act4(self.ln4(self.conv4(x)))
         x = self.act5(self.ln5(self.conv5(x)))
-        
-        x = x.view(x.size(0), -1)  # Flatten
+        x = x.view(x.size(0), -1)
         x = self.act6(self.fc1(x))
-        x = self.fc2(x)
-        x = self.softmax(x)
-        return x
-    
+        logits = self.fc2(x)
+        return logits
+
+
+
 # DANN classifier
 
 class DANNClassifier(nn.Module):

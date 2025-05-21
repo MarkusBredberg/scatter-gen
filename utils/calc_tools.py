@@ -6,7 +6,7 @@ import numpy as np
 from sklearn.cluster import KMeans
 from sklearn.metrics import pairwise_distances
 from scipy.ndimage import label
-from utils.VAE_models import get_model
+from utils.VAE_models import get_VAE_model
 from sklearn.metrics import mean_squared_error
 from torchvision.models import inception_v3, Inception_V3_Weights
 from scipy import linalg
@@ -153,6 +153,13 @@ def cluster_metrics(features, n_clusters=13):
 ###### IMAGE PROCESSING FUNCTIONS #############
 ###############################################
 
+def normalise_images(images, out_min=-1, out_max=1):
+    global_min = images.min()
+    global_max = images.max()
+    images = (images - global_min) / (global_max - global_min)   # now in [0,1]
+    return out_min + images * (out_max - out_min)                # now in [out_min,out_max]
+
+
 def change_images(images):
     # Apply random flipping 
     if np.random.rand() > 0.5:
@@ -168,32 +175,6 @@ def change_images(images):
     if np.random.rand() > 0.5:
         images = torch.rot90(images, 3, [2, 3])  # Rotate 270 degrees
     return images
-
-
-def normalize_to_0_1(images, batch_size=64):
-    normed_images = torch.zeros_like(images)  # Placeholder for the normalized images
-
-    # Split the images into smaller sub-batches
-    num_images = images.size(0)
-    for i in range(0, num_images, batch_size):
-        batch = images[i:i + batch_size]
-
-        # Min and max per sub-batch
-        min_vals = batch.view(batch.size(0), -1).min(dim=1, keepdim=True)[0].view(batch.size(0), 1, 1, 1)
-        max_vals = batch.view(batch.size(0), -1).max(dim=1, keepdim=True)[0].view(batch.size(0), 1, 1, 1)
-
-        # Normalize to [0, 1]
-        normed_batch = (batch - min_vals) / (max_vals - min_vals + 1e-8)
-        normed_batch[torch.isnan(normed_batch)] = 0.0  # Set any NaN values to 0
-        normed_images[i:i + batch_size] = normed_batch
-
-    return normed_images
-
-
-# Normalize each image individually to [-1, 1] after normalizing to [0, 1]
-def normalize_to_minus1_1(images):
-    return images * 2 - 1
-
 
 def get_main_and_secondary_peaks(images, threshold=0.1):
     peak_intensity_stats_all = []
@@ -314,7 +295,7 @@ def load_model(path, scatshape, hidden_dim1=256, hidden_dim2=128, latent_dim=64,
     name = path.split('_')[-2].split('.')[0]
     checkpoint = torch.load(path, map_location=DEVICE)
     state_dict = checkpoint['state_dict'] if 'state_dict' in checkpoint else checkpoint
-    model = get_model(name=name, scatshape=scatshape, hidden_dim1=hidden_dim1, hidden_dim2=hidden_dim2, latent_dim=latent_dim, num_classes=num_classes, J=J)
+    model = get_VAE_model(name=name, scatshape=scatshape, hidden_dim1=hidden_dim1, hidden_dim2=hidden_dim2, latent_dim=latent_dim, num_classes=num_classes, J=J)
 
     # Adapt the state_dict to match model's state_dict
     model_state_dict = model.state_dict()
@@ -342,7 +323,7 @@ def get_model_directory(galaxy_classes=11, num_galaxies=1001028, encoder='Dual',
 
 
 def generate_from_noise(model, img_shape=(1, 128, 128), latent_dim=128,
-                        num_samples=1000, NORMALISE_GENERATED_IMAGES=False, DEVICE=None):
+                        num_samples=1000, DEVICE=None):
     device = next(model.parameters()).device if DEVICE is None else torch.device(DEVICE)
     model.eval()
     with torch.no_grad():
@@ -366,9 +347,7 @@ def generate_from_noise(model, img_shape=(1, 128, 128), latent_dim=128,
             except Exception as e:
                 print("Error in reshaping generated images:", e)
                 raise
-
-        if NORMALISE_GENERATED_IMAGES:
-            generated_images = normalize_to_0_1(generated_images)
+            
         return generated_images
  
 

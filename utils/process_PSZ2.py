@@ -1,154 +1,131 @@
 #!/usr/bin/env python3
 
-# Add clipping to the image. One image per time
-
 import os, shutil
-import numpy           as np
+import numpy as np
 import matplotlib.pyplot as plt
-from scipy.ndimage import gaussian_filter
-
-from astropy.io         import fits
-from astropy.wcs        import WCS
-from astropy.coordinates import SkyCoord
-import astropy.units    as u
-from astropy.nddata.utils import Cutout2D
-from scipy               import ndimage
-from astropy.table       import Table
+from astropy.io import fits
+from astropy.table import Table
 import pandas as pd
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────
-FITS_ROOT = "data/PSZ2/fits"
-CROP_ROOT = "data/PSZ2/crops"
-CROP_SZ   = (500, 500)
-SIGMA     = 2.0
-MIN_PIX   = 1000
+FITS_ROOT       = "/users/mbredber/scratch/data/PSZ2/fits"
+CROP_ROOT       = "/users/mbredber/scratch/data/PSZ2/crops"
+META_FITS       = "/users/mbredber/scratch/data/PSZ2/planck_dr2_metadata.fits"
+CROP_SIZE       = (128, 128)  # Set to None to use full size
 
-META_FITS = "data/PSZ2/planck_dr2_metadata.fits"
+FILENAME_SUFFIXES = ["T100kpcSUB"] # List of suffixes to use
+# or to grab _all_ .fits variants in the first cluster folder:
+if FILENAME_SUFFIXES == 'ALL':
+    import glob
+    suffixes = set()
+    for slug in os.listdir(FITS_ROOT):
+        dpath = os.path.join(FITS_ROOT, slug)
+        if not os.path.isdir(dpath):
+            continue
+        pattern = os.path.join(dpath, f"{slug}*.fits")
+        for fpath in glob.glob(pattern):
+            base = os.path.splitext(os.path.basename(fpath))[0]
+            suffixes.add(base.replace(slug, ""))
 
-# target directories for your classification scheme
-OUT_BASE   = "data/PSZ2/classified"
-BUCKETS    = {
-    'RH':          'radio_halo',
-    'RR':          'radio_relic',
-    'NDE':         'no_diffuse',
-    'cRH':         'uncertain',
-    'cRR':         'uncertain',
-    'U':           'uncertain',
-    'N/A':         'unclassified'
+    FILENAME_SUFFIXES = sorted(suffixes)
+    print("FILENAME_SUFFIXES:", FILENAME_SUFFIXES)
+
+
+# ─── SETUP ─────────────────────────────────────────────────────────────────
+
+BUCKETS = {
+    'RH':   ['RH', 'DE'],
+    'RR':   ['RR', 'DE'],
+    'NDE':  ['NDE'],
+    'cRH':  ['cRH', 'cDE'],
+    'cRR':  ['cRR', 'cDE'],
+    'U':    ['U'],
+    'N/A':  ['unclassified']
 }
-for d in BUCKETS.values():
-    os.makedirs(os.path.join(OUT_BASE, d), exist_ok=True)
-# ────────────────────────────────────────────────────────────────────────────
 
-# 1) Load metadata and decode the Name column
+
+os.makedirs(CROP_ROOT, exist_ok=True)
+
+# ─── LOAD METADATA ─────────────────────────────────────────────────────────
 meta = Table.read(META_FITS).to_pandas()
-
-# Name is bytes, decode to string
-meta['Name_str'] = [n.decode('utf-8') if isinstance(n, (bytes,bytearray)) else str(n)
-                    for n in meta['Name']]
-
-# Build slug and re‐index
+meta['Name_str'] = [n.decode('utf-8') if isinstance(n, (bytes, bytearray)) else str(n) for n in meta['Name']]
 meta['slug'] = meta['Name_str'].str.replace(" ", "")
 meta = meta.set_index('slug')
-
-def detect_diffuse(data):
-    data = np.nan_to_num(data, nan=0, posinf=0, neginf=0)
-    sm   = ndimage.gaussian_filter(data, sigma=3)
-    thr  = sm.mean() + SIGMA*sm.std()
-    mask = sm > thr
-    labels, n = ndimage.label(mask)
-    if n == 0: return False
-    sizes = ndimage.sum(mask, labels, index=np.arange(1,n+1))
-    return sizes.max() >= MIN_PIX
-
 rows = []
-for slug in os.listdir(FITS_ROOT):
-    dpath = os.path.join(FITS_ROOT, slug)
-    if not os.path.isdir(dpath): continue
 
-    fits_path = os.path.join(dpath, f"{slug}.fits")
-    if not os.path.exists(fits_path):
-        print("❌ no FITS for", slug)
-        continue
+for suffix in FILENAME_SUFFIXES:
+    OUT_BASE = os.path.join("data/PSZ2/classified", suffix)
+    os.makedirs(OUT_BASE, exist_ok=True)
+    for dirs in BUCKETS.values():
+        for d in dirs:
+            os.makedirs(os.path.join(OUT_BASE, d), exist_ok=True)
 
-    # read
-    with fits.open(fits_path) as hd:
-        hdr  = hd[0].header
-        data = hd[0].data
+    # ─── LOOP OVER CLUSTERS ────────────────────────────────────────────────────
+    for slug in os.listdir(FITS_ROOT):
+        dpath = os.path.join(FITS_ROOT, slug)
+        fits_path = os.path.join(dpath, f"{slug}{suffix}.fits")
+        if not os.path.exists(fits_path):
+            print(f"❌ No {suffix} FITS for {slug}")
+            continue
 
-    # ─── FORCE A 2D IMAGE ───────────────────────────────────────────
-    data = np.array(data)        # ensure it’s an ndarray
-    data = np.squeeze(data)      # remove any singleton axes
-    if data.ndim != 2:
-        # if it’s still 3D (e.g. [nchan, y, x] or [npol, y, x]), pick the first plane
-        data = data[0]
-    # now data.ndim == 2
+        fits_path = os.path.join(dpath, f"{slug}{suffix}.fits")
+        print(f"  {fits_path}")
+        if not os.path.exists(fits_path):
+            print(f"❌ No FITS file for {slug}")
+            continue
 
-    
-    # restrict to the 2D sky-only WCS (drop the frequency axis)
-    wcs2d = WCS(hdr).celestial
-    cen   = SkyCoord(hdr['CRVAL1'], hdr['CRVAL2'], unit="deg")
-    pix_x, pix_y = wcs2d.world_to_pixel(cen) # now world_to_pixel expects only RA,Dec
+        try:
+            hdu = fits.open(fits_path)[0]
+            data = hdu.data
+            data = data[0,0,:,:]
+            
+            plt.imshow(data, origin='lower', cmap='afmhot')
+            plt.axis('off')
+            plt.savefig(os.path.join(CROP_ROOT, f"{slug}.png"), bbox_inches='tight', pad_inches=0)
+            plt.savefig("Last.png", bbox_inches='tight', pad_inches=0)
+                
+            # Crop the image if needed
+            if CROP_SIZE is not None:
+                center = np.array(data.shape) // 2
+                half_size = CROP_SIZE // 2
+                data = data[center[0]-half_size:center[0]+half_size, center[1]-half_size:center[1]+half_size]
+                
+            out_png = os.path.join(CROP_ROOT, f"{slug}.png")
+            plt.imshow(data, origin='lower', cmap='afmhot')
+            plt.axis('off')
+            plt.savefig(out_png, bbox_inches='tight', pad_inches=0)
+            plt.close()
 
-    diff = detect_diffuse(data)
-    label = 'diffuse' if diff else 'cluster'
+            # Classification
+            if slug in meta.index:
+                cls = meta.loc[slug]['Classification']
+                if isinstance(cls, (bytes, bytearray)):
+                    cls = cls.decode('utf-8')
+            else:
+                cls = 'N/A'
 
-    # make cutout
-    cut = Cutout2D(data, (pix_x,pix_y), CROP_SZ, wcs=wcs2d).data
-    out_png = os.path.join(CROP_ROOT, f"{slug}_{label}.png")
-    # subtract large‐scale background
-    background = gaussian_filter(cut, sigma=50)
-    flat       = cut - background
+            # if there are multiple labels (comma-separated), copy into each bucket
+            labels = [s.strip() for s in cls.split(',')]
+            for lab in labels:
+                buckets = BUCKETS[lab] if lab in BUCKETS else ['unclassified']
+                for bucket in buckets:
+                    dest_dir = os.path.join(OUT_BASE, bucket)
+                    os.makedirs(dest_dir, exist_ok=True)
+                    shutil.copy(out_png, os.path.join(dest_dir, os.path.basename(out_png)))
 
-    # compute the detection floor in "flat" units (~3σ of the smoothed image)
-    # (use the same SIGMA you use in detect_diffuse)
-    local_rms   = np.nanstd(gaussian_filter(cut, sigma=3))
-    detect_floor = SIGMA * local_rms
-    # floor the map at that level (i.e. discard everything below it, but
-    # don’t zero–out *all* pixel values—just clamp them to the floor)
-    floored = np.clip(flat, detect_floor, None)
+            rows.append({
+                'slug': slug,
+                'image': os.path.basename(out_png),
+                'class': cls
+            })
 
-    # asinh stretch
-    stretch = np.arcsinh(floored / np.nanstd(floored))
 
-    # re‐normalize to 0–1
-    vmin, vmax = np.nanpercentile(stretch, [1,99])
-    normed     = np.clip((stretch - vmin) / (vmax - vmin), 0, 1)
-    
-    # ─── hard‐clip the “noise floor” ───────────────────────────────────────────
-    # find the same threshold level you’d use for detection
-    noise_level = np.nanstd(gaussian_filter(cut, sigma=3))
-    clip_level  = np.arcsinh((SIGMA * noise_level) / np.nanstd(flat))
-    # map that back into the 0–1 range
-    clip_norm   = (clip_level - vmin) / (vmax - vmin)
-    # zero everything below that
-    normed[normed < clip_norm] = 0.0
+            print(f"✅ Saved {slug}.png to {cls}. It has size {data.shape}.")
 
-    # save
-    plt.imsave(out_png, normed, origin='lower', cmap='gray')
-    plt.close()
+        except Exception as e:
+            print(f"⚠️ Error processing {slug}: {e}")
 
-    # lookup metadata
-    if slug in meta.index:
-        row = meta.loc[slug]
-        cls = row['Classification'].decode('utf-8') if isinstance(row['Classification'], (bytes,bytearray)) else row['Classification']
-    else:
-        cls = 'N/A'
-
-    # decide bucket
-    bucket = BUCKETS.get(cls, 'unclassified')
-    dest   = os.path.join(OUT_BASE, bucket, os.path.basename(out_png))
-    shutil.copy(out_png, dest)
-
-    rows.append({
-        'slug': slug,
-        'image': os.path.basename(out_png),
-        'ps_class': cls,
-        'bucket':   bucket,
-        'detected_diffuse': diff
-    })
-
-# write a CSV of all images → their bucket → original PSZ2 classification
+# ─── WRITE CSV SUMMARY ─────────────────────────────────────────────────────
 df = pd.DataFrame(rows)
 df.to_csv(os.path.join(OUT_BASE, "train_labels.csv"), index=False)
-print("Written", len(df), "entries to train_labels.csv")
+print(f"📄 Written {len(df)} entries to train_labels.csv")

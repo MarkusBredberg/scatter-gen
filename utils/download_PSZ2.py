@@ -34,7 +34,8 @@ for page_url in cluster_pages:
         continue
     soup = BeautifulSoup(r.text, "html.parser")
 
-    tar_a = soup.find("a", string="Tarball with FITS images")
+    #tar_a = soup.find("a", string="Tarball with FITS images")
+    tar_a = soup.find("a", href=lambda h: h and h.endswith(".tar") or h.endswith(".tar.gz"))
     if not tar_a:
         print("⚠️  no tarball link on", page_url)
         continue
@@ -44,7 +45,13 @@ for page_url in cluster_pages:
     out_tar = os.path.join(OUT_ROOT, f"{slug}.tar.gz")
 
     print("⏬", slug)
-    tr = requests.get(tar_url); tr.raise_for_status()
+    #tr = requests.get(tar_url); tr.raise_for_status()
+    try:
+        tr = requests.get(tar_url); tr.raise_for_status()
+    except Exception as e:
+        print(f"❌ failed to download tarball for {slug}: {e}")
+        continue
+
     with open(out_tar, "wb") as fd:
         fd.write(tr.content)
 
@@ -53,5 +60,6 @@ for page_url in cluster_pages:
     os.makedirs(dest, exist_ok=True)
     with tarfile.open(out_tar, "r:gz") as tf:
         tf.extractall(dest)
+    extracted = os.listdir(dest)
+    print(f"📁 Extracted files: {len(extracted)} → {[f for f in extracted if f.endswith('.fits')]}")
     os.remove(out_tar)
-    print("✅ extracted to", dest)

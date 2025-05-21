@@ -1,14 +1,13 @@
 import itertools
 import os
-from utils.data_loader import load_galaxies, get_classes
+from utils.data_loader import load_galaxies, get_classes, normalise_images
 from torch.utils.data import DataLoader, TensorDataset, random_split
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
 from kymatio.torch import Scattering2D
-from utils.models import get_model
-from utils.calc_tools import normalize_to_minus1_1, normalize_to_0_1
+from utils.VAE_models import get_VAE_model
 from utils.custom_mse import NormalisedWeightedMSELoss, CustomMSELoss, WeightedMSELoss, RadialWeightedMSELoss, CustomIntensityWeightedMSELoss, MaxIntensityMSELoss, StandardMSELoss, CombinedMSELoss, ExperimentalMSELoss, BasicMSELoss
 from utils.scatter_reduction import lavg, ldiff
 from utils.training_tools import EarlyStopping 
@@ -43,7 +42,7 @@ REMOVEOUTLIERS = True     # Filter away problematic images
 F = 8 #Choose the loss function to use
 
 #galaxy_classes = [[10, 11, 12, 13]] #Use double square parenthesis for conditional VAEs
-galaxy_classes = [13]
+galaxy_classes = [40]
 hidden_dim1 = [256]
 hidden_dim2 = [128]
 latent_dims = [64]
@@ -219,24 +218,29 @@ for galaxy_class, num_galaxies, encoder_choice, hidden_dim1, hidden_dim2, latent
     ############ NORMALISE AND FILTER THE INPUT ##############
     ##########################################################
                 
-    # Normalize train and test images to [0, 1]
-    if NORMALISEIMGS:
-        train_images = normalize_to_0_1(train_images)
-        test_images = normalize_to_0_1(test_images)
+    ##########################################################
+    ############ NORMALISE AND FILTER THE INPUT ##############
+    ##########################################################
 
-    if NORMALISEIMGSTOPM: # normalize to [-1, 1]
-        train_images = normalize_to_minus1_1(train_images)
-        test_images = normalize_to_minus1_1(test_images)
+    # Bring train + test together, normalise globally, then split back
+    all_imgs = torch.cat([train_images, test_images], dim=0)
+    if NORMALISEIMGS or NORMALISEIMGSTOPM:
+        if NORMALISEIMGSTOPM:
+            all_imgs = normalise_images(all_imgs, -1, 1)
+        else:
+            all_imgs = normalise_images(all_imgs, 0, 1)
+    train_images, test_images = all_imgs[:len(train_images)], all_imgs[len(train_images):]
 
-    # Handle scattering coefficients normalization in a similar way
+    # If using scattering, do the same for those coefficients
     if 'ST' in encoder_choice or 'Dual' in encoder_choice:
-        if NORAMLISESCS:
-            train_scat_coeffs = normalize_to_0_1(train_scat_coeffs)
-            test_scat_coeffs = normalize_to_0_1(test_scat_coeffs)
-
+        all_scat = torch.cat([train_scat_coeffs, test_scat_coeffs], dim=0)
+        if NORAMLISESCS or NORMALISESCSTOPM:
             if NORMALISESCSTOPM:
-                train_scat_coeffs = normalize_to_minus1_1(train_scat_coeffs)
-                test_scat_coeffs = normalize_to_minus1_1(test_scat_coeffs)
+                all_scat = normalise_images(all_scat, -1, 1)
+            else:
+                all_scat = normalise_images(all_scat, 0, 1)
+        train_scat_coeffs, test_scat_coeffs = all_scat[:len(train_scat_coeffs)], all_scat[len(train_scat_coeffs):]
+
     
     #Check input after renormalisation and filtering  
     if IMGCHECK: 
@@ -274,7 +278,7 @@ for galaxy_class, num_galaxies, encoder_choice, hidden_dim1, hidden_dim2, latent
         train_labels = torch.nn.functional.one_hot(train_labels.squeeze(), num_classes=num_classes).float()
         test_labels = torch.nn.functional.one_hot(test_labels.squeeze(), num_classes=num_classes).float()
     scatshape = np.shape(train_scat_coeffs)[1:] if "ST" in encoder_choice or "Dual" in encoder_choice else np.array([1, 1, 1])    
-    model = get_model(encoder_choice, scatshape=scatshape, hidden_dim1=hidden_dim1, hidden_dim2=hidden_dim2, latent_dim=latent_dim, num_classes=num_classes, J=J)
+    model = get_VAE_model(encoder_choice, scatshape=scatshape, hidden_dim1=hidden_dim1, hidden_dim2=hidden_dim2, latent_dim=latent_dim, num_classes=num_classes, J=J)
     model.to(DEVICE)
 
 

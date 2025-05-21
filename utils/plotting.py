@@ -98,8 +98,7 @@ def plot_images_by_class(images, labels, num_images=5, save_path="./classifier/u
     """
     unique_labels = np.unique(labels)
     fig, axes = plt.subplots(len(unique_labels), num_images,
-                         figsize=(num_images * 3, len(unique_labels) * 3),
-                         constrained_layout=True)
+                      figsize=(num_images * 3, len(unique_labels) * 3))
 
 
     # make room on the left for the row labels
@@ -114,7 +113,7 @@ def plot_images_by_class(images, labels, num_images=5, save_path="./classifier/u
 
         # use the description instead of the tag number
         axes[i, 0].set_ylabel(
-            class_map[label],
+            class_map[int(label)],
             fontsize=20,
             rotation=0,
             ha="right",
@@ -244,15 +243,40 @@ def new_images_epoch(src_imgs, supertitle, generated_images, num_galaxies,
         plt.close()
     else:
         plt.show()
-        
-def plot_images(images, labels, num_images=5):
-    plt.figure(figsize=(10, 6))
-    for i in range(num_images):
-        plt.subplot(1, num_images, i + 1)
-        plt.imshow(images[i].squeeze(), cmap='viridis')
-        plt.title(f'Label: {labels[i]}')
-        plt.axis('off')
-    plt.show()
+
+    
+def plot_background_histogram(orig_imgs, gen_imgs, img_shape=(1, 128, 128), title="Background pixels", save_path="backgound_histogram.png"):
+
+    # define a circular mask to exclude the central source;
+    # adjust `radius` (in pixels) to match your source size
+    radius = 30  
+    h, w = img_shape[1], img_shape[2]
+    Y, X = np.ogrid[:h, :w]
+    cy, cx = h//2, w//2
+    bkg_mask = (Y - cy)**2 + (X - cx)**2 > radius**2  # True for background pixels
+
+    # helper to compute per-image sum over background
+    def total_background(images):
+        sums = []
+        for im in images.cpu().numpy():
+            im = im.squeeze()           # shape (H, W)
+            sums.append(im[bkg_mask].sum())
+        return sums
+
+    # compute for one class (you can loop over classes as needed)
+    real_sums = total_background(orig_imgs)  # orig_cls from your sanity-check loop
+    gen_sums  = total_background(gen_imgs)
+
+    # plot histograms
+    plt.figure()
+    plt.hist(real_sums, bins=50, alpha=0.7, label='Real')
+    plt.hist(gen_sums,  bins=50, alpha=0.7, label='Generated')
+    plt.xlabel('Total background intensity')
+    plt.legend()
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
     
 
 def plot_histograms(

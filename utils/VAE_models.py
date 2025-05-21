@@ -1381,7 +1381,7 @@ class CDual_VAE_Model(nn.Module):
         return kld / x.size(0)
 
     
-def get_model(name, scatshape, hidden_dim1=None, hidden_dim2=None, latent_dim=None, num_classes=4, J=4):
+def get_VAE_model(name, scatshape, hidden_dim1=None, hidden_dim2=None, latent_dim=None, num_classes=4, J=4):
     if 'MLP' in name and 'C' not in name:
         encoder = MLP_Encoder(input_channels=scatshape[-3], hidden_dim1=hidden_dim1, hidden_dim2=hidden_dim2, latent_dim=latent_dim, J=J)
         decoder = CNN_Decoder(latent_dim=latent_dim, intermediate_dim=128)

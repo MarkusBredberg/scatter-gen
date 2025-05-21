@@ -3,26 +3,29 @@ import numpy as np
 import h5py
 import torch
 from torchvision import transforms, datasets
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedKFold, train_test_split
 from scipy.ndimage import label
 import skimage
 from torch.utils.data import DataLoader
 from utils.GAN_models import load_gan_generator
-from utils.calc_tools import get_model_name, normalize_to_0_1, normalize_to_minus1_1
+from utils.calc_tools import get_model_name
 from utils.calc_tools import generate_from_noise
 from utils.calc_tools import load_model
 import cv2
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
-from collections import defaultdict, Counter
+import collections
+from collections import Counter
 import os
 from PIL import Image
+import random
+import hashlib
 
 ######################################################################################################
 ################################### CONFIGURATION ####################################################
 ######################################################################################################
 
-root_path =  '/users/mbredber/scratch/Scripts/data/' #'/home/sysadmin/Scripts/data/'  #
+root_path =  '/users/mbredber/scratch/data/' #'/home/sysadmin/Scripts/data/'  #
 SEED = 42 
 
 ######################################################################################################
@@ -80,8 +83,27 @@ def get_classes():
         {"tag": 34, "length": 12, "description": "2_2"},
         {"tag": 35, "length": 18, "description": "2_3"},
         {"tag": 36, "length": 25, "description": "3_3"},
-        # MGCLS 1x1034x1024
-        {"tag": 40, "length": 12, "description": "MGCLS DCRE"}
+        # MGCLS 1x1024x1024
+        {"tag": 40, "length": 52, "description": "DE"}, # Diffuse Emission
+        {"tag": 41, "length": 46, "description": "NDE"},
+        {"tag": 42, "length": 13, "description": "RH"}, # Radio Halo
+        {"tag": 43, "length": 14, "description": "RR"}, # Radio Relic
+        {"tag": 44, "length": 1, "description": "mRH"}, # Mini Radio Halo
+        {"tag": 45, "length": 1, "description": "Ph"}, # Phoenix
+        {"tag": 46, "length": 4, "description": "cRH"}, # Candidate Radio Halo
+        {"tag": 47, "length": 16, "description": "cRR"}, # Candidate Radio Relic
+        {"tag": 48, "length": 7, "description": "cmRH"}, # Candidate Mini Radio Halo
+        {"tag": 49, "length": 2, "description": "cPh"}, # Candidate Phoenix
+        # PSZ2 4x369x369
+        {"tag": 50, "length": 62, "description": "DE"}, # RR + RH
+        {"tag": 51, "length": 114, "description": "NDE"}, # No Diffuse Emission
+        {"tag": 52, "length": 53, "description": "RH"}, # Radio Halo
+        {"tag": 53, "length": 20, "description": "RR"}, # Radio Relic
+        {"tag": 54, "length": 19, "description": "cRH"}, # Candidate Radio Halo
+        {"tag": 55, "length": 6, "description": "cRR"}, # Candidate Radio Relic
+        {"tag": 56, "length": 24, "description": "cDE"}, # candidate Diffuse Emission
+        {"tag": 57, "length": 47, "description": "U"}, # Uncertain
+        {"tag": 58, "length": 40, "description": "unclassified"} # Unclassified
     ]
 
 
@@ -90,11 +112,11 @@ def get_classes():
 ########################################################################################################
 
 def get_synthetic(
-    num_generate,
     gen_model_name,
     cls,
+    num_generate = 1000,
+    batch_size_generate = 500,
     galaxy_classes = [10, 11, 12, 13],
-    batch_size = 256,
     img_shape=(1, 128, 128),
     FILTERGEN=False,
     CLIPDDPM=True,
@@ -106,140 +128,152 @@ def get_synthetic(
     Returns two lists: generated_images_list and generated_labels_list
     following the GAN, DDPM or VAE branch & optional duplicate‑filtering.
     """
-    try:
-        if gen_model_name == 'GAN':
-            gan_path = (
-                f"./GAN/generators/generator_"
-                f"{model_kwargs['gan_type']}_latent{model_kwargs['gan_latent_dim']}"
-                f"_cl{cls}_lrgen{model_kwargs['lr_gen']}"
-                f"_lrdisc{model_kwargs['lr_disc']}_gl{model_kwargs['gan_gen_loss']}"
-                f"_dl{model_kwargs['gan_disc_loss']}_ab{model_kwargs['gan_adam_beta']}"
-                f"_wd{model_kwargs['gan_weight_decay']}_ls{model_kwargs['gan_label_smoothing']}"
-                f"_ld{model_kwargs['gan_lambda_div']}_dv{model_kwargs['gan_data_version']}"
-                f"_ep{model_kwargs['gan_epoch']}_f{fold}.pth"
-            )
-            model = load_gan_generator(
-                gan_path,
-                latent_dim=model_kwargs['gan_latent_dim']
-            )
-            latent_dim = model_kwargs['gan_latent_dim']
-
-        elif gen_model_name == 'DDPM':
-            ddpm_file_map = {
-                10: "generated_fr1_8k.npy",
-                11: "generated_fr2_8k.npy",
-                12: "generated_compact_8k.npy",
-                13: "generated_bent_8k.npy"
-            }
-            ddpm_path = f"/users/mbredber/data/DDPM/{ddpm_file_map[cls]}"
-            ddpm_data = np.load(ddpm_path)                 # (N,128,128)
-            ddpm_data = torch.from_numpy(ddpm_data)        # (N,128,128)
-            ddpm_data = ddpm_data.unsqueeze(1).float()     # (N,1,128,128)
-            if CLIPDDPM:
-                ddpm_data = np.clip(ddpm_data, 0, 1)
-            if model_kwargs['NORMALISEIMGS']:
-                ddpm_data = normalize_to_0_1(ddpm_data)
-                if model_kwargs['NORMALISETOPM']:
-                    ddpm_data = normalize_to_minus1_1(ddpm_data)
-
-            if ddpm_data.shape[0] < num_generate:
-                print(f"Warning: num_generate ({num_generate}) is larger than available data ({ddpm_data.shape[0]}). Reducing to available data.")
-                num_generate = ddpm_data.shape[0]
-            else:
-                ddpm_data = ddpm_data[:num_generate]
-            batch = ddpm_data[:num_generate]
-            labels = torch.ones(num_generate, dtype=torch.long) * (cls - min(galaxy_classes))
-            return [batch], [labels]
-
-        else:  # VAE
-            path = get_model_name(
-                cls,
-                model_kwargs['VAE_train_size'][cls],
-                gen_model_name,
-                fold=fold
-            )
-            model = load_model(
-                path,
-                scatshape=model_kwargs['scatshape'],
-                hidden_dim1=model_kwargs['hidden_dim1'],
-                hidden_dim2=model_kwargs['hidden_dim2'],
-                latent_dim=model_kwargs['vae_latent_dim'],
-                num_classes=len(galaxy_classes)
-            )
-            latent_dim = model_kwargs['vae_latent_dim']
-
-    except Exception as e:
-        print(f"Model not found for class: {cls}. Error: {e}")
-        exit(1)
-
-    model.eval()
-    num_batches = (num_generate + batch_size - 1) // batch_size
-    total_generated = 0
-    total_unique = 0
     generated_images_list = []
     generated_labels_list = []
-    tol = 1e-3
+    try:           
+        if gen_model_name == 'DDPM':
+            ddpm_file_map = {
+                10: "new_generated_fr1.npy",
+                11: "new_generated_fr2.npy",
+                12: "new_generated_compact.npy",
+                13: "new_generated_bent.npy"
+            }
+            ddpm_path = f"/users/mbredber/data/DDPM/{ddpm_file_map[cls]}"
+            print(f"Loading DDPM data for class {cls} from {ddpm_path}")
+            ddpm_data = np.load(ddpm_path)  # shape assumed (N, 128, 128)
+            ddpm_data = torch.from_numpy(ddpm_data).unsqueeze(1).float()  # (N, 1, 128, 128)
+            n_here = min(ddpm_data.shape[0], num_generate)  # Use as many samples as num_generate, or all if fewer exist
+            ddpm_data = ddpm_data[:n_here]
+            if CLIPDDPM: # Clip to [0,1] range
+                ddpm_data = np.clip(ddpm_data, 0, 1)
 
-    for batch_idx in range(num_batches):
-        current_batch = min(batch_size, num_generate - batch_idx * batch_size)
-        total_generated += current_batch
-        labels = torch.ones(current_batch, dtype=torch.long) * (cls - min(galaxy_classes))
+            # Append to the lists (do not overwrite!)
+            generated_images_list.append(ddpm_data)
+            generated_labels_list.append(torch.ones(n_here, dtype=torch.long) * (cls - min(galaxy_classes)))
+        elif gen_model_name == 'NOISE': # To troubleshoot, add noise as generated data
+            noise = torch.randn(num_generate, *img_shape)
+            noise = noise.to(device)
+            generated_images_list.append(noise)
+            generated_labels_list.append(torch.ones(num_generate, dtype=torch.long) * (cls - min(galaxy_classes)))
 
-        with torch.no_grad():
-            batch = generate_from_noise(
-                model,
-                latent_dim=latent_dim,
-                num_samples=current_batch,
-                DEVICE=device
-            )
-
-        if batch.shape[0] != current_batch:
-            batch = batch.permute(1, 0, 2, 3)
-
-        if FILTERGEN and cls != 12:
-            # (1) remove duplicates within this batch
-            flat = batch.view(current_batch, -1)
-            dists = torch.cdist(flat, flat, p=2)
-            dists.fill_diagonal_(1e6)
-            mask = torch.ones(current_batch, dtype=torch.bool, device=batch.device)
-            for i in range(current_batch):
-                if mask[i]:
-                    mask[i+1:] &= ~(dists[i, i+1:] < tol)
-            uniq_imgs = batch[mask]
-            uniq_lbls = labels[mask]
-            n_unique = len(uniq_imgs)
-
-            # (2) remove duplicates vs. prior batches
-            if generated_images_list:
-                new_flat = uniq_imgs.view(n_unique, -1)
-                prev = torch.cat(generated_images_list, dim=0)
-                prev_flat = prev.view(prev.size(0), -1)
-                cross = torch.cdist(new_flat, prev_flat, p=2)
-                keep = torch.ones(n_unique, dtype=torch.bool, device=uniq_imgs.device)
-                for i in range(n_unique):
-                    if torch.any(cross[i] < tol):
-                        keep[i] = False
-                uniq_imgs = uniq_imgs[keep]
-                uniq_lbls = uniq_lbls[keep]
-                n_unique = len(uniq_imgs)
-
-            total_unique += n_unique
-            print("Shape of batch_unique_images:", uniq_imgs.shape)
-
-            # (3) augment
-            aug_imgs, aug_lbls = augment_images(uniq_imgs, uniq_lbls, img_shape=img_shape)
-            generated_images_list.append(aug_imgs)
-            generated_labels_list.append(aug_lbls)
         else:
-            generated_images_list.append(batch)
-            generated_labels_list.append(labels)
+            if gen_model_name == 'GAN':
+                gan_path = (
+                    f"./GAN/generators/generator_"
+                    f"{model_kwargs['gan_type']}_ss{model_kwargs['gan_sample_size']}_cl{cls}_lrgen{model_kwargs['lr_gen']}_"
+                    f"lrdisc{model_kwargs['lr_disc']}_gl{model_kwargs['gan_gen_loss']}_dl{model_kwargs['gan_disc_loss']}_"
+                    f"ls{model_kwargs['gan_label_smoothing']}_ld{model_kwargs['gan_lambda_div']}_dv{model_kwargs['gan_data_version']}_"
+                    f"ep{model_kwargs['gan_epoch']}_f{fold}.pth"
+                )
+                print(f"Loading GAN data for class {cls} from {gan_path}")
+                model = load_gan_generator(
+                    gan_path,
+                    latent_dim=model_kwargs['gan_latent_dim']
+                ).to(device)
+                latent_dim = model_kwargs['gan_latent_dim']
+            else: # VAE
+                path = get_model_name(
+                    cls,
+                    model_kwargs['VAE_train_size'][cls],
+                    gen_model_name,
+                    fold=fold
+                )
+                model = load_model(
+                    path,
+                    scatshape=model_kwargs['scatshape'],
+                    hidden_dim1=model_kwargs['hidden_dim1'],
+                    hidden_dim2=model_kwargs['hidden_dim2'],
+                    latent_dim=model_kwargs['vae_latent_dim'],
+                    num_classes=len(galaxy_classes)
+                )
+                latent_dim = model_kwargs['vae_latent_dim']
+                
+            model.eval()
+            num_batches = (num_generate + batch_size_generate - 1) // batch_size_generate
+            total_generated = 0
 
-    if FILTERGEN and cls != 12:
-        frac = (total_generated - total_unique) / total_generated * 100
-        print(f"Class {cls}: Removed {frac:.2f}% of images "
-              f"(Generated: {total_generated}, Unique: {total_unique})")
+            for batch_idx in range(num_batches):
+                current_batch = min(batch_size_generate, num_generate - batch_idx * batch_size_generate)
+                total_generated += current_batch
 
-    return generated_images_list, generated_labels_list
+                generated_labels = torch.ones(current_batch, dtype=torch.long) * (cls - min(galaxy_classes))
+                with torch.no_grad():
+                    generated_batch = generate_from_noise(
+                        model,
+                        latent_dim=latent_dim,
+                        num_samples=current_batch,
+                        DEVICE=device)
+                # Ensure the tensor is [batch_size, channels, H, W]
+                if generated_batch.shape[0] != current_batch:
+                    generated_batch = generated_batch.permute(1, 0, 2, 3)
+
+                if FILTERGEN and cls != 12:
+                    total_unique = 0
+                    tol = 1e-3
+                    # --------------------------
+                    # (1) Remove duplicates *within* the new batch
+                    # --------------------------
+                    flat = generated_batch.view(current_batch, -1)  # flatten each image
+                    dists = torch.cdist(flat, flat, p=2)
+                    dists.fill_diagonal_(1e6)  # ignore self-comparisons
+                    unique_mask = torch.ones(current_batch, dtype=torch.bool, device=generated_batch.device)
+                    for i in range(current_batch):
+                        if unique_mask[i]:
+                            # Mark subsequent images that are too close as duplicates
+                            unique_mask[i+1:] &= ~(dists[i, i+1:] < tol)
+
+                    batch_unique_images = generated_batch[unique_mask]
+                    batch_unique_labels = generated_labels[unique_mask]
+                    n_unique = len(batch_unique_images)
+
+                    # --------------------------
+                    # (2) Remove duplicates *across* previously accepted images
+                    # --------------------------
+                    if len(generated_images_list) > 0:
+                        # Flatten the newly filtered batch
+                        new_flat = batch_unique_images.view(n_unique, -1)
+
+                        # Flatten everything we've already accepted
+                        prev_accepted = torch.cat(generated_images_list, dim=0)  # shape: [N_accepted, C, H, W]
+                        prev_flat = prev_accepted.view(prev_accepted.size(0), -1)
+
+                        # Compare new vs. all accepted
+                        cross_dists = torch.cdist(new_flat, prev_flat, p=2)
+                        cross_unique_mask = torch.ones(n_unique, dtype=torch.bool, device=batch_unique_images.device)
+                        for i in range(n_unique):
+                            # If the new image is within tol of *any* accepted image, exclude it
+                            if torch.any(cross_dists[i] < tol):
+                                cross_unique_mask[i] = False
+
+                        batch_unique_images = batch_unique_images[cross_unique_mask]
+                        batch_unique_labels = batch_unique_labels[cross_unique_mask]
+                        n_unique = len(batch_unique_images)
+
+                    # Now everything in batch_unique_* is unique vs. each other & prior batches
+                    total_unique += n_unique
+                    
+                    # --------------------------
+                    # (3) Augment the unique images
+                    # --------------------------
+                    
+                    print("Shape of batch_unique_images: ", batch_unique_images.shape)
+                    generated_batch, generated_labels = augment_images(batch_unique_images, batch_unique_labels) # Produces 8 versions of each image
+                    
+                    removal_fraction = (total_generated - total_unique) / total_generated * 100
+                    print(f"Class {cls}: Removed {removal_fraction:.2f}% of images "
+                    f"(Generated: {total_generated}, Unique: {total_unique})")
+
+                generated_images_list.append(generated_batch)
+                generated_labels_list.append(generated_labels)
+                
+    except Exception as e:
+        print(f"Model error for class: {cls}. Error: {e}")
+        exit(1)
+
+    generated_images = torch.cat(generated_images_list, dim=0)
+    generated_labels = torch.cat(generated_labels_list, dim=0)
+
+    return generated_images, generated_labels
 
 
 ######################################################################################################
@@ -705,10 +739,8 @@ def remove_outliers(images, labels, threshold=0.1, peak_threshold=0.6, intensity
 
 
 # Using systematic transformations instead of random choices in augmentation
-def apply_transforms_with_config(image, config, img_shape=(128, 128), brightness_adjustment=0.0):
+def apply_transforms_with_config(image, config):
     preprocess = transforms.Compose([
-        #transforms.CenterCrop((img_shape[-2], img_shape[-1])),
-        #transforms.Resize((img_shape[-2], img_shape[-1])),  # Resize images to the desired size
         transforms.Lambda(lambda x: transforms.functional.hflip(x) if config['flip_h'] else x),  # Horizontal flip
         transforms.Lambda(lambda x: transforms.functional.vflip(x) if config['flip_v'] else x),  # Vertical flip
         transforms.Lambda(lambda x: transforms.functional.rotate(x, config['rotation']))  # Rotation by specific angle
@@ -743,32 +775,14 @@ def complex_apply_transforms_with_config(image, config, img_shape=(128, 128), in
     return transformed_image
 
 
-def apply_formatting(image, img_shape=(128, 128), island=False):
-
-    class AddGaussianNoise(object):
-        def __init__(self, mean=0., std=0.01):
-            self.mean = mean
-            self.std = std
-
-        def __call__(self, tensor):
-            noise = torch.randn_like(tensor) * self.std + self.mean
-            noised_image = tensor + noise
-            noised_image_clipped = torch.clamp(noised_image, 0, 1)  # Clip the values to be within [0, 1]
-            return noised_image_clipped
-
-        def __repr__(self):
-            return f"{self.__class__.__name__}(mean={self.mean}, std={self.std})"
+def apply_formatting(image, crop_size=(128, 128), downsample_size=(128, 128)):
+    """
+    Apply formatting to the image by cropping and resizing it to the specified dimensions.
+    """
 
     preprocess = transforms.Compose([
-        transforms.CenterCrop((img_shape[-2], img_shape[-1])),
-        transforms.Resize((img_shape[-2], img_shape[-1])),  # Resize images to the desired size
-        #transforms.RandomHorizontalFlip(p=0.5),  # Random horizontal flip
-        #transforms.RandomVerticalFlip(p=0.5),  # Random vertical flip
-        #transforms.RandomRotation(degrees=90),  # Random rotation by up to 90 degrees
-        #transforms.Lambda(lambda x: transforms.functional.rotate(x, random.choice([0, 90, 180, 270]))), # Random rotation by 0, 90, 180, or 270 degrees
-        #transforms.RandomAffine(degrees=0, translate=(0.01, 0.1)),  # Random translation by up to 1% of the image size
-        #transforms.ColorJitter(brightness=(1, 1.05)),  # Random brightness increase from 0% to 10%
-        #AddGaussianNoise(0., 0.05)  # Add Gaussian noise with mean and std
+        transforms.CenterCrop((crop_size[0], crop_size[1])),
+        transforms.Resize((downsample_size[0], downsample_size[1])),  # Resize images to the desired size
     ])
 
     if image.dim() == 2:  # Ensure image is 3D
@@ -776,6 +790,11 @@ def apply_formatting(image, img_shape=(128, 128), island=False):
     image = preprocess(image)
     
     return image
+
+
+def img_hash(img: torch.Tensor) -> str:
+    arr = img.cpu().contiguous().numpy()
+    return hashlib.sha1(arr.tobytes()).hexdigest()
 
 
 ######################################################################################################
@@ -875,9 +894,8 @@ def isolate_galaxy_batch(images, upper_intensity_threshold=500000, lower_intensi
     return accepted_images
         
 def augment_images(
-    images, labels, img_shape=(1, 128, 128), rotations=[0, 90, 180, 270],
-    flips = [(False, False), (True, False)], 
-    brightness_adjustments=None, mem_threshold=1000):
+    images, labels, rotations=[0, 90, 180, 270],
+    flips = [(False, False), (True, False)], mem_threshold=1000):
     """
     General function to augment images in chunks with memory optimization.
 
@@ -893,29 +911,23 @@ def augment_images(
         tuple: Augmented images and labels as tensors.
     """
 
-    if brightness_adjustments is None:
-        brightness_adjustments = [0.0]  # Default brightness adjustment if none provided
-
     # Initialize empty lists for results
     augmented_images, augmented_labels = [], []
     cumulative_augmented_images, cumulative_augmented_labels = [], []
     for idx, image in enumerate(images):
         for rot in rotations:
             for flip_h, flip_v in flips:
-                for adjustment in brightness_adjustments:
-                    # Apply augmentation transforms
-                    config = {'rotation': rot, 'flip_h': flip_h, 'flip_v': flip_v}
-                    augmented_image = apply_transforms_with_config(
-                        image.clone().detach(), config, img_shape, brightness_adjustment=adjustment
-                    )
-                    augmented_images.append(augmented_image)
-                    augmented_labels.append(labels[idx])  # Append corresponding label
+                # Apply augmentation transforms
+                config = {'rotation': rot, 'flip_h': flip_h, 'flip_v': flip_v}
+                augmented_image = apply_transforms_with_config(image.clone().detach(), config)
+                augmented_images.append(augmented_image)
+                augmented_labels.append(labels[idx])  # Append corresponding label
 
-                    # Memory check: Save and clear if too many augmentations are in memory
-                    if len(augmented_images) >= mem_threshold:  # Threshold for saving (adjustable)
-                        cumulative_augmented_images.extend(augmented_images)
-                        cumulative_augmented_labels.extend(augmented_labels)
-                        augmented_images, augmented_labels = [], []  # Reset batch
+                # Memory check: Save and clear if too many augmentations are in memory
+                if len(augmented_images) >= mem_threshold:  # Threshold for saving (adjustable)
+                    cumulative_augmented_images.extend(augmented_images)
+                    cumulative_augmented_labels.extend(augmented_labels)
+                    augmented_images, augmented_labels = [], []  # Reset batch
 
     # Extend cumulative lists with remaining augmented images from the chunk
     cumulative_augmented_images.extend(augmented_images)
@@ -929,7 +941,7 @@ def augment_images(
 
         
 def reduce_by_class(images, labels, sample_size, num_classes):
-    class_data = defaultdict(list)
+    class_data = collections.defaultdict(list)
     
     # Group images by class
     for img, lbl in zip(images, labels):
@@ -944,6 +956,46 @@ def reduce_by_class(images, labels, sample_size, num_classes):
     
     return reduced_images, reduced_labels
 
+
+def redistribute_excess(train_images, train_labels, eval_images, eval_labels, target_classes):
+    """
+    Redistribute excess images from the training set to the evaluation set to balance the classes.
+    """
+    
+    # 1) Split existing eval into target-class vs other
+    target_eval = [(img, lbl) for img, lbl in zip(eval_images, eval_labels) if lbl in target_classes]
+    other_eval  = [(img, lbl) for img, lbl in zip(eval_images, eval_labels) if lbl not in target_classes]
+
+    # 2) Group target eval by class
+    groups = collections.defaultdict(list)
+    for img, lbl in target_eval:
+        groups[lbl].append(img)
+
+    if not groups:
+        print("No valid classes found in validation data; skipping redistribution.")
+        return train_images, train_labels, eval_images, eval_labels
+
+    # 3) Find smallest class size in eval
+    min_count = min(len(imgs) for imgs in groups.values())
+
+    # 4) Keep only min_count per class; mark the rest to move back to train
+    kept, moved_back = [], []
+    for lbl, imgs in groups.items():
+        kept_imgs   = imgs[:min_count]
+        moved_imgs  = imgs[min_count:]
+        kept    += [(img, lbl) for img in kept_imgs]
+        moved_back += [(img, lbl) for img in moved_imgs]
+
+    # 5) Rebuild balanced eval (kept + any non-target classes)
+    final_eval = kept + other_eval
+    eval_imgs2, eval_lbls2 = zip(*final_eval) if final_eval else ([], [])
+    eval_imgs2, eval_lbls2 = list(eval_imgs2), list(eval_lbls2)
+
+    # 6) Send all “moved_back” images into train (rest of train stays untouched)
+    train_imgs2 = train_images + [img for img, _ in moved_back]
+    train_lbls2 = train_labels + [lbl for _, lbl in moved_back]
+
+    return train_imgs2, train_lbls2, eval_imgs2, eval_lbls2
         
 ##########################################################################################
 ################################## SPECIFIC DATASET LOADER ###############################
@@ -951,7 +1003,7 @@ def reduce_by_class(images, labels, sample_size, num_classes):
 
 
 def load_galaxy10(path=root_path + 'Galaxy10.h5', sample_size=300, target_classes=[4], 
-                  img_shape=(3, 256, 256), fold=None, island=True, REMOVEOUTLIERS=True, AUGMENT=True, train=False):
+                  crop_size=(3, 256, 256), downsample_size=(3, 256, 256), fold=None, island=True, REMOVEOUTLIERS=True, AUGMENT=False, train=False):
     print("Loading Galaxy10 data...")
 
     try:
@@ -970,7 +1022,7 @@ def load_galaxy10(path=root_path + 'Galaxy10.h5', sample_size=300, target_classe
                     continue
 
                 selected_images = 2 * (images[class_indices].astype(np.float32) / 255.0 - .5)
-                if img_shape[0] == 1:  
+                if crop_size[0] == 1:  
                     selected_images = np.mean(selected_images, axis=-1, keepdims=True)
 
                 filtered_images = isolate_galaxy_batch(selected_images)
@@ -983,8 +1035,8 @@ def load_galaxy10(path=root_path + 'Galaxy10.h5', sample_size=300, target_classe
 
                 for image in filtered_images:
                     image = torch.tensor(image, dtype=torch.float)
-                    if img_shape != 256:
-                        image = apply_formatting(image, img_shape, island=island)
+                    if crop_size != 256:
+                        image = apply_formatting(image, crop_size, downsample_size)
                     class_images.append(image)
                     class_labels.append(cls)
 
@@ -1021,8 +1073,8 @@ def load_galaxy10(path=root_path + 'Galaxy10.h5', sample_size=300, target_classe
                 eval_images, eval_labels = remove_outliers(eval_images, eval_labels, v="validation")
 
             # Ensure all images have consistent shape (cropping and resizing)
-            train_images = [apply_formatting(img, img_shape) for img in train_images]
-            eval_images = [apply_formatting(img, img_shape) for img in eval_images]
+            train_images = [apply_formatting(img, crop_size, downsample_size) for img in train_images]
+            eval_images = [apply_formatting(img, crop_size, downsample_size) for img in eval_images]
                 
             # Limit by sample size
             if sample_size is not None and sample_size > 0:
@@ -1042,15 +1094,11 @@ def load_galaxy10(path=root_path + 'Galaxy10.h5', sample_size=300, target_classe
     # Parameters for augmentation
     if AUGMENT:
         chunk_size = 64
-        print("Shape of images before augmentation in galaxy 10", np.shape(train_images))
         # Augmentation for training data
         for i in range(0, len(train_images), chunk_size):
             chunk_images = train_images[i:i + chunk_size]
             chunk_labels = train_labels[i:i + chunk_size]
-            augmented_chunk_images, augmented_chunk_labels = augment_images(
-                chunk_images, chunk_labels, img_shape,
-            )
-            
+            augmented_chunk_images, augmented_chunk_labels = augment_images(chunk_images, chunk_labels)
             # Convert augmented data to tensors
             augmented_chunk_images = torch.tensor(augmented_chunk_images)
             augmented_chunk_labels = torch.tensor(augmented_chunk_labels)
@@ -1071,10 +1119,9 @@ def load_galaxy10(path=root_path + 'Galaxy10.h5', sample_size=300, target_classe
         for i in range(0, len(eval_images), chunk_size):
             chunk_images = eval_images[i:i + chunk_size]
             chunk_labels = eval_labels[i:i + chunk_size]
-            augmented_chunk_images, augmented_chunk_labels = augment_images(
-                chunk_images, chunk_labels, img_shape,  mem_threshold=1
-            )
-                    # Convert augmented data to tensors
+            augmented_chunk_images, augmented_chunk_labels = augment_images(chunk_images, chunk_labels,  mem_threshold=1)
+            
+            # Convert augmented data to tensors
             augmented_chunk_images = torch.tensor(augmented_chunk_images)
             augmented_chunk_labels = torch.tensor(augmented_chunk_labels)
             
@@ -1096,10 +1143,8 @@ def load_galaxy10(path=root_path + 'Galaxy10.h5', sample_size=300, target_classe
     return train_images, train_labels, eval_images, eval_labels
 
 
-
-
-def load_FIRST(path=None, fold=0, target_classes=None, img_shape=(1, 300, 300), sample_size=300,
-               island=False, REMOVEOUTLIERS=True, AUGMENT=True, train=True):
+def load_FIRST(path=None, fold=0, target_classes=None, crop_size=(1, 300, 300), downsample_size=(1, 300, 300), sample_size=300,
+               island=False, REMOVEOUTLIERS=True, AUGMENT=False, train=True):
     print("Loading FIRST data...")
     
     class_mapping = {11: 'FRI', 12: 'FRII', 13: 'Compact', 14: 'Bent'}
@@ -1118,10 +1163,10 @@ def load_FIRST(path=None, fold=0, target_classes=None, img_shape=(1, 300, 300), 
                                         selected_classes=target_classes, is_PIL=True, is_RGB=False, transform=transforms.ToTensor())
             if train:
                 eval_data = FIRSTGalaxyData(root="./.cache", selected_split="valid", input_data_list=[f"galaxy_data_h5.h5"],
-                                            is_PIL=True, is_RGB=False, transform=transforms.ToTensor())
+                                            selected_classes=target_classes, is_PIL=True, is_RGB=False, transform=transforms.ToTensor())
             else:
                 eval_data = FIRSTGalaxyData(root="./.cache", selected_split="test", input_data_list=[f"galaxy_data_h5.h5"],
-                                            is_PIL=True, is_RGB=False, transform=transforms.ToTensor())
+                                            selected_classes=target_classes, is_PIL=True, is_RGB=False, transform=transforms.ToTensor())
         else:
             train_data = FIRSTGalaxyData(root="./.cache", selected_split="train", input_data_list=[f"galaxy_data_crossvalid_{fold}_h5.h5"],
                                          selected_classes=target_classes, is_PIL=True, is_RGB=False, transform=transforms.ToTensor())
@@ -1138,15 +1183,11 @@ def load_FIRST(path=None, fold=0, target_classes=None, img_shape=(1, 300, 300), 
         
         if len(eval_images) == 0:
             raise ValueError("No valid images found. Check the dataset and loading process.")
-        
-        #train_images_tensor = torch.stack(train_images)
-        #eval_images_tensor = torch.stack(eval_images)
-        #print("Original training images shape before augmentation:", train_images_tensor.shape)
-        #print("Original valid images shape before augmentation:", eval_images_tensor.shape)
+
         
         # Ensure all images have consistent shape (cropping and resizing)
-        train_images = [apply_formatting(img, img_shape) for img in train_images]
-        eval_images = [apply_formatting(img, img_shape) for img in eval_images]
+        train_images = [apply_formatting(img, crop_size, downsample_size) for img in train_images]
+        eval_images = [apply_formatting(img, crop_size, downsample_size) for img in eval_images]
                 
         if REMOVEOUTLIERS: # Remove outliers
             #plot_cut_flow_for_all_filters(train_images, train_labels, save_path_prefix="./generator/filtering/")
@@ -1163,68 +1204,15 @@ def load_FIRST(path=None, fold=0, target_classes=None, img_shape=(1, 300, 300), 
             if len(eval_images) > 10:
                 eval_images, eval_labels = reduce_by_class(eval_images, eval_labels, int(sample_size*0.2), len(target_classes))
 
-        #print(f"Reduced train dataset: {len(train_images)} images, {len(set(train_labels))} classes")
-        #print(f"Reduced validation dataset: {len(eval_images)} images, {len(set(eval_labels))} classes")
-
-        #Make sure there is the same amount of test images in each dataset
-        def redistribute_excess(images, labels, train_images, train_labels, target_classes):
-            # Map target_classes to numerical labels
-            class_mapping = {
-                'FRI': 0,
-                'FRII': 1,
-                'Compact': 2,
-                'Bent': 3
-            }
-            target_classes = [class_mapping[cls] for cls in target_classes if cls in class_mapping]
-
-            class_data = defaultdict(list)
-            for img, lbl in zip(images, labels):
-                class_data[lbl].append(img)
-            
-            #print("Validation data class distribution before redistribution:")
-            #for cls, imgs in class_data.items():
-            #    print(f"Class {cls}: {len(imgs)} images")
-            
-            eval_classes = [cls for cls in target_classes if cls in class_data]            
-            if not eval_classes:
-                print("No valid classes found in validation data! Skipping redistribution.")
-                return images, labels, train_images, train_labels
-
-            min_count = min(len(class_data[cls]) for cls in eval_classes)
-            redistributed_eval_images, redistributed_eval_labels = [], []
-            for cls in eval_classes:
-                class_images = class_data[cls]
-                if len(class_images) > min_count:
-                    eval_samples = class_images[:min_count]
-                    redistributed_eval_images.extend(eval_samples)
-                    redistributed_eval_labels.extend([cls] * len(eval_samples))
-                    excess_samples = class_images[min_count:]
-                    train_images.extend(excess_samples)
-                    train_labels.extend([cls] * len(excess_samples))
-                else:
-                    redistributed_eval_images.extend(class_images)
-                    redistributed_eval_labels.extend([cls] * len(class_images))
-
-            #print("Validation data class distribution after redistribution:")
-            #for cls in set(redistributed_eval_labels):
-            #    print(f"Class {cls}: {redistributed_eval_labels.count(cls)} images")
-            #print(f"Total validation images after redistribution: {len(redistributed_eval_images)}")
-
-            return redistributed_eval_images, redistributed_eval_labels, train_images, train_labels
-
-        #print("Length of validation images before distribution: ", len(eval_images))
-        #print("Length of training images before distribution: ", len(train_images))
         eval_images, eval_labels, train_images, train_labels = redistribute_excess(
             eval_images, eval_labels, train_images, train_labels, target_classes)
-        #print(f"Valid images after redistribution: {len(eval_images)}")
-        #print(f"Train images after redistribution: {len(train_images)}")
         
         # Augment train images (converts to tensors)
         if AUGMENT:
             train_images, train_labels = augment_images(
-                train_images, train_labels, img_shape)
+                train_images, train_labels)
             eval_images, eval_labels = augment_images(
-                eval_images, eval_labels, img_shape)
+                eval_images, eval_labels)
         else:
             # Convert from list to tensor
             train_images = torch.stack(train_images)
@@ -1239,8 +1227,8 @@ def load_FIRST(path=None, fold=0, target_classes=None, img_shape=(1, 300, 300), 
 
 
 
-def load_Mirabest(target_classes=[16], img_shape=(1, 150, 150), sample_size=397,
-                  train=False, island=False, REMOVEOUTLIERS=True, AUGMENT=True):
+def load_Mirabest(target_classes=[16], crop_size=(1, 150, 150), downsample_size=(1, 150, 150), sample_size=397,
+                  train=False, island=False, REMOVEOUTLIERS=True, AUGMENT=False):
     print("Loading MiraBest data...")
 
     # Select the dataset class based on `target_classes`
@@ -1285,8 +1273,8 @@ def load_Mirabest(target_classes=[16], img_shape=(1, 150, 150), sample_size=397,
                         image = batch_images[i].squeeze(0)
                         original_images.append(image.clone().detach())
                         # Apply transformations if required (e.g., resizing, cropping, noise addition)
-                        if img_shape[1] != 150:
-                            processed_image = apply_formatting(image, img_shape, island)
+                        if crop_size[1] != 150:
+                            processed_image = apply_formatting(image, crop_size, downsample_size)
                         images.append(processed_image)
                         labels.append(label.item())
                         # Stop once we have enough samples
@@ -1301,7 +1289,7 @@ def load_Mirabest(target_classes=[16], img_shape=(1, 150, 150), sample_size=397,
                 while len(images) < sample_size:
                     idx = np.random.randint(0, len(original_images))
                     if idx < len(images):  # Ensure the index is within bounds
-                        augmented_image = apply_formatting(original_images[idx].clone().detach(), img_shape, island)
+                        augmented_image = apply_formatting(original_images[idx].clone().detach(), crop_size, downsample_size)
                         images.append(augmented_image)
                         labels.append(labels[idx])
                     else:
@@ -1313,7 +1301,7 @@ def load_Mirabest(target_classes=[16], img_shape=(1, 150, 150), sample_size=397,
             else:
                 # Apply the same transformations to the test/validation images
                 for img in original_images:
-                    preprocessed_image = apply_formatting(img, img_shape, island)
+                    preprocessed_image = apply_formatting(img, crop_size, downsample_size)
                     all_test_images.append(preprocessed_image)
                 all_test_labels.extend(labels)
 
@@ -1354,8 +1342,8 @@ def load_Mirabest(target_classes=[16], img_shape=(1, 150, 150), sample_size=397,
         return train_images, train_labels, test_images, test_labels
     
 
-def load_MNIST(target_classes=[19], fold=0, img_shape=(1, 28, 28), sample_size=60000,
-               train=False, island=False, AUGMENT=True, batch_size=32):
+def load_MNIST(target_classes=[19], fold=0, crop_size=(1, 28, 28), downsample_size=(1, 28, 28), sample_size=60000,
+               train=False, island=False, AUGMENT=False, batch_size=32):
     print("Loading MNIST data...")
     train_data = datasets.MNIST(root=root_path, train=True, download=True, transform=transforms.ToTensor())
     train_loader = DataLoader(train_data, REMOVEOUTLIERS=True, batch_size=batch_size, shuffle=True)
@@ -1372,8 +1360,8 @@ def load_MNIST(target_classes=[19], fold=0, img_shape=(1, 28, 28), sample_size=6
         for i, label in enumerate(batch_labels):
             if label.item() in digit_classes:
                 image = batch_images[i]
-                if img_shape[1] != 28:
-                    image = apply_formatting(image, img_shape, island)
+                if crop_size[1] != 28:
+                    image = apply_formatting(image, crop_size, downsample_size)
                 train_images.append(image)
                 train_labels.append(label.item())
                 if len(train_images) >= sample_size:
@@ -1397,8 +1385,8 @@ def load_MNIST(target_classes=[19], fold=0, img_shape=(1, 28, 28), sample_size=6
             for i, label in enumerate(batch_labels):
                 if label.item() in digit_classes:
                     image = batch_images[i]
-                    if img_shape[1] != 28:
-                        image = apply_formatting(image, img_shape, island=False)
+                    if crop_size[1] != 28:
+                        image = apply_formatting(image, crop_size, island=False)
                     test_images.append(image)
                     test_labels.append(label.item())
                     if len(test_images) >= int(0.15 * sample_size):
@@ -1422,7 +1410,7 @@ def load_MNIST(target_classes=[19], fold=0, img_shape=(1, 28, 28), sample_size=6
         return train_images, train_labels, test_images, test_labels
     
     
-def load_rgz10k(path=root_path + "RGZ_10k", fold=5, target_classes=None, img_shape=(1, 132, 132), sample_size=300,
+def load_RGZ10k(path=root_path + "RGZ_10k", fold=5, target_classes=None, crop_size=(1, 132, 132), sample_size=300,
                 island=False, AUGMENT=False, REMOVEOUTLIERS=True, train=True, random_state=SEED):
     print("Loading rgz10k data...")
     """
@@ -1600,9 +1588,9 @@ def load_rgz10k(path=root_path + "RGZ_10k", fold=5, target_classes=None, img_sha
         if img_data is None:
             raise ValueError(f"Failed to load image: {img_path}")
         # Resize if needed.
-        img_data = cv2.resize(img_data, (img_shape[-2], img_shape[-1]))
+        img_data = cv2.resize(img_data, (crop_size[-2], crop_size[-1]))
         # Reshape to the desired shape.
-        img_data = img_data.reshape(img_shape)
+        img_data = img_data.reshape(crop_size)
         images.append(img_data)
     train_images = np.stack(images, axis=0)
     
@@ -1612,8 +1600,8 @@ def load_rgz10k(path=root_path + "RGZ_10k", fold=5, target_classes=None, img_sha
         img_data = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
         if img_data is None:
             raise ValueError(f"Failed to load image: {img_path}")
-        img_data = cv2.resize(img_data, (img_shape[-2], img_shape[-1]))
-        img_data = img_data.reshape(img_shape)
+        img_data = cv2.resize(img_data, (crop_size[-2], crop_size[-1]))
+        img_data = img_data.reshape(crop_size)
         images.append(img_data)
     eval_images = np.stack(images, axis=0)
     
@@ -1642,36 +1630,172 @@ def load_rgz10k(path=root_path + "RGZ_10k", fold=5, target_classes=None, img_sha
     # Step 8. Augment images.
     # ------------------------------------------------------------
     flips = [(False, False)] if AUGMENT else [(False, False), (True, False), (False, True), (True, True)] 
-    train_images, train_labels = augment_images(train_images, train_labels, img_shape, flips=flips)
-    eval_images, eval_labels = augment_images(eval_images, eval_labels, img_shape, flips=flips)
+    train_images, train_labels = augment_images(train_images, train_labels, flips=flips)
+    eval_images, eval_labels = augment_images(eval_images, eval_labels, flips=flips)
     
     return train_images, train_labels, eval_images, eval_labels
 
 
-def load_mgcls_diffuse(path=root_path + "MGCLS_1Diffuse", sample_size=300, target_classes=[0], img_shape=(1, 256, 256), fold=None, island=True, REMOVEOUTLIERS=True, train=False):
-    print("Loading MGCLS diffuse data...")
-    
-    # Read images from the input folder
+def load_PSZ2(path=root_path + "PSZ2/classified/T100kpcSUB", fold=5, AUGMENT=False, sample_size=300, target_classes=[53], crop_size=(1, 256, 256), downsample_size=(1, 256, 256), island=True, REMOVEOUTLIERS=True, train=False):
+    print("Loading PSZ2 data...")
+    # To fix: fold and sample size
+
     images = []
-    labels = []  # Replace with actual labels if available
-    for file_name in os.listdir(path):
-        if file_name.lower().endswith(('.jpg', '.jpeg')):
-            file_path = os.path.join(path, file_name)
-            img = Image.open(file_path)
-            images.append(img)
-            labels.append(0)  # Dummy label; change if necessary
-            
-    images = [transforms.ToTensor()(img) for img in images]    # Convert JpegImageFile to tensor
-    images = [transforms.Resize(img_shape[1:])(img) for img in images] #Reduce resolution of images to 256x256
-    train_images, train_labels = augment_images(images, labels, img_shape)     # Create 16 versions of each image
+    labels = []
+
+    for cls in target_classes:
+        class_folder = next(c["description"] for c in get_classes() if c["tag"] == cls)
+        subfolders = [class_folder]
+        label = cls
+
+        for subfolder in subfolders:
+            folder_path = os.path.join(path, subfolder)
+            if not os.path.isdir(folder_path):
+                print(f"Warning: Folder {folder_path} not found. Skipping.")
+                continue
+            for file_name in os.listdir(folder_path):
+                if file_name.lower().endswith((".jpg", ".jpeg", ".png")):
+                    file_path = os.path.join(folder_path, file_name)
+                    with Image.open(file_path) as img:
+                        # immediately format to the final shape+tensor
+                        pil_gray = img.convert("L")
+                        tensor = transforms.ToTensor()(pil_gray)
+                        tensor = apply_formatting(tensor, crop_size, downsample_size)
+                    images.append(tensor)
+                    labels.append(label)
+
+
+    if len(images) == 0:
+        raise ValueError("No images loaded. Check the path and file extensions.")
     
-    return train_images, train_labels, 0, 0
+        # Group indices by label
+    label_to_indices = collections.defaultdict(list)
+    for i, lbl in enumerate(labels):
+        label_to_indices[lbl].append(i)
+
+    # Manually sample test indices (e.g., 20% from each class)
+    test_idx = []
+    train_idx = []
+    for lbl, idxs in label_to_indices.items():
+        random.Random(SEED).shuffle(idxs)
+        split = int(0.2 * len(idxs))
+        test_idx.extend(idxs[:split])
+        train_idx.extend(idxs[split:])
+        overlap = set(train_idx).intersection(test_idx)
+        assert not overlap, f"Overlap between train and eval indices: {overlap}"
+        
+    train_images = [images[i] for i in train_idx]
+    train_labels = [labels[i] for i in train_idx]
+    eval_images  = [images[i] for i in test_idx]
+    eval_labels  = [labels[i] for i in test_idx]
+    
+    # Check for overlap between train and test sets
+    train_hashes = {img_hash(img) for img in train_images}
+    test_hashes   = {img_hash(img) for img in eval_images}
+    common = train_hashes & test_hashes
+    assert not common, f"Overlap detected: {len(common)} images appear in both train and test sets before redistribution!"
+
+    train_images, train_labels, eval_images, eval_labels = redistribute_excess(
+        train_images, train_labels, eval_images, eval_labels, target_classes)
+
+    # Format and optionally augment
+    if AUGMENT:
+        train_images, train_labels = augment_images(train_images, train_labels)
+        eval_images, eval_labels = augment_images(eval_images, eval_labels)
+    else:
+        train_images, train_labels = torch.stack(train_images), torch.tensor(train_labels, dtype=torch.long)
+        eval_images, eval_labels = torch.stack(eval_images), torch.tensor(eval_labels, dtype=torch.long)
+    
+
+    return train_images, train_labels, eval_images, eval_labels
 
 
+def load_MGCLS(path='/users/mbredber/data/MGCLS/classified_crops_1600/',  # Path to MGCLS data
+               fold=None,
+               target_classes=[40],
+               crop_size=(1600, 1600),
+               downsample_size=(128, 128),
+               sample_size=300,
+               island=True,
+               REMOVEOUTLIERS=True,
+               AUGMENT=False,
+               train=False):
 
-classes = get_classes()
 
-def load_galaxies(galaxy_class, path=None, fold=None, island=None, img_shape=None, sample_size=None, REMOVEOUTLIERS=True, AUGMENT=True, train=None):
+    print("Loading MGCLS diffuse data…")
+
+    # build a map tag→folder
+    classes_map = {c['tag']: c['description'] for c in get_classes()}
+
+    images, labels, filenames = [], [], []
+    for cls in target_classes:
+        folder = classes_map.get(cls)
+        if folder is None:
+            continue
+        class_dir = os.path.join(path, folder)
+        for fn in os.listdir(class_dir):
+            if fn.lower().endswith((".jpg", ".jpeg", ".png")):
+                with Image.open(os.path.join(class_dir, fn)) as img:
+                    pil_gray = img.convert("L")
+                    tensor = transforms.ToTensor()(pil_gray)
+                    tensor = apply_formatting(tensor, crop_size, downsample_size)
+                images.append(tensor)
+                labels.append(cls)
+                filenames.append(fn)
+
+    if not images:
+        raise ValueError("No images loaded. Check the path and file extensions.")
+
+    # === GROUP-AWARE SPLIT ===
+    # 1) extract group key (everything before the final underscore)
+    groups = [fn.rsplit('_', 1)[0] for fn in filenames]
+
+    # 2) unique groups and one label per group
+    unique_groups, inverse_idxs = np.unique(groups, return_inverse=True)
+    # pick the first occurrence of each group to get its label
+    group_labels = [labels[groups.index(g)] for g in unique_groups]
+
+    # 3) split groups, stratified by their class
+    train_groups, test_groups = train_test_split(
+        unique_groups,
+        test_size=0.2,
+        stratify=group_labels,
+        random_state=SEED
+    )
+
+    # 4) assign each file to train/test based on its group
+    train_idx = [i for i, g in enumerate(groups) if g in train_groups]
+    test_idx  = [i for i, g in enumerate(groups) if g in test_groups]
+
+    train_images = [images[i] for i in train_idx]
+    train_labels = [labels[i] for i in train_idx]
+    eval_images  = [images[i] for i in test_idx]
+    eval_labels  = [labels[i] for i in test_idx]
+
+    # optional: rebalance any leftover via your redistribute_excess
+    train_images, train_labels, eval_images, eval_labels = redistribute_excess(
+        train_images, train_labels, eval_images, eval_labels, target_classes)
+
+    # stack into tensors (and optionally augment)
+    if AUGMENT:
+        train_images, train_labels = augment_images(train_images, train_labels)
+        eval_images, eval_labels = augment_images(eval_images, eval_labels)
+    else:
+        train_images = torch.stack(train_images)
+        train_labels = torch.tensor(train_labels, dtype=torch.long)
+        eval_images  = torch.stack(eval_images)
+        eval_labels  = torch.tensor(eval_labels,  dtype=torch.long)
+
+    # save per‐class training arrays
+    #for cls in set(train_labels.tolist()):
+    #    cls_imgs = train_images[train_labels == cls].cpu().numpy()
+    #    np.save(os.path.join(path, f"MGCLS_train_{cls}.npy"), cls_imgs)
+    #    print(f"Saved {len(cls_imgs)} images for class {cls} to {path}/MGCLS_train_{cls}.npy")
+
+    return train_images, train_labels, eval_images, eval_labels
+
+
+def load_galaxies(galaxy_class, path=None, fold=None, island=None, crop_size=None, downsample_size=None, sample_size=None, REMOVEOUTLIERS=True, AUGMENT=False, train=None):
 
     def get_max_class(galaxy_class):
         if isinstance(galaxy_class, list):
@@ -1679,7 +1803,7 @@ def load_galaxies(galaxy_class, path=None, fold=None, island=None, img_shape=Non
         return galaxy_class
 
     # Clean up kwargs to remove None values
-    kwargs = {'path': path, 'sample_size': sample_size, 'img_shape': img_shape, 'fold':fold, 'train': train, 'island': island, 'REMOVEOUTLIERS': REMOVEOUTLIERS, 'AUGMENT': AUGMENT}
+    kwargs = {'path': path, 'sample_size': sample_size, 'fold':fold, 'train': train, 'island': island, 'REMOVEOUTLIERS': REMOVEOUTLIERS, 'AUGMENT': AUGMENT, 'crop_size': crop_size, 'downsample_size': downsample_size}
     clean_kwargs = {k: v for k, v in kwargs.items() if v is not None}
 
     max_class = get_max_class(galaxy_class)
@@ -1690,15 +1814,16 @@ def load_galaxies(galaxy_class, path=None, fold=None, island=None, img_shape=Non
         data = load_galaxy10(path=path, target_classes=target_classes, **clean_kwargs)
 
     elif max_class < 14:  # FIRST radio galaxies
-        if 'img_shape' in clean_kwargs:
-            clean_kwargs['img_shape'] = np.squeeze(clean_kwargs['img_shape'])
+        classes = get_classes()
+        if 'crop_size' in clean_kwargs:
+            clean_kwargs['crop_size'] = np.squeeze(clean_kwargs['crop_size'])
         path =  root_path +  'firstgalaxydata/'
         target_classes = [classes[c]['description'] for c in galaxy_class] if isinstance(galaxy_class, list) else [classes[galaxy_class]['description']]
         data = load_FIRST(path=path, target_classes=target_classes, **clean_kwargs)
 
     elif max_class < 18:  # MiraBest radio galaxies
-        if 'img_shape' in clean_kwargs:
-            clean_kwargs['img_shape'] = np.squeeze(clean_kwargs['img_shape'])
+        if 'crop_size' in clean_kwargs:
+            clean_kwargs['crop_size'] = np.squeeze(clean_kwargs['crop_size'])
         target_classes = galaxy_class if isinstance(galaxy_class, list) else [galaxy_class]
         data = load_Mirabest(target_classes=target_classes, **clean_kwargs)
 
@@ -1709,11 +1834,25 @@ def load_galaxies(galaxy_class, path=None, fold=None, island=None, img_shape=Non
 
     elif max_class < 37: # RGZ10k radio galaxies
         target_classes = galaxy_class if isinstance(galaxy_class, list) else [galaxy_class]
-        data = load_rgz10k(target_classes=target_classes, **clean_kwargs)
+        data = load_RGZ10k(target_classes=target_classes, **clean_kwargs)
         
-    elif max_class < 45:  # MGCLS diffuse cluster radio emission
-        data = load_mgcls_diffuse(**clean_kwargs)
+    elif max_class < 50:  # MGCLS diffuse cluster radio emission
+        target_classes = galaxy_class if isinstance(galaxy_class, list) else [galaxy_class]
+        data = load_MGCLS(target_classes=target_classes, **clean_kwargs)
+        
+    elif max_class <= 59:  # PSZ2
+        target_classes = galaxy_class if isinstance(galaxy_class, list) else [galaxy_class]
+        data = load_PSZ2(target_classes=target_classes, **clean_kwargs)
+        
     else:
-
         raise ValueError("Invalid galaxy class provided.")
+    
+    # Check for overlap between train and test sets
+    train_hashes = {img_hash(img) for img in data[0]}
+    eval_images = data[2] if len(data) > 2 else []
+    if len(eval_images) != 0:
+        test_hashes   = {img_hash(img) for img in eval_images}
+        common = train_hashes & test_hashes
+        assert not common, f"Overlap detected: {len(common)} images appear in both train and test validation!"
+    
     return data
