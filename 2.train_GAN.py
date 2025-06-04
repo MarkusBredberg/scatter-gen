@@ -28,7 +28,7 @@ The script also evaluates the model using various metrics and saves the results 
 # -------------------------------
 # Fixed parameters for hyperparameter optimization
 # -------------------------------
-galaxy_class = 41
+galaxy_class = 40
 folds = [0, 1, 2, 3, 4]
 batch_size = 256
 epochs = 500
@@ -43,15 +43,15 @@ if gan_type == "ScatterDualGAN":
 
 # Hyperparameter grid (grid_filter controls REMOVEOUTLIERS)
 grid_latent_dim = [128]
-grid_lr_gen = [1e-3, 1e-4]       # Separate learning rate for generator
-grid_lr_disc = [1e-4]      # Separate learning rate for discriminator
+grid_lr_gen = [1e-3]       # Separate learning rate for generator
+grid_lr_disc = [1e-3]      # Separate learning rate for discriminator
 grid_gen_loss = ["MSE", "BCE"]
 grid_disc_loss = ["BCE"]
 grid_adam_betas = [(0.5, 0.999)]
 grid_weight_decay = [0.0]
-grid_label_smoothing = [0.7, 0.9, 1]  # Label smoothing for generator
-grid_lambda_div = [0, 0.1]      
-grid_filter = [True]   # REMOVEOUTLIERS option
+grid_label_smoothing = [0.9]  # Label smoothing for generator
+grid_lambda_div = [0]      
+grid_filter = [False]   # REMOVEOUTLIERS option
 
 EVALUATE = True  # Set to True to evaluate the model after training
 

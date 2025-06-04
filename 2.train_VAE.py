@@ -1,6 +1,6 @@
 import itertools
 import os
-from utils.data_loader import load_galaxies, get_classes, normalise_images
+from utils.data_loader import load_galaxies, get_classes
 from torch.utils.data import DataLoader, TensorDataset, random_split
 import numpy as np
 import torch
@@ -11,11 +11,12 @@ from utils.VAE_models import get_VAE_model
 from utils.custom_mse import NormalisedWeightedMSELoss, CustomMSELoss, WeightedMSELoss, RadialWeightedMSELoss, CustomIntensityWeightedMSELoss, MaxIntensityMSELoss, StandardMSELoss, CombinedMSELoss, ExperimentalMSELoss, BasicMSELoss
 from utils.scatter_reduction import lavg, ldiff
 from utils.training_tools import EarlyStopping 
+from utils.calc_tools import normalise_images
 from torchsummary import summary
 from tqdm import tqdm
 import heapq
 import time
-from utils.plotting import vae_plot_comparison, loss_vs_epoch, plot_original_images, plot_weight_and_loss_maps, plot_images, plot_histograms, plot_reconstructions
+from utils.plotting import vae_plot_comparison, loss_vs_epoch, plot_original_images, plot_weight_and_loss_maps, plot_histograms, plot_reconstructions
 import matplotlib.pyplot as plt
 
 
@@ -39,7 +40,7 @@ SAVEIMGS = False          # Save the reconstructed images in tensor format
 PLOTFAILED = True         # Plot the top 5 images with the largest MSE loss and weakest peak intensities
 REMOVEOUTLIERS = True     # Filter away problematic images
 
-F = 8 #Choose the loss function to use
+F = 0 #Choose the loss function to use
 
 #galaxy_classes = [[10, 11, 12, 13]] #Use double square parenthesis for conditional VAEs
 galaxy_classes = [40]
@@ -50,8 +51,7 @@ learning_rates = [1e-4]
 reg_params = [1e-4] 
 initial_final_betas = [(1e-1, 1)]
 num_epochs_cuda = 200; num_epochs_cpu = 200
-batch_size = 128 
-img_shape = (1, 128, 128)
+batch_size = 32
 J, L, order = 2, 12, 2
 
 #1001028
@@ -80,6 +80,14 @@ C = 1 # 0: No normalisation, 1: Batch normalisation, 2: Groupnorm
 D = 1 if REMOVEOUTLIERS else 0 # 0: No filter, 1: Filter
 E = J # Number of scales
 # F: Loss function
+
+if galaxy_classes[0] in [40, 41, 42, 43, 44, 45, 46, 47, 48]:
+    crop_size = (1600, 1600)
+    downsample_size = (128, 128)
+else:
+    crop_size = (128, 128)
+    downsample_size = (128, 128)
+img_shape = (1, downsample_size[0], downsample_size[1]) # (1, 128, 128) for 128x128 images
     
 
 num_galaxies_list = [int(1000000+A*1e5+B*1e4+C*1e3+D*1e2+E*10+F)]
@@ -160,7 +168,8 @@ for galaxy_class, num_galaxies, encoder_choice, hidden_dim1, hidden_dim2, latent
     else:
         data = load_galaxies(galaxy_class=galaxy_class, 
                             fold=fold,
-                            img_shape=img_shape, 
+                            crop_size=crop_size,
+                            downsample_size=downsample_size,
                             sample_size=1000000, 
                             REMOVEOUTLIERS=REMOVEOUTLIERS,
                             train=True)
@@ -180,7 +189,6 @@ for galaxy_class, num_galaxies, encoder_choice, hidden_dim1, hidden_dim2, latent
     # Check the input data
     print("Train images shape as read in:", np.shape(train_images))
     if IMGCHECK:
-        plot_images(train_images, train_labels)
         plot_histograms(train_images, test_images)
 
     # Prepare input data
@@ -244,7 +252,6 @@ for galaxy_class, num_galaxies, encoder_choice, hidden_dim1, hidden_dim2, latent
     
     #Check input after renormalisation and filtering  
     if IMGCHECK: 
-        plot_images(train_images, train_labels)
         plot_histograms(train_images, test_images)
         
     ##########################################################
@@ -264,8 +271,8 @@ for galaxy_class, num_galaxies, encoder_choice, hidden_dim1, hidden_dim2, latent
             return None
         return torch.utils.data.dataloader.default_collate(batch)
     
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, num_workers=0, collate_fn=custom_collate, drop_last=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=0, collate_fn=custom_collate, drop_last=True)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, num_workers=0, collate_fn=custom_collate, drop_last=False)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=0, collate_fn=custom_collate, drop_last=False)
 
     ##########################################################
     ############ TRAINING ####################################
@@ -305,7 +312,7 @@ for galaxy_class, num_galaxies, encoder_choice, hidden_dim1, hidden_dim2, latent
     #scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
     beta_increment = (final_beta - initial_beta) / num_epochs
     
-    MSEfun = ['blablabla', 'normalised', 'radial', 'weighted', 'intensity', 'maxintensity', 'custom', 'combined', 'experimental', 'basic'][F]
+    MSEfun = ['standard', 'normalised', 'radial', 'weighted', 'intensity', 'maxintensity', 'custom', 'combined', 'experimental', 'basic'][F]
     print("F: ", F, " and MSEfun: ", MSEfun)
     if MSEfun == 'radial': mse_loss = RadialWeightedMSELoss(threshold=0.1, intensity_weight=0.001, radial_weight=0.001)
     elif MSEfun == 'normalised': mse_loss = NormalisedWeightedMSELoss(threshold=0.1, weight=0.5) 
@@ -490,11 +497,17 @@ for galaxy_class, num_galaxies, encoder_choice, hidden_dim1, hidden_dim2, latent
                 x_hat, mean, log_var = model(x)
 
             # Verify and append only if shapes match
-            if x_hat.shape == x.shape:
-                reconstructed_images_list.append(x_hat.cpu())
-                original_images_list.append(x.cpu())
-            else:
-                print(f"Shape mismatch: x_hat shape: {x_hat.shape}, x shape: {x.shape}")
+            #if x_hat.shape == x.shape:
+            #    reconstructed_images_list.append(x_hat.cpu())
+            #    original_images_list.append(x.cpu())
+            #else:
+            #    print(f"Shape mismatch: x_hat shape: {x_hat.shape}, x shape: {x.shape}")
+            
+            # Ensure x_hat matches x shape before appending
+            if x_hat.shape != x.shape:
+                x_hat = x_hat.view(x.shape)
+            reconstructed_images_list.append(x_hat.cpu())
+            original_images_list.append(x.cpu())
             if len(reconstructed_images_list) >= 100:
                 break
             
@@ -654,15 +667,15 @@ for galaxy_class, num_galaxies, encoder_choice, hidden_dim1, hidden_dim2, latent
         # plot_top_low_intensity_images(all_original_images, all_reconstructed_images, num_images=5, supertitle=supertitle)
         # plot_top_mse_images(all_original_images, all_reconstructed_images, num_images=5, supertitle=supertitle)
          
-        # Plot the 100 reconstructions with the highest MSE loss
+        ## Plot the 100 reconstructions with the highest MSE loss
         top_100_mse_originals, top_100_mse_reconstructions = get_top_100_mse_images(all_original_images, all_reconstructed_images)
-        plot_image_grid(top_100_mse_originals, img_shape, 10, 10, 
+        plot_image_grid(top_100_mse_originals, img_shape, 4, 4, 
                         title="Originals of top 100 reconstructions with highest MSE loss", 
                         savepath=f'{fig_path}/top_100_mse_grid.png')
         
         # Plot the 100 reconstructions with the faintest emission
         top_100_faint_originals, top_100_faint_reconstructions = get_top_100_faint_images(all_original_images, all_reconstructed_images)
-        plot_image_grid(top_100_faint_originals, img_shape, 10, 10,  
+        plot_image_grid(top_100_faint_originals, img_shape, 4, 4,  
                         title="Originals of top 100 reconstructions with faintest emission", 
                         savepath=f'{fig_path}/top_100_faint_grid.png')
         
@@ -700,8 +713,8 @@ for galaxy_class, num_galaxies, encoder_choice, hidden_dim1, hidden_dim2, latent
         else:
             generated_images = model.decoder(noise)
 
-        plot_image_grid(generated_images, img_shape, 10, 10, title="Generations", savepath=f"{fig_path}/generation.png")
-        plot_image_grid(all_reconstructed_images, img_shape, 10, 10, title="Reconstructions", savepath= f"{fig_path}/reconstructions.png")
+        plot_image_grid(generated_images, img_shape, 4, 4, title="Generations", savepath=f"{fig_path}/generation.png")
+        plot_image_grid(all_reconstructed_images, img_shape, 4, 4, title="Reconstructions", savepath= f"{fig_path}/reconstructions.png")
 
     train_loader = DataLoader(TensorDataset(train_images, train_images), batch_size=batch_size, shuffle=False, drop_last=False, num_workers=0)
     plot_original_images(train_loader, img_shape[-1], 10, save_path=f'{fig_path}/originals.png')

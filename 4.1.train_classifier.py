@@ -5,8 +5,8 @@ import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader, Subset, Dataset
 from torchsummary import summary
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score 
-from utils.data_loader import load_galaxies, get_classes,  get_synthetic
-from utils.classifiers import RustigeClassifier, ProjectModel, MLPClassifier, DualClassifier, DANNClassifier, BinaryClassifier
+from utils.data_loader import load_galaxies, get_classes,  get_synthetic, augment_images
+from utils.classifiers import RustigeClassifier, ProjectModel, MLPClassifier, DualClassifier, ScatterResNet, DANNClassifier, BinaryClassifier, ScatterSqueezeNet
 from utils.training_tools import EarlyStopping, reset_weights
 from utils.calc_tools import cluster_metrics, normalise_images
 from utils.plotting import plot_histograms, plot_images_by_class, plot_image_grid, plot_background_histogram
@@ -33,21 +33,22 @@ print("Running script 4.1")
 ###############################################
 
 classes = get_classes()
-galaxy_classes = [40, 41]  # Classes to classify
+galaxy_classes = [10, 11, 12, 13]  # Classes to classify
 max_num_galaxies = 1000000  # Upper limit for the all-classes combined training data before classical augmentation
 dataset_portions = [0.1, 0.5, 1]  # Portions of complete dataset for the accuracy vs dataset size
 J, L, order = 2, 12, 2  # Scatter transform parameters
-classifier = ["ProjectModel", "Rustige", "DANN", "ScatterNet", "ScatterDual", "Binary"][-1]  # Choose one classifier model model
-gen_model_names = ['DDPM'] #['GAN', 'Dual', 'CNN', 'STMLP', 'lavgSTMLP', 'ldiffSTMLP'] # Specify the generative model_name
+classifier = ["ProjectModel", "Rustige", "DANN", "ScatterNet", "ScatterDual", "Binary", "ScatterResNet"][1]
+gen_model_names = ['wGAN'] #['ST', 'DDPM', 'wGAN', 'GAN', 'Dual', 'CNN', 'STMLP', 'lavgSTMLP', 'ldiffSTMLP'] # Specify the generative model_name
 num_epochs_cuda = 200
 num_epochs_cpu = 100
 batch_size = 250
 learning_rates = [1e-3]  # Learning rates
-regularization_params = [0]  # Regularisation parameters
+regularization_params = [1e-3]  # Regularisation parameters
+label_smoothing = 0.2  # Label smoothing for the classifier
 img_shape = (1, 128, 128)
-num_experiments = 10
+num_experiments = 5
 folds = [5] # 0-4 for 5-fold cross validation, 5 for only one training
-lambda_values = [0]  # Ratio between generated images and original images per class. 8 is reserfved for TESTONGENERATED
+lambda_values = [0, 0.25, 0.5, 1]  # Ratio between generated images and original images per class. 8 is reserfved for TRAINONGENERATED
 
 ES, patience = True, 10  # Use early stopping
 SHOWIMGS = True  # Show some generated images for each class (Tool for control)
@@ -56,14 +57,15 @@ NORMALISEIMGSTOPM = False  # Normalise images to [-1, 1]
 NORMALISESCS = False  # Normalise scattering coefficients to [0, 1]
 NORMALISESCSTOPM = False  # Normalise scattering coefficients to [-1, 1]
 USE_CLASS_WEIGHTS = True  # Set to False to disable class weights
-TESTONGENERATED = False  # Use generated data as testdata
+TRAINONGENERATED = True  # Use generated data as testdata
 FILTERED = True  # Remove in training, validation and test data for the classifier
 FILTERGEN = False  # Remove generated images that are too similar to other generated images
 HISTOGRAMMATCHING = False  # Histogram matching for generated images
 USE_MEMMAP = False  # Use memmap for scattering coefficients
 SIGMACLIPPONDDPM = False  # Apply sigma clipping to DDPM data
+SCHEDULER = False  # Use a learning rate scheduler
 
-# -------------------------- NEW GAN CONFIGURATION --------------------------
+# -------------------------- GAN CONFIGURATION --------------------------
 gan_epoch = 5000           # e.g., epoch number to load from
 gan_gen_loss = 'MSE'       # e.g., generator loss value (as used in filename)
 gan_disc_loss = 'BCE'      # e.g., discriminator loss value (as used in filename)
@@ -77,23 +79,25 @@ gan_label_smoothing = 0.7
 gan_lambda_div = 0
 gan_type = ['Simple', 'Advanced'][0]
 gan_data_version = 'clean' if FILTERED else 'full'  # 'full' or 'clean'
-# -------------------------------------------------------------------------
 
+
+# ---------------------------- VAE CONFIGURATION -----------------------------
+VAE_train_size = 1101128
+forbidden_classes = 12  # Generated bent sources look awful
 #########################################################################################################################
-
-if lambda_values != [0] and galaxy_classes == [10, 11, 12, 13]:
-    VAE_train_size = {galaxy_classes[0]: 1101128, galaxy_classes[1]: 1101128, galaxy_classes[2]: 1101128, galaxy_classes[3]: 1101128}
-    forbidden_classes = [galaxy_classes[3]]  # Generated bent sources look awful
     
-if galaxy_classes == [40, 41]:
+if any (cls in galaxy_classes for cls in [10, 11, 12, 13]):
+    crop_size = (128, 128)  # Crop size for the images
+    downsample_size = (128, 128)  # Downsample size for the images
+elif galaxy_classes == [40, 41]:
     crop_size = crop_size = (1600, 1600)  # Crop size for the images
     downsample_size = (128, 128)  # Downsample size for the images
 elif galaxy_classes == [50, 51]:
     crop_size = crop_size = (128, 128)  # Crop size for the images
     downsample_size = (128, 128)  # Downsample size for the images
 
-if TESTONGENERATED:
-    lambda_values = [8]  # To identify and distinguish TESTONGENERATED from other runs
+if TRAINONGENERATED:
+    lambda_values = [8]  # To identify and distinguish TRAINONGENERATED from other runs
     print("Using generated data for testing.")
 
 SEED = 42
@@ -109,7 +113,6 @@ else:
     num_epochs = num_epochs_cpu
     print(f"CUDA is not available. Setting epochs to {num_epochs}.")
     
-print("Using crop size:", crop_size)
 
 if set(galaxy_classes) & {18} or set(galaxy_classes) & {19}:
     galaxy_classes = [20, 21, 21, 22, 23, 24, 25, 26, 27, 28, 29]  # Include all digits if 18 or 19 is in target_classes
@@ -187,7 +190,6 @@ dataset_sizes = {}
 
 scattering = Scattering2D(J=J, L=L, shape=img_shape[1:], max_order=order)       
 def compute_scattering_coeffs(images, scattering=scattering, batch_size=128, device="cpu"):
-    print("Computing scattering coefficients in batches on CPU...")
     scat_coeffs_list = []
     with torch.no_grad():
         for i in range(0, len(images), batch_size):
@@ -300,9 +302,10 @@ def filter_generated_images(generated_images_list, generated_labels_list):
     # Plot some example of images next to their similar images
     if SHOWIMGS:
         for i in range(min(18, len(filtered_images_list))):
-            save_images_tensorboard(torch.cat([filtered_images_list[i], generated_images_list[i]], dim=0), save_path=f"./classifier/{gen_model_name}_{galaxy_classes}_{num_galaxies}_filtered_grid.png", nrow=6)
+            save_images_tensorboard(torch.cat([filtered_images_list[i], generated_images_list[i]], dim=0), save_path=f"./classifier/{gen_model_name}_{galaxy_classes}_filtered_grid.png", nrow=6)
 
     return filtered_images_list, filtered_labels_list
+
 
 ###############################################
 ########### READ IN TEST DATA #################
@@ -314,7 +317,7 @@ for gen_model_name in gen_model_names:
 
     with torch.no_grad():
         dummy = torch.zeros((1, *img_shape)).cpu()
-        scat_dummy = scattering(dummy)f
+        scat_dummy = scattering(dummy)
         if scat_dummy.shape[1] == 1:
             scat_dummy = scat_dummy.squeeze(1)
     scatshape = tuple(scat_dummy.shape[1:])
@@ -322,98 +325,103 @@ for gen_model_name in gen_model_names:
     hidden_dim2 = 128
     vae_latent_dim = 64
 
-    if not TESTONGENERATED:
-        train_imgs, train_lbls, test_images, test_labels  = load_galaxies(galaxy_class=galaxy_classes, 
-                    fold=max(folds), #Any fold other than 5 gives me the test data for the five fold cross validation
-                    crop_size=crop_size,
-                    downsample_size=downsample_size,
-                    sample_size=max_num_galaxies, 
-                    REMOVEOUTLIERS=FILTERED,
-                    AUGMENT=True,
-                    train=False)
-        
-        
-        # ——— Data sanity checks ———
-        print("Shape of test_images: ", np.shape(test_images))
-        
-        def check_tensor(name, tensor):
-            if torch.isnan(tensor).any():
-                print(f"Warning: {name} contains NaNs")
-            if torch.isinf(tensor).any():
-                print(f"Warning: {name} contains Infs")
-            if tensor.is_floating_point():
-                print(f"{name} stats: min={tensor.min().item():.3f}, max={tensor.max().item():.3f}, mean={tensor.mean().item():.3f}, std={tensor.std().item():.3f}")
-            else:
-                vals, counts = torch.unique(tensor, return_counts=True)
-                print(f"{name} unique values: {vals.tolist()}, counts: {counts.tolist()}")
-                
-        check_tensor("Test images", test_images)
-        check_tensor("Train images", train_imgs)
-        
-        # Check the tensor for each class
-        for cls in galaxy_classes:
-            cls_mask = (train_lbls == cls)
-            cls_images = train_imgs[cls_mask]
-            check_tensor(f"Train images for class {cls}", cls_images)
+    train_imgs, train_lbls, test_images, test_labels  = load_galaxies(galaxy_class=galaxy_classes, 
+                fold=max(folds), #Any fold other than 5 gives me the test data for the five fold cross validation
+                crop_size=crop_size,
+                downsample_size=downsample_size,
+                sample_size=max_num_galaxies, 
+                REMOVEOUTLIERS=FILTERED,
+                AUGMENT=True,
+                train=False)
     
-        import hashlib
+    # ——— Data sanity checks ———
+    print("Shape of test_images: ", np.shape(test_images))
+    
+    def check_tensor(name, tensor):
+        # skip completely empty tensors
+        if tensor.numel() == 0:
+            print(f"Warning: {name} is empty, skipping stats.")
+            return
 
-        def img_hash(img: torch.Tensor) -> str:
-            # ensure CPU & contiguous
-            arr = img.cpu().contiguous().numpy()
-            return hashlib.sha1(arr.tobytes()).hexdigest()
+        if torch.isnan(tensor).any():
+            print(f"Warning: {name} contains NaNs")
+        if torch.isinf(tensor).any():
+            print(f"Warning: {name} contains Infs")
+        if tensor.is_floating_point():
+            print(f"{name} stats: min={tensor.min().item():.3f}, "
+                f"max={tensor.max().item():.3f}, "
+                f"mean={tensor.mean().item():.3f}, "
+                f"std={tensor.std().item():.3f}")
+        else:
+            vals, counts = torch.unique(tensor, return_counts=True)
+            print(f"{name} unique values: {vals.tolist()}, counts: {counts.tolist()}")
 
-        # after loading train_images, test_images:
-        train_hss = {img_hash(img) for img in train_imgs}
-        test_hashes   = {img_hash(img) for img in test_images}
+            
+    check_tensor("Test images", test_images)
+    check_tensor("Train images", train_imgs)
+    
+    # Check the tensor for each class
+    for cls in range(num_classes):
+        cls_mask = (train_lbls == cls)
+        cls_images = train_imgs[cls_mask]
+        check_tensor(f"Train images for class {cls}", cls_images)
 
-        common = train_hss & test_hashes
-        assert not common, f"Overlap detected: {len(common)} images appear in both train and test validation!"
-        # ————————————————————————
-        
-        test_labels = test_labels - test_labels.min() 
-        perm = torch.randperm(test_images.size(0))
-        test_images = test_images[perm]
-        test_labels = test_labels[perm]
+    import hashlib
+
+    def img_hash(img: torch.Tensor) -> str:
+        # ensure CPU & contiguous
+        arr = img.cpu().contiguous().numpy()
+        return hashlib.sha1(arr.tobytes()).hexdigest()
+
+    # after loading train_images, test_images:
+    train_hss = {img_hash(img) for img in train_imgs}
+    test_hashes   = {img_hash(img) for img in test_images}
+
+    common = train_hss & test_hashes
+    assert not common, f"Overlap detected: {len(common)} images appear in both train and test validation!"
+    # ————————————————————————
+    
+    test_labels = test_labels - test_labels.min() 
+    perm = torch.randperm(test_images.size(0))
+    test_images = test_images[perm]
+    test_labels = test_labels[perm]
 
 
-        # Print the distribution of raw test labels
-        unique_labels, counts = torch.unique(test_labels, return_counts=True)
-        print("Test labels distribution (raw):", dict(zip(unique_labels.tolist(), counts.tolist())))
-        
-        if classifier in ['ProjectModel', 'Rustige', 'ScatterDual', 'Binary']:
-            if NORMALISEIMGS or NORMALISEIMGSTOPM:
-                if NORMALISEIMGSTOPM:
-                    test_images = normalise_images(test_images, -1, 1)
-                else:
-                    test_images = normalise_images(test_images, 0, 1)
+    # Print the distribution of raw test labels
+    unique_labels, counts = torch.unique(test_labels, return_counts=True)
+    print("Test labels distribution (raw):", dict(zip(unique_labels.tolist(), counts.tolist())))
+    
+    if classifier in ['ProjectModel', 'Rustige', 'ScatterDual', 'Binary']:
+        if NORMALISEIMGS or NORMALISEIMGSTOPM:
+            if NORMALISEIMGSTOPM:
+                test_images = normalise_images(test_images, -1, 1)
+            else:
+                test_images = normalise_images(test_images, 0, 1)
 
-        # Handle scattering coefficients normalization in a similar way
-        if classifier in ['ScatterNet', 'ScatterDual']:
-            if NORMALISESCS or NORMALISESCSTOPM:
-                if NORMALISESCSTOPM:
-                    test_scat_coeffs = normalise_images(test_scat_coeffs, -1, 1)
-                else:
-                    test_scat_coeffs = normalise_images(test_scat_coeffs, 0, 1)
-                    
-        # Prepare input data
-        # Produce an empty tensor to occupy the not used component of the datasets. 
-        # It should have the same size as the test images
-        mock_tensor = torch.zeros_like(test_images)
-        #min_label = test_labels.min()
-        #test_labels = test_labels - min_label # Labels remain as integers for CrossEntropyLoss
-        if classifier in ['ScatterNet', 'ScatterDual']:
-            test_scat_coeffs = compute_scattering_coeffs(test_images)
-        if classifier == "ScatterNet":
+    # Handle scattering coefficients normalization in a similar way
+    if classifier in ['ScatterNet', 'ScatterDual']:
+        if NORMALISESCS or NORMALISESCSTOPM:
+            if NORMALISESCSTOPM:
+                test_scat_coeffs = normalise_images(test_scat_coeffs, -1, 1)
+            else:
+                test_scat_coeffs = normalise_images(test_scat_coeffs, 0, 1)
+                
+    # Prepare input data
+    # Produce an empty tensor to occupy the not used component of the datasets. 
+    # It should have the same size as the test images
+    mock_tensor = torch.zeros_like(test_images)
+    if classifier in ['ScatterNet', 'ScatterResNet', 'ScatterDual']:
+        test_scat_coeffs = compute_scattering_coeffs(test_images)
+        if classifier in ['ScatterNet', 'ScatterResNet']:
             test_dataset = TensorDataset(mock_tensor, test_scat_coeffs, test_labels)
-        if classifier == 'ScatterDual':
+        elif classifier == 'ScatterDual':
             test_dataset = TensorDataset(test_images, test_scat_coeffs, test_labels)
-        else: 
-            test_dataset = TensorDataset(test_images, mock_tensor, test_labels) 
-                                
-        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=custom_collate, drop_last=False)
+    else: 
+        test_dataset = TensorDataset(test_images, mock_tensor, test_labels) 
+                            
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=custom_collate, drop_last=False)
 
-        print(f"Test dataset size: {len(test_dataset)}")
+    print(f"Test dataset size: {len(test_dataset)}")
 
     ###############################################
     ########### LOOP OVER DATA FOLD ###############
@@ -428,129 +436,63 @@ for gen_model_name in gen_model_names:
         log_path = f"./classifier/log_{runname}.txt"
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
         #file = open(log_path, 'w')
-
-        # Load the data
-        data = load_galaxies(galaxy_class=galaxy_classes, 
-                            fold=fold,
-                            crop_size=crop_size,
-                            downsample_size=downsample_size, 
-                            sample_size=max_num_galaxies, 
-                            REMOVEOUTLIERS=FILTERED,
-                            AUGMENT=True,
-                            train=True)
-        train_images, train_labels, valid_images, valid_labels = data
-
-        train_labels = train_labels - train_labels.min() 
-        valid_labels = valid_labels - valid_labels.min() 
-
-        perm = torch.randperm(train_images.size(0))
-        train_images = train_images[perm]
-        train_labels = train_labels[perm]
-        perm = torch.randperm(valid_images.size(0))
-        valid_images = valid_images[perm]
-        valid_labels = valid_labels[perm]
-                                      
-        num_galaxies = len(train_images)
-        dataset_sizes[fold] = [int(num_galaxies * perc) for perc in dataset_portions]
-        
-        
-        ##########################################################
-        ############# TESTING ON GENERATED DATA ##################
-        ##########################################################
-
-        if TESTONGENERATED:  # Use generated data for testing
-            for cls in galaxy_classes:
-                # use your shared helper to do all generation + filtering
-                generated_images, generated_labels = get_synthetic(
-                    num_generate=int(lambda_generate/len(galaxy_classes)*len(train_images)),
-                    gen_model_name=gen_model_name,
-                    cls=cls,
-                    galaxy_classes=galaxy_classes,
-                    img_shape=img_shape,
-                    FILTERGEN=FILTERGEN,
-                    CLIPDDPM=True,
-                    model_kwargs={
-                        'gan_type': gan_type,
-                        'gan_latent_dim': gan_latent_dim,
-                        'gan_sample_size': gan_sample_size,
-                        'lr_gen': lr_gen,
-                        'lr_disc': lr_disc,
-                        'gan_gen_loss': gan_gen_loss,
-                        'gan_disc_loss': gan_disc_loss,
-                        'gan_adam_beta': gan_adam_beta,
-                        'gan_weight_decay': gan_weight_decay,
-                        'gan_label_smoothing': gan_label_smoothing,
-                        'gan_lambda_div': gan_lambda_div,
-                        'gan_data_version': gan_data_version,
-                        'gan_epoch': gan_epoch,
-                        'NORMALISEIMGS': NORMALISEIMGS,
-                        'NORMALISETOPM': NORMALISEIMGSTOPM,
-                        'VAE_train_size': VAE_train_size,
-                        'scatshape': scatshape,
-                        'hidden_dim1': hidden_dim1,
-                        'hidden_dim2': hidden_dim2,
-                        'vae_latent_dim': vae_latent_dim
-                    },
-                    fold=fold,
-                    device=DEVICE
-                )
-
-            test_images = torch.cat(generated_images, dim=0)
-            test_labels = torch.cat(generated_labels, dim=0)
-
-            print("Shape of test_images: ", test_images.shape)
             
-            # Shuffle the test data
-            perm = torch.randperm(test_images.size(0))
-            test_images = test_images[perm]
-            test_labels = test_labels[perm]
-
-            # Normalize train and test images to [0, 1]
-            if classifier in ['ProjectModel', 'Rustige', 'ScatterDual', 'Binary']:
-                if NORMALISEIMGS:
-                    test_images = normalise_images(test_images, 0, 1)
-                    if NORMALISEIMGSTOPM:  # normalize to [-1, 1]
-                        test_images = normalise_images(test_images, -1, 1)
-
-            # Handle scattering coefficients normalization in a similar way
-            if classifier in ['ScatterNet', 'ScatterDual']:
-                if NORMALISESCS:
-                    test_scat_coeffs = normalise_images(test_scat_coeffs, 0, 1)
-                    if NORMALISESCSTOPM:
-                        test_scat_coeffs = normalise_images(test_scat_coeffs, -1, 1)
-                        
-            # Normalise labels
-            test_labels = test_labels - min(test_labels)  # Labels remain as integers for CrossEntropyLoss
-        
-            # Prepare input data
-            mock_tensor = torch.zeros_like(test_images)
-            if classifier in ['ScatterNet', 'ScatterDual']:
-                test_scat_coeffs = compute_scattering_coeffs(test_images)
-            if classifier == "ScatterNet":
-                test_dataset = TensorDataset(mock_tensor, test_scat_coeffs, test_labels)
-            if classifier == 'ScatterDual':
-                test_dataset = TensorDataset(test_images, test_scat_coeffs, test_labels)
-            else: 
-                test_dataset = TensorDataset(test_images, mock_tensor, test_labels) 
-
-            test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=custom_collate, drop_last=True)
-
-
+        # ——— Data loading for training/validation ———
+        if TRAINONGENERATED:
+            # only synthetic for training; reserve real for validation
+            train_images = torch.empty((0, *img_shape), device=DEVICE)
+            train_labels = torch.empty((0,), dtype=torch.long, device=DEVICE)
+            _, _, valid_images, valid_labels = load_galaxies(
+                galaxy_class=galaxy_classes,
+                fold=fold,
+                crop_size=crop_size,
+                downsample_size=downsample_size,
+                sample_size=max_num_galaxies,
+                REMOVEOUTLIERS=FILTERED,
+                AUGMENT=False,   # no augmentation on hold-out real val set
+                train=True
+            )
+            valid_labels = valid_labels - valid_labels.min()
+            perm = torch.randperm(valid_images.size(0))
+            valid_images, valid_labels = valid_images[perm], valid_labels[perm]
+        else:
+            # real train + valid
+            train_images, train_labels, valid_images, valid_labels = load_galaxies(
+                galaxy_class=galaxy_classes,
+                fold=fold,
+                crop_size=crop_size,
+                downsample_size=downsample_size,
+                sample_size=max_num_galaxies,
+                REMOVEOUTLIERS=FILTERED,
+                AUGMENT=True,
+                train=True
+            )
+            valid_labels = valid_labels - valid_labels.min()
+            perm = torch.randperm(train_images.size(0))
+            train_images, train_labels = train_images[perm], train_labels[perm]
+            perm = torch.randperm(valid_images.size(0))
+            valid_images, valid_labels = valid_images[perm], valid_labels[perm]
+            dataset_sizes[fold] = [int(len(train_images) * p) for p in dataset_portions]
+            
+            
         ##########################################################
-        ############# ARTIFICIAL AUGMENTATION ####################
+        ############# READ IN GENERATED DATA #####################
         ##########################################################
                     
         # Generate more training data if requested
-        if lambda_generate not in [0, 8]:
+        if lambda_generate not in [0]:
             batch_size_generate = 500 
-            num_generate = int(lambda_generate / len(galaxy_classes) * len(train_images))
+            if train_images.numel() > 0:
+                num_generate = int(lambda_generate / len(galaxy_classes) * len(train_images))
+            else:
+                num_generate = int(lambda_generate * 125)
             print("Old training data size: ", train_images.size())
             print('Number of images to generate for each class: ', num_generate)
             
             for cls in galaxy_classes:
                 # use your shared helper to do all generation + filtering
                 gen_imgs_list, gen_lbls_list = get_synthetic(
-                    num_generate=int(lambda_generate/len(galaxy_classes)*len(train_images)),
+                    num_generate=num_generate,
                     gen_model_name=gen_model_name,
                     cls=cls,
                     galaxy_classes=galaxy_classes,
@@ -583,29 +525,78 @@ for gen_model_name in gen_model_names:
                     device=DEVICE
                 )
                 # flatten and append
-                generated_images = torch.cat(gen_imgs_list, dim=0)
-                generated_labels = torch.cat(gen_lbls_list, dim=0)
-                train_images = torch.cat([train_images, generated_images.to(train_images.device)])
-                train_labels = torch.cat([train_labels, generated_labels])
-                
+                if isinstance(gen_imgs_list, torch.Tensor):
+                    generated_images = gen_imgs_list
+                    print("Generated images shape: ", generated_images.shape)
+                else:
+                    generated_images = torch.cat(gen_imgs_list, dim=0)
+                    
+                if isinstance(gen_lbls_list, torch.Tensor):
+                    generated_labels = gen_lbls_list
+                else:
+                    generated_labels = torch.cat(gen_lbls_list, dim=0)
+
+                if train_images.numel() > 0:     
+                    train_images = torch.cat([train_images, generated_images.to(train_images.device)])
+                    train_labels = torch.cat([train_labels, generated_labels])
+                else:
+                    train_images = generated_images.to(DEVICE)
+                    train_labels = generated_labels
+                    
                 # store per-class generated images for sanity checking later
                 if 'generated_by_class' not in locals() and SHOWIMGS:
                     generated_by_class = {}
                 generated_by_class[cls] = generated_images.cpu()
 
-                # Compare the real and generated labels
-                unique_labels, counts = torch.unique(generated_labels, return_counts=True)
-                print("Generated labels distribution (raw):", dict(zip(unique_labels.tolist(), counts.tolist())))
-                unique_labels, counts = torch.unique(train_labels, return_counts=True)
-                print("Train labels distribution (raw):", dict(zip(unique_labels.tolist(), counts.tolist())))
-
                 # Append the filtered images and labels to your training data:
-                
-                if SHOWIMGS and lambda_generate not in [0, 8]:                 
+                if SHOWIMGS and lambda_generate not in [0, 8]:
                     pristine_train_images = train_images
+                    pristine_train_labels = train_labels
+
+        train_labels = train_labels - train_labels.min()
+        
+        unique_labels, counts = torch.unique(train_labels, return_counts=True)
+        print("Train labels distribution (raw):", dict(zip(unique_labels.tolist(), counts.tolist())))
+        print("Length of train_images: ", len(train_images))
+        print("Length of train labels: ", len(train_labels))
+        
+        if TRAINONGENERATED:
+            # For each class, select the correct slice of (images, labels), then concatenate all.
+            class_imgs, class_lbls = [], []
+            offset = min(galaxy_classes)
+            for cls in galaxy_classes:
+                idx = cls - offset
+                imgs = train_images[train_labels == idx]
+                lbls = train_labels[train_labels == idx]
+                if  cls == 10:
+                    imgs, lbls = imgs[:389], lbls[:389]
+                elif cls == 11:
+                    imgs, lbls = imgs[:816], lbls[:816]
+                elif cls == 12:
+                    imgs, lbls = imgs[:292], lbls[:292]
+                elif cls == 13:
+                    imgs, lbls = imgs[:242], lbls[:242]
+                class_imgs.append(imgs)
+                class_lbls.append(lbls)
+            train_images = torch.cat(class_imgs, dim=0)
+            train_labels = torch.cat(class_lbls, dim=0)
+                    
+            # Now apply augmentation to both images and labels
+            train_images, train_labels = augment_images(train_images, train_labels)
+            USE_CLASS_WEIGHTS = True
             
-                train_images = torch.cat([train_images, generated_images.to(train_images.device)])
-                train_labels = torch.cat([train_labels.clone().detach(), generated_labels])
+        # Shuffle the training data
+        perm = torch.randperm(train_images.size(0))
+        train_images = train_images[perm]
+        train_labels = train_labels[perm]
+            
+        unique_labels, counts = torch.unique(train_labels, return_counts=True)
+        print("Train labels distribution (raw) after possible filtering and augmentation:", dict(zip(unique_labels.tolist(), counts.tolist())))
+        print("Length of train_images: ", len(train_images))
+        print("Length of train labels: ", len(train_labels))
+
+        if dataset_sizes == {}:
+            dataset_sizes[fold] = [int(len(train_images) * p) for p in dataset_portions]
 
                 
         ##########################################################
@@ -614,34 +605,75 @@ for gen_model_name in gen_model_names:
 
         if classifier in ['ProjectModel', 'Rustige', 'ScatterDual', 'Binary']:
             if lambda_generate not in [0, 8]:
-                # We have pristine + generated + valid to normalise together
-                splits = [pristine_train_images, generated_images, valid_images]
-                lengths = [len(s) for s in splits]
-                all_images = torch.cat(splits, dim=0)
-            else:
-                # Only train+valid
-                splits = [train_images, valid_images]
-                lengths = [len(s) for s in splits]
-                all_images = torch.cat(splits, dim=0)
+                # 1. concatenate images
+                img_splits = [
+                    pristine_train_images.to(DEVICE),
+                    generated_images.to(DEVICE),
+                    valid_images.to(DEVICE)
+                ]
+                img_lengths = [len(t) for t in img_splits]
+                all_images = torch.cat(img_splits, dim=0)
 
-            if NORMALISEIMGS or NORMALISEIMGSTOPM:
-                out_min, out_max = (-1, 1) if NORMALISEIMGSTOPM else (0, 1)
-                all_images = normalise_images(all_images, out_min, out_max)
+                # 2. concatenate labels in the same order
+                lbl_splits = [
+                    pristine_train_labels.to(DEVICE),
+                    generated_labels.to(DEVICE),
+                    valid_labels.to(DEVICE)
+                ]
+                all_labels = torch.cat(lbl_splits, dim=0)
 
-            # Split back into the original groups
-            boundaries = [0] + list(torch.cumsum(torch.tensor(lengths), dim=0).numpy())
-            chunked = [
-                all_images[boundaries[i]:boundaries[i+1]]
-                for i in range(len(lengths))
-            ]
+                # 3. compute split boundaries once
+                boundaries = [0] + list(torch.cumsum(torch.tensor(img_lengths), dim=0).numpy())
 
-            if lambda_generate not in [0, 8]:
-                pristine_train_images, generated_images, valid_images = chunked
+                # 4. slice images back into (pristine, generated, valid)
+                chunked_imgs = [
+                    all_images[boundaries[i]:boundaries[i+1]]
+                    for i in range(len(img_lengths))
+                ]
+                # 5. slice labels back in exactly the same way
+                chunked_lbls = [
+                    all_labels[boundaries[i]:boundaries[i+1]]
+                    for i in range(len(img_lengths))
+                ]
+
+                # 6. reassign train/valid splits
+                pristine_train_images, generated_images, valid_images = chunked_imgs
+                pristine_train_labels, generated_labels, valid_labels = chunked_lbls
+
+                # 7. rebuild train_images and train_labels without pulling validation back in
                 train_images = torch.cat([pristine_train_images, generated_images], dim=0)
-            else:
-                train_images, valid_images = chunked
+                train_labels = torch.cat([pristine_train_labels, generated_labels], dim=0)
 
+            else:
+                # same idea if lambda_generate == 0 (i.e. only real train+valid)
+                img_splits = [
+                    train_images.to(DEVICE),
+                    valid_images.to(DEVICE)
+                ]
+                img_lengths = [len(t) for t in img_splits]
+                all_images = torch.cat(img_splits, dim=0)
+
+                lbl_splits = [
+                    train_labels.to(DEVICE),
+                    valid_labels.to(DEVICE)
+                ]
+                all_labels = torch.cat(lbl_splits, dim=0)
+
+                boundaries = [0] + list(torch.cumsum(torch.tensor(img_lengths), dim=0).numpy())
+                chunked_imgs = [
+                    all_images[boundaries[i]:boundaries[i+1]]
+                    for i in range(len(img_lengths))
+                ]
+                chunked_lbls = [
+                    all_labels[boundaries[i]:boundaries[i+1]]
+                    for i in range(len(img_lengths))
+                ]
+
+                train_images, valid_images = chunked_imgs
+                train_labels, valid_labels = chunked_lbls
                         
+        print("Length of train_images before packaging: ", len(train_images))
+        print("Length of train labels before packaging: ", len(train_labels))
         # ── SANITY-CHECK PLOTS ON FIRST FOLD ONLY ──
         if fold == folds[0] and SHOWIMGS and downsample_size != (1024, 1024):
             
@@ -664,19 +696,17 @@ for gen_model_name in gen_model_names:
                     train_images_cls2.cpu(),
                     title1=f"Class {galaxy_classes[0]}",
                     title2=f"Class {galaxy_classes[1]}",
-                    save_path=f"./classifier/{classifier}_{gen_model_name}_{galaxy_classes[0]}_{galaxy_classes[1]}_{num_galaxies}_f{fold}_histogram.png"
+                    save_path=f"./classifier/{classifier}_{gen_model_name}_{galaxy_classes[0]}_{galaxy_classes[1]}_f{fold}_histogram.png"
                 )
+
                 plot_background_histogram(
-                    train_images_cls1.cpu(),
-                    train_images_cls2.cpu(),
+                    train_images_cls1.cpu(),        # shape (936, 1, 128, 128)
+                    train_images_cls2.cpu(),        # shape (720, 1, 128, 128)
+                    img_shape=(1, 128, 128),
                     title="Background histograms",
-                    save_path=(
-                        f"./classifier/"
-                        f"{classifier}_{gen_model_name}_"
-                        f"{galaxy_classes[0]}_{galaxy_classes[1]}_"
-                        f"{num_galaxies}_f{fold}_background_hist.png"
-                    )
+                    save_path=f"./classifier/{classifier}_{gen_model_name}_{galaxy_classes[0]}_{galaxy_classes[1]}_f{fold}_background_hist.png"
                 )
+
             
             for cls in galaxy_classes:
                 orig_imgs = train_images[train_labels == (cls - min(galaxy_classes))][:36]
@@ -685,12 +715,12 @@ for gen_model_name in gen_model_names:
                 plot_image_grid(
                     orig_imgs.cpu(),
                     num_images=36,
-                    save_path=f"./classifier/{classifier}_{gen_model_name}_{cls}_{num_galaxies}_f{fold}_real_grid.png"
+                    save_path=f"./classifier/{classifier}_{gen_model_name}_{cls}_f{fold}_real_grid.png"
                 )
                 plot_image_grid(
                     test_imgs.cpu(),
                     num_images=36,
-                    save_path=f"./classifier/{classifier}_{gen_model_name}_{cls}_{num_galaxies}_f{fold}_test_grid.png"
+                    save_path=f"./classifier/{classifier}_{gen_model_name}_{cls}_f{fold}_test_grid.png"
                 )
 
                 if lambda_generate not in [0, 8]:
@@ -699,20 +729,24 @@ for gen_model_name in gen_model_names:
                     plot_image_grid(
                         gen_imgs,
                         num_images=36,
-                        save_path=f"./classifier/{classifier}_{gen_model_name}_{cls}_{num_galaxies}_f{fold}_generated_grid.png"
+                        save_path=f"./classifier/{classifier}_{gen_model_name}_{cls}_f{fold}_generated_grid.png"
                     )
                     plot_histograms(
                         gen_imgs,
                         orig_imgs.cpu(),
                         title1="Generated Images",
                         title2="Train Images",
-                        save_path=f"./classifier/{classifier}_{gen_model_name}_{cls}_{num_galaxies}_f{fold}_histogram.png"
+                        save_path=f"./classifier/{classifier}_{gen_model_name}_{cls}_f{fold}_histogram.png"
                     )
-    
-                    plot_background_histogram(orig_imgs, gen_imgs, "Background histograms", f"./classifier/{classifier}_{gen_model_name}_{cls}_{num_galaxies}_f{fold}_background_hist.png")
+                    plot_background_histogram(
+                        orig_imgs,
+                        gen_imgs,
+                        img_shape=(1, 128, 128),
+                        title="Background histograms",
+                        save_path=f"./classifier/{classifier}_{gen_model_name}_{cls}_f{fold}_background_hist.png")
         
         if USE_CLASS_WEIGHTS:
-            unique, counts = np.unique(train_labels, return_counts=True)
+            unique, counts = np.unique(train_labels.cpu().numpy(), return_counts=True)
             class_counts = dict(zip(map(int, unique), map(int, counts)))
             total_count = sum(counts)
             class_weights = {int(cls): float(total_count / count) for cls, count in class_counts.items()}
@@ -730,20 +764,20 @@ for gen_model_name in gen_model_names:
             print("Class weights: ", weights)
         else:
             weights = None
-            print("No class weighting")
-            print("Classes used: ", galaxy_classes)
 
         if fold in [0, 5] and SHOWIMGS:
+            imgs = train_images.detach().cpu().numpy()
+            lbls = (train_labels + min(galaxy_classes)).detach().cpu().numpy()
             print("Random train labels: ", train_labels[:10]) 
-            plot_images_by_class(train_images, labels=train_labels+min(galaxy_classes), num_images=5, save_path=f"./classifier/{classifier}_{gen_model_name}_{galaxy_classes}_{num_galaxies}_example_originals.pdf")
+            plot_images_by_class(imgs, labels=lbls, num_images=5, save_path=f"./classifier/{classifier}_{gen_model_name}_{galaxy_classes}_example_originals.pdf")
         
         # Prepare input data
         mock_tensor = torch.zeros_like(train_images)
         valid_mock_tensor = torch.zeros_like(valid_images)
-        if classifier in ['ScatterNet', 'ScatterDual']:
+        if classifier in ['ScatterNet', 'ScatterResNet', 'ScatterDual']:
             # Define cache paths (you can adjust these names as needed)
-            train_cache_path = f"./.cache/train_scat_{galaxy_classes}_{fold}_{lambda_generate}_{dataset_portions[0]}_{FILTERED}_{num_galaxies}.npy"
-            valid_cache_path = f"./.cache/valid_scat_{galaxy_classes}_{fold}_{lambda_generate}_{dataset_portions[0]}_{FILTERED}_{num_galaxies}.npy"
+            train_cache_path = f"./.cache/train_scat_{galaxy_classes}_{fold}_{lambda_generate}_{dataset_portions[0]}_{FILTERED}_{TRAINONGENERATED}.npy"
+            valid_cache_path = f"./.cache/valid_scat_{galaxy_classes}_{fold}_{lambda_generate}_{dataset_portions[0]}_{FILTERED}_{TRAINONGENERATED}.npy"
             
             if USE_MEMMAP:
                 # Use memmap-based caching (from script 1)
@@ -754,10 +788,11 @@ for gen_model_name in gen_model_names:
                 valid_dataset = CachedScatterDataset(valid_images, valid_labels, valid_cache_file, valid_full_shape)
                 scatdim = train_full_shape[1:]  # e.g., (C, H, W)
             else:
-                train_cache = f"./.cache/train_scat_{galaxy_classes}_{fold}_{lambda_generate}_{dataset_portions[0]}_{FILTERED}_{num_galaxies}.pt"
-                valid_cache = f"./.cache/valid_scat_{galaxy_classes}_{fold}_{lambda_generate}_{dataset_portions[0]}_{FILTERED}_{num_galaxies}.pt"
-                train_scat_coeffs = cache_scattering(train_images, scattering, train_cache, batch_size=128, device="cpu")
-                valid_scat_coeffs = cache_scattering(valid_images, scattering, valid_cache, batch_size=128, device="cpu")
+                train_cache = f"./.cache/train_scat_{galaxy_classes}_{fold}_{lambda_generate}_{dataset_portions[0]}_{FILTERED}.pt"
+                valid_cache = f"./.cache/valid_scat_{galaxy_classes}_{fold}_{lambda_generate}_{dataset_portions[0]}_{FILTERED}.pt"
+                train_scat_coeffs = compute_scattering_coeffs(train_images, scattering, batch_size=128, device="cpu")
+                valid_scat_coeffs = compute_scattering_coeffs(valid_images, scattering, batch_size=128, device="cpu")
+                scatdim = train_scat_coeffs[0].shape
                 all_scat = torch.cat([train_scat_coeffs, valid_scat_coeffs], dim=0)
                 if NORMALISESCS or NORMALISESCSTOPM:
                     if NORMALISESCSTOPM:
@@ -766,11 +801,10 @@ for gen_model_name in gen_model_names:
                         all_scat = normalise_images(all_scat, 0, 1)
                 train_scat_coeffs, valid_scat_coeffs = all_scat[:len(train_scat_coeffs)], all_scat[len(train_scat_coeffs):]
                 
-                scatdim = train_scat_coeffs[0].shape
-                if classifier == "ScatterNet":
+                if classifier in ['ScatterNet', 'ScatterResNet']:
                     train_dataset = TensorDataset(mock_tensor, train_scat_coeffs, train_labels)
                     valid_dataset = TensorDataset(valid_mock_tensor, valid_scat_coeffs, valid_labels)
-                else: # classifier == "ScatterDual"
+                else:  # ScatterDual
                     train_dataset = TensorDataset(train_images, train_scat_coeffs, train_labels)
                     valid_dataset = TensorDataset(valid_images, valid_scat_coeffs, valid_labels)
         else:
@@ -778,15 +812,18 @@ for gen_model_name in gen_model_names:
             valid_dataset = TensorDataset(valid_images, valid_mock_tensor, valid_labels)
 
 
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=custom_collate, drop_last=True)
-        valid_loader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=custom_collate, drop_last=True)
+        print("Length of validation images: ", len(valid_images))
+        print("Length of train images: ", len(train_images))
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=custom_collate, drop_last=False)
+        valid_loader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=custom_collate, drop_last=False)
+        print(f"Train loader size: {len(train_loader)}, Validation loader size: {len(valid_loader)}")
         
         print(f"Train dataset size: {len(train_dataset)}, Validation dataset size: {len(valid_dataset)}")
 
         if SHOWIMGS and lambda_generate not in [0, 8]: 
             if classifier in ['ProjectModel', 'Rustige', 'ScatterDual', 'Binary']:
-                #save_images_tensorboard(generated_images[:36], save_path=f"./classifier/{gen_model_name}_{galaxy_classes}_{num_galaxies}_generated.png", nrow=6)
-                plot_histograms(pristine_train_images, valid_images, title1="Train images", title2="Valid images", imgs3=generated_images, imgs4=test_images, title3='Generated images', title4='Test images', save_path=f"./classifier/{classifier}_{gen_model_name}_{galaxy_classes}_{num_galaxies}_histograms.png")
+                #save_images_tensorboard(generated_images[:36], save_path=f"./classifier/{gen_model_name}_{galaxy_classes}_generated.png", nrow=6)
+                plot_histograms(pristine_train_images, valid_images, title1="Train images", title2="Valid images", imgs3=generated_images, imgs4=test_images, title3='Generated images', title4='Test images', save_path=f"./classifier/{classifier}_{gen_model_name}_{galaxy_classes}_histograms.png")
 
         
                 
@@ -802,8 +839,10 @@ for gen_model_name in gen_model_names:
             models = {"DANN": {"model": DANNClassifier(input_shape=tuple(valid_images.shape[1:]), num_classes=num_classes).to(DEVICE)}}
         elif classifier == "ScatterNet":
             models = {"ScatterNet": {"model": MLPClassifier(input_dim=int(np.prod(scatdim)), num_classes=num_classes).to(DEVICE)}}
+        elif classifier == "ScatterResNet":
+            models = {"ScatterResNet": {"model": ScatterResNet(scat_shape=scatdim, num_classes=num_classes).to(DEVICE)}}
         elif classifier == "ScatterDual":
-            models = {"ScatterDual": {"model": DualClassifier(img_shape=tuple(valid_images.shape[1:]), scat_shape=scatdim, num_classes=num_classes).to(DEVICE)}}
+            models = {"ScatterDual": {"model": ScatterSqueezeNet(img_shape=tuple(valid_images.shape[1:]), scat_shape=scatdim, num_classes=num_classes).to(DEVICE)}}
         elif classifier == 'Binary':
             models = {"BinaryClassifier": {"model": BinaryClassifier(input_shape=tuple(valid_images.shape[1:])).to(DEVICE)}}
         else:
@@ -814,6 +853,8 @@ for gen_model_name in gen_model_names:
                 print(f"Summary for {classifier_name}:")
                 if classifier == "ScatterNet":
                     summary(model_details["model"], input_size=(int(np.prod(scatdim)),), device=DEVICE)
+                elif classifier == "ScatterResNet":
+                    summary(model_details["model"], input_size=scatdim, device=DEVICE)
                 elif classifier == "ScatterDual":
                     summary(model_details["model"], input_size=[valid_images.shape[1:], scatdim])
                 else:
@@ -828,13 +869,9 @@ for gen_model_name in gen_model_names:
         
         if weights is not None:
             print(f"Using class weights: {weights}")
-            if len(galaxy_classes) == 2:
-                # pull out a Python float, not a 0-dim tensor
-                pos_w = float(weights[1].cpu().item())
-                criterion = nn.BCEWithLogitsLoss(pos_weight=pos_w)
-            else:
-                criterion = nn.CrossEntropyLoss(weight=weights)
+            criterion = nn.CrossEntropyLoss(weight=weights, label_smoothing=label_smoothing)
         else:
+            print("No class weighting")
             if len(galaxy_classes) == 2:
                 criterion = nn.BCEWithLogitsLoss()
             else:
@@ -842,6 +879,9 @@ for gen_model_name in gen_model_names:
             
 
         optimizer = AdamW(models[classifier_name]["model"].parameters(), lr=lr, weight_decay=reg)
+        if SCHEDULER:
+            scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=10*lr, 
+                                    steps_per_epoch=len(train_loader), epochs=num_epochs)
 
         for classifier_name, model_details in models.items():
             print(f"Training {classifier_name} model...")
@@ -876,8 +916,7 @@ for gen_model_name in gen_model_names:
                         total_images = 0
 
                         for images, scat, labels in subset_train_loader:
-                            images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE)      
-                            labels = labels.float().unsqueeze(1)    # now shape [B,1] of 0.0/1.0
+                            images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE) # Send to device
                             optimizer.zero_grad()
                             if classifier == "DANN":
                                 # 1) forward pass: two heads
@@ -898,11 +937,13 @@ for gen_model_name in gen_model_names:
 
                                 loss.backward()
                                 optimizer.step()
+                                if SCHEDULER:
+                                    scheduler.step()
 
                                 total_loss += float(loss.item() * images.size(0))
                                 total_images += float(images.size(0))
                             else:
-                                if classifier == "ScatterNet":
+                                if classifier in ["ScatterNet", "ScatterResNet"]:
                                     outputs = model(scat)
                                 elif classifier == "ScatterDual":
                                     outputs = model(images, scat)
@@ -928,12 +969,11 @@ for gen_model_name in gen_model_names:
                                     print(f"Empty batch at index {i}. Skipping...")
                                     continue
                                 images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE)
-                                labels = labels.float().unsqueeze(1)   # now [B,1] of 0.0/1.0
                                 if classifier == "DANN":
                                     class_logits, _ = model(images, alpha=1.0)
                                     loss = criterion(class_logits, labels)
                                 else: 
-                                    if classifier == "ScatterNet":
+                                    if classifier in ["ScatterNet", "ScatterResNet"]:
                                         outputs = model(scat)
                                     elif classifier == "ScatterDual":
                                         outputs = model(images, scat)
@@ -965,13 +1005,13 @@ for gen_model_name in gen_model_names:
                                 class_logits, _ = model(images, alpha=1.0)
                                 pred_probs = torch.softmax(class_logits, dim=1).cpu().numpy()
                             else:
-                                if classifier == "ScatterNet":
-                                    outputs = model(scat)
+                                if classifier in ["ScatterNet", "ScatterResNet"]:
+                                    pred_probs = model(scat).cpu().detach().numpy()
+
                                 elif classifier == "ScatterDual":
-                                    outputs = model(images, scat)
+                                    pred_probs = model(images, scat).cpu().detach().numpy()
                                 else:
-                                    outputs = model(images)
-                                pred_probs = torch.softmax(outputs, dim=1).cpu().numpy()
+                                    pred_probs = model(images).cpu().detach().numpy()
                             true_labels = labels.cpu().numpy()
                             #true_labels = torch.argmax(labels, dim=1).cpu().numpy()
                             pred_labels = np.argmax(pred_probs, axis=1)
@@ -1000,12 +1040,13 @@ for gen_model_name in gen_model_names:
                     if classifier == "DANN":
                         class_logits, _ = model(images, alpha=1.0)
                         outputs = class_logits.cpu().detach().numpy()
-                    elif classifier == "ScatterNet":
+                    elif classifier in ["ScatterNet", "ScatterResNet"]:
                         outputs = model(scat).cpu().detach().numpy()
                     elif classifier == "ScatterDual":
                         outputs = model(images, scat).cpu().detach().numpy()
                     else:
                         outputs = model(images).cpu().detach().numpy()
+
                     generated_features.append(outputs)
 
             generated_features = np.concatenate(generated_features, axis=0)
@@ -1036,4 +1077,4 @@ for gen_model_name in gen_model_names:
                         "training_times": training_times,
                         "all_pred_probs": all_pred_probs
                     }, f)
-                print(f"Metrics and related data saved to {metrics_save_path}")
+                print(f"Metrics and related data saved to {metrics_save_path}")        

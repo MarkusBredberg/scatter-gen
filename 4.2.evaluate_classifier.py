@@ -30,17 +30,17 @@ np.random.seed(seed)
 ###############################################
 
 FILTERED = True       # Evaluation with filtered data (REMOVEOUTLIERS = True)
-TESTONGENERATED = False # Use generated data as testdata
+TRAINONGENERATED = True # Use generated data as testdata
 
 classes = get_classes()
-galaxy_classes = [40, 41]
+galaxy_classes = [10, 11, 12, 13]
 learning_rates = [1e-3]
-regularization_params = [0]
-lambda_values = [0, 0.25, 0.5, 1, 2]
-num_experiments = 10
+regularization_params = [1e-3]
+lambda_values = [0, 0.25, 0.5, 1]
+num_experiments = 5
 folds = [5] # Number of folds for cross-validation
-generators = ['DDPM']
-classifier = ["ProjectModel", "Rustige", "DANN", "ScatterNet", "ScatterDual", "Binary"][-1]  # Choose one classifier model model
+generators = ['wGAN']
+classifier = ["ProjectModel", "Rustige", "DANN", "ScatterNet", "ScatterDual", "Binary", "ScatterResNet"][1]
 print("Classifier:", classifier)
 
 # -------------------------- NEW GAN CONFIGURATION --------------------------
@@ -74,37 +74,40 @@ colors = {
 ######### SETTING THE RIGHT PARAMETERS ########
 ###############################################
 
+directory = './classifier/trained_models_filtered/' if FILTERED else './classifier/trained_models/'
+
 if galaxy_classes == [31, 32, 33, 34, 35, 36]:
     dataset_sizes = [[1088, 10883, 54416, 108832]]
     num_experiments = 1
     FILTERED = False
-    TESTONGENERATED = False
 elif galaxy_classes == [40, 41]:
     dataset_sizes = [[140, 704, 1408], [140, 704, 1408], [140, 704, 1408], [140, 704, 1408], [140, 704, 1408], [140, 704, 1408]] # For 1024, 512
-    #dataset_sizes = [[141, 708, 1416], [141, 708, 1416], [141, 708, 1416], [141, 708, 1416], [141, 708, 1416], [141, 708, 1416]] # For 128, 1600
-    #dataset_sizes = [[124, 624, 1248], [124, 624, 1248], [124, 624, 1248], [124, 624, 1248], [124, 624, 1248], [124, 624, 1248]] # For 128, 512
 elif galaxy_classes == [50, 51]:
-    dataset_sizes = [[121, 608, 1216], [121, 608, 1216], [121, 608, 1216], [121, 608, 1216], [121, 608, 1216], [121, 608, 1216]]
+    if TRAINONGENERATED:
+        dataset_sizes = [[1600, 8000, 16000], [1600, 8000, 16000], [1600, 8000, 16000], [1600, 8000, 16000], [1600, 8000, 16000],  [1600, 8000, 16000]]
+    else:
+        dataset_sizes = [[121, 608, 1216], [121, 608, 1216], [121, 608, 1216], [121, 608, 1216], [121, 608, 1216], [121, 608, 1216]]
 elif galaxy_classes == [11, 12]:
     dataset_sizes = [[885, 4428, 8856], [885, 4428, 8856], [885, 4428, 8856], [885, 4428, 8856], [885, 4428, 8856], [885, 4428, 8856]]
 elif galaxy_classes == [10, 11, 12, 13]:
     if FILTERED:
         if max(folds) == 5:
-            #dataset_sizes = [[200], [200], [200], [200], [200], [200]] # Used for faster trouble shooting
-            #dataset_sizes = [[13936], [13936], [13936], [13936], [13936], [13936]] 
-            dataset_sizes = [[139, 1393, 13936], [139, 1393, 13936], [139, 1393, 13936], [139, 1393, 13936], [139, 1393, 13936], [139, 1393, 13936]] 
-        else:
-            dataset_sizes = [[123, 1236, 12368], [123, 1233, 12336], [123, 1236, 12368], [123, 1236, 12368], [123, 1236, 12368]] 
+            if TRAINONGENERATED:
+                dataset_sizes = [[1391, 6956, 13912], [1391, 6956, 13912], [1391, 6956, 13912], [1391, 6956, 13912], [1391, 6956, 13912], [1391, 6956, 13912]]
+            else:
+                dataset_sizes = [[1393, 6968, 13936], [1393, 6968, 13936], [1393, 6968, 13936], [1393, 6968, 13936], [1393, 6968, 13936], [1393, 6968, 13936]]
+            #dataset_sizes = [[123, 1236, 12368], [123, 1233, 12336], [123, 1236, 12368], [123, 1236, 12368], [123, 1236, 12368]] 
             #dataset_sizes = [[200], [200], [200], [200], [200], [200]]
-    elif max(folds) == 5:
-        #dataset_sizes = [[140, 1406, 14064], [140, 1406, 14064], [140, 1406, 14064], [140, 1406, 14064], [140, 1406, 14064], [140, 1406, 14064]] # Used for faster trouble shooting
-        #dataset_sizes = [[139, 1393, 13936], [139, 1393, 13936], [139, 1393, 13936], [139, 1393, 13936], [139, 1393, 13936], [139, 1393, 13936]]
-        dataset_sizes = [[1389, 6948, 13896], [1389, 6948, 13896], [1389, 6948, 13896], [1389, 6948, 13896], [1389, 6948, 13896], [1389, 6948, 13896]]
-        #dataset_sizes = [[281, 2812, 14064, 28128], [281, 2812, 14064, 28128], [281, 2812, 14064, 28128], 
-        #                    [281, 2812, 14064, 28128], [281, 2812, 14064, 28128], [281, 2812, 14064, 28128]] #Need length = folds[0] = 1
+        else:
+            print("Using default dataset sizes for 5 folds.")
+            dataset_sizes = [[1236, 6184, 12368], [1233, 6168, 12336], [1236, 6184, 12368], [1236, 6184, 12368], [1236, 6184, 12368], [1236, 6184, 12368]]
+            #dataset_sizes = [[140, 1406, 14064], [140, 1406, 14064], [140, 1406, 14064], [140, 1406, 14064], [140, 1406, 14064], [140, 1406, 14064]] # Used for faster trouble shooting
+            #dataset_sizes = [[139, 1393, 13936], [139, 1393, 13936], [139, 1393, 13936], [139, 1393, 13936], [139, 1393, 13936], [139, 1393, 13936]]
+            #dataset_sizes = [[1389, 6948, 13896], [1389, 6948, 13896], [1389, 6948, 13896], [1389, 6948, 13896], [1389, 6948, 13896], [1389, 6948, 13896]]
+            #dataset_sizes = [[281, 2812, 14064, 28128], [281, 2812, 14064, 28128], [281, 2812, 14064, 28128], 
     else:
         #dataset_sizes = [[249, 2492, 12464, 24928], [249, 2492, 12464, 24928], [249, 2492, 12464, 24928], [249, 2492, 12464, 24928], 250, 2505, 12528, 25056]]    
-        dataset_sizes = [[12464], [12464], [12464], [12464], [12528]]
+        dataset_sizes = [[1236, 6184, 12368], [1236, 6184, 12368], [1236, 6184, 12368], [1236, 6184, 12368], [1236, 6184, 12368], [1236, 6184, 12368]]
 elif galaxy_classes == [10, 11]:
    dataset_sizes = [[9656], [9656], [9656], [9656], [9656], [9656]]
 else:
@@ -113,8 +116,9 @@ else:
 if 'GAN' in generators:
     latent_dim = 128 
 
-if TESTONGENERATED:
+if TRAINONGENERATED:
     lambda_values = [8]  # To identify and distinguish TESTONGENERATED from other runs
+    
 
 ############################################################
 ################# MERGE MAP GENERATION #####################
@@ -162,7 +166,6 @@ def update_metrics(metrics, generator, subset_size, fold, experiment, lr, reg,
 
 tot_metrics = {}
 valid_lambda_values = []
-directory = './classifier/trained_models_filtered/' if FILTERED else './classifier/trained_models/'
 
 print("Loading metrics from pickle files...")
 for lambda_generate in lambda_values:
@@ -202,7 +205,7 @@ for lambda_generate in lambda_values:
                 )
                 lambda_loaded = True
             except FileNotFoundError:
-                # just skip this one, don’t bail out on the whole λ
+                print(f"Metrics file not found at {metrics_read_path}. Ignoring this λ. Try to check dataset sizes for each fold.")
                 continue
 
     if lambda_loaded:
@@ -213,55 +216,11 @@ print("Done loading. Valid λ:", valid_lambda_values)
 metrics = tot_metrics
 lambda_values = valid_lambda_values
 
-
-if False:
-    print("Loading metrics from pickle files...")
-    for lambda_generate in lambda_values:
-        try:
-            for lr, reg, experiment, generator, fold in itertools.product(
-                learning_rates, regularization_params, range(num_experiments), generators, folds):
-                for subset_size in dataset_sizes[fold]:
-                    metrics_read_path = f'{directory}{classifier}_{galaxy_classes}_{generator}_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}_metrics_data.pkl'
-                    #metrics_read_path = f'{directory}{galaxy_classes}_{generator}_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}_metrics_data.pkl'
-                    with open(metrics_read_path, 'rb') as f:
-                        metrics_data = pickle.load(f)
-                        clf_models = metrics_data["models"] # Classifier models
-                        history = metrics_data["history"]
-                        loaded_metrics = metrics_data["metrics"]
-                        metric_colors = metrics_data["metric_colors"]
-                        all_true_labels = metrics_data["all_true_labels"]
-                        all_pred_labels = metrics_data["all_pred_labels"]
-                        training_times = metrics_data["training_times"]
-                        all_pred_probs = metrics_data["all_pred_probs"]
-                    initialize_metrics(tot_metrics, generator, subset_size, fold, experiment, lr, reg, lambda_generate)
-                    update_metrics(
-                        tot_metrics, generator, subset_size, fold, experiment, lr, reg,
-                        loaded_metrics[f"{generator}_accuracy_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}"][0],
-                        loaded_metrics[f"{generator}_precision_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}"][0],
-                        loaded_metrics[f"{generator}_recall_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}"][0],
-                        loaded_metrics[f"{generator}_f1_score_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}"][0],
-                        lambda_generate,
-                        history,
-                        all_true_labels,
-                        all_pred_labels,
-                        training_times,
-                        all_pred_probs
-                    )
-            valid_lambda_values.append(lambda_generate)
-        except FileNotFoundError:
-            print(f"Metrics file not found at {metrics_read_path}. Ignoring this lambda.")
-
-
 ###############################################
 ########### PLOTTING FUNCTIONS ################
 ###############################################
 
-
-def visualize_feature_tsne(model, real_loader, gen_loader, wrappername, perplexity=30, n_iter=2000, device='cpu', save_path="./classifier/tsne_by_class.png"):
-    model = model.to(device).eval()
-    model_name = model.__class__.__name__
-    print(f"Model name: {model_name}")
-    def extract_feats(loader):
+def extract_feats(loader):
         feats = []
         # pick the penultimate feature‐vector layer automatically
         if hasattr(model, 'feature_extractor'):
@@ -271,8 +230,9 @@ def visualize_feature_tsne(model, real_loader, gen_loader, wrappername, perplexi
         elif hasattr(model, 'fc2'):
             penult = model.fc2
         elif hasattr(model, 'classifier'):
-            # ProjectModel puts its hidden Linear at classifier[1]
             penult = model.classifier[1]
+        elif hasattr(model, 'fc'):
+            penult = model.fc
         else:
             raise RuntimeError(f"Can't find a penultimate layer to hook in {model.__class__.__name__}")
         handle = penult.register_forward_hook(lambda m, inp, out: feats.append(out.detach().cpu()))
@@ -282,13 +242,22 @@ def visualize_feature_tsne(model, real_loader, gen_loader, wrappername, perplexi
         handle.remove()
         return torch.cat(feats,0).numpy()
 
-    real_feats = extract_feats(real_loader)
-    real_labels = real_loader.dataset.tensors[2].numpy()   # assuming your DataLoader stores labels
+def visualize_feature_tsne(model, real_loader, gen_loader, wrappername, perplexity=30, n_iter=2000, device='cpu', save_path="./classifier/tsne_by_class.png"):
+    model = model.to(device).eval()
+    model_name = model.__class__.__name__
+    print(f"Model name: {model_name}")
 
-    gen_feats  = extract_feats(gen_loader)
-    gen_labels = gen_loader.dataset.tensors[2].numpy()     # same here
+    try:
+        real_feats = extract_feats(real_loader)
+        real_labels = real_loader.dataset.tensors[2].numpy()   # assuming your DataLoader stores labels
+
+        gen_feats  = extract_feats(gen_loader)
+        gen_labels = gen_loader.dataset.tensors[2].numpy()     # same here
+    except Exception as e:
+        # Continue the code but skip this visualization if there's an error
+        print(f"Error extracting features: {e}")
+        return
     
-
     # stack & fit TSNE
     y   = np.concatenate([real_labels, gen_labels])
     X     = np.vstack([real_feats, gen_feats])
@@ -326,36 +295,19 @@ def visualize_feature_tsne(model, real_loader, gen_loader, wrappername, perplexi
 
     print(f"Saved t-SNE plots to {save_path} and density to {save_path.replace('.png','_density.png')}")
 
-
-
 def visualize_tsne_by_class(model, real_loader, gen_loader, wrappername, device='cpu', save_path="./classifier/tsne_by_class.png"):
     model = model.to(device).eval()
-    def extract_feats(loader):
-        feats = []
-        # pick the penultimate feature‐vector layer automatically
-        if hasattr(model, 'feature_extractor'):
-            penult = model.feature_extractor
-        elif hasattr(model, 'fc1'):
-            penult = model.fc1
-        elif hasattr(model, 'fc2'):
-            penult = model.fc2
-        elif hasattr(model, 'classifier'):
-            # ProjectModel puts its hidden Linear at classifier[1]
-            penult = model.classifier[1]
-        else:
-            raise RuntimeError(f"Can't find a penultimate layer to hook in {model.__class__.__name__}")
-        handle = penult.register_forward_hook(lambda m, inp, out: feats.append(out.detach().cpu()))
+    
+    try:
+        real_feats = extract_feats(real_loader)
+        real_labels = real_loader.dataset.tensors[2].numpy()   # assuming your DataLoader stores labels
 
-        for x, _, y in loader:
-            _ = model(x.to(device))
-        handle.remove()
-        return torch.cat(feats,0).numpy()
-
-    real_feats = extract_feats(real_loader)
-    real_labels = real_loader.dataset.tensors[2].numpy()   # assuming your DataLoader stores labels
-
-    gen_feats  = extract_feats(gen_loader)
-    gen_labels = gen_loader.dataset.tensors[2].numpy()     # same here
+        gen_feats  = extract_feats(gen_loader)
+        gen_labels = gen_loader.dataset.tensors[2].numpy()     # same here
+    except Exception as e:
+        # Continue the code but skip this visualization if there's an error
+        print(f"Error extracting features: {e}")
+        return
 
     # combine
     X   = np.vstack([real_feats, gen_feats])
@@ -422,7 +374,6 @@ def plot_overlap_image_grids(model, real_loader, gen_loader,
     """
     model = model.to(device).eval()
 
-    # reuse your extract_feats hook to grab features
     def extract_feats_and_imgs(loader):
         feats, imgs = [], []
         # hook on penult
@@ -432,8 +383,11 @@ def plot_overlap_image_grids(model, real_loader, gen_loader,
             penult = model.fc1
         elif hasattr(model, 'classifier'):
             penult = model.classifier[1]
+        elif hasattr(model, 'fc'):
+            penult = model.fc
         else:
             raise RuntimeError("No penultimate layer found")
+
         handle = penult.register_forward_hook(lambda m, inp, out: feats.append(out.detach().cpu()))
         for x, _, _ in loader:
             imgs.append(x.cpu())
@@ -443,8 +397,13 @@ def plot_overlap_image_grids(model, real_loader, gen_loader,
         F = torch.cat(feats, dim=0).numpy()     # (N,D)
         return F, X
 
-    real_feats, real_imgs = extract_feats_and_imgs(real_loader)
-    gen_feats, gen_imgs = extract_feats_and_imgs(gen_loader)
+    try: 
+        real_feats, real_imgs = extract_feats_and_imgs(real_loader)
+        gen_feats, gen_imgs = extract_feats_and_imgs(gen_loader)
+    except Exception as e:
+        # Continue the code but skip this visualization if there's an error
+        print(f"Error extracting features or images: {e}")
+        return
 
     # build NN on real feats
     nn = NearestNeighbors(n_neighbors=1).fit(real_feats)
@@ -587,8 +546,8 @@ def plot_all_metrics_vs_dataset_size(
                                  alpha=0.2)
 
             # now that all λ-lines are drawn, add legend
-            plt.legend(title='Lambda Values', fontsize=12, loc='best')
-            plt.title(f'{title} vs Dataset Size ({generator})', fontsize=16)
+            plt.legend(title='Lambda Values', fontsize=14, loc='best')
+            plt.title(f'{title} vs Dataset Size ({generator})', fontsize=18)
             plt.xlabel('Training Dataset Size', fontsize=14)
             plt.ylabel(title, fontsize=14)
             plt.grid(True, linestyle='--', alpha=0.5)
@@ -660,8 +619,8 @@ def plot_avg_roc_curves(metrics, generators, dataset_sizes=dataset_sizes, merge_
                             ax.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
                             ax.set_xlim([0.0, 1.0])
                             ax.set_ylim([0.0, 1.05])
-                            ax.set_xlabel('False Positive Rate', fontsize=16)
-                            ax.set_ylabel('True Positive Rate', fontsize=16)
+                            ax.set_xlabel('False Positive Rate', fontsize=18)
+                            ax.set_ylabel('True Positive Rate', fontsize=18)
                             merged_subset_key = merge_map.get(subset_size, str(subset_size))
                             ax.set_title(f'Average ROC Curve - {generator} \n {merged_subset_key}, Experiment {experiment}', fontsize=14)
                             ax.legend(loc="lower right")
@@ -711,9 +670,9 @@ def plot_roc_curves(metrics, generators, dataset_sizes=dataset_sizes,  folds= fo
                                 ax.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
                                 ax.set_xlim([0.0, 1.0])
                                 ax.set_ylim([0.0, 1.05])
-                                ax.set_xlabel('False Positive Rate', fontsize=16)
-                                ax.set_ylabel('True Positive Rate', fontsize=16)
-                                ax.set_title(f'ROC Curve - {generator} \n {subset_size}, Fold {fold}, Experiment {experiment}', fontsize=14)
+                                ax.set_xlabel('False Positive Rate', fontsize=18)
+                                ax.set_ylabel('True Positive Rate', fontsize=18)
+                                ax.set_title(f'ROC Curve - {generator} \n {subset_size}, Fold {fold}, Experiment {experiment}', fontsize=16)
                                 ax.legend(loc="lower right")
                                 os.makedirs(save_dir, exist_ok=True)
                                 plt.savefig(f'{save_dir}/{galaxy_classes}_{classifier}_{generator}_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}_roc_curve.png')
@@ -778,9 +737,9 @@ def plot_diff_avg_std_confusion_matrix(metrics, generators, metric_stats,
             fig, ax = plt.subplots(figsize=(8, 6))
             sns.heatmap(diff_avg, annot=ann, fmt="", cmap=custom_cmap, center=0,
                         xticklabels=present_descriptions, yticklabels=present_descriptions, ax=ax)
-            ax.set_xlabel("Predicted Label", fontsize=12)
-            ax.set_ylabel("True Label", fontsize=12)
-            ax.set_title(f"Difference in Average Accuracy: {mean_diff:.2f} ± {std_diff:.2f}", fontsize=14)
+            ax.set_xlabel("Predicted Label", fontsize=14)
+            ax.set_ylabel("True Label", fontsize=14)
+            ax.set_title(f"Difference in Average Accuracy: {mean_diff:.2f} ± {std_diff:.2f}", fontsize=16)
             os.makedirs(save_dir, exist_ok=True)
             save_path = f"{save_dir}/{galaxy_classes}_{classifier}_{generator}_{merged_size}_{lr}_{reg}_{lambda_vals[1]}-{lambda_vals[0]}_diff_confusion_matrix.png"
             plt.savefig(save_path)
@@ -828,12 +787,27 @@ def plot_avg_std_confusion_matrix(metrics, generators, metric_stats, merge_map={
                 values = metric_stats[lambda_generate]['accuracy']
                 mean_value = np.mean(values)
                 std_dev = np.std(values)
-                fig, ax = plt.subplots(figsize=(8, 6))
-                sns.heatmap(avg_cm, annot=ann, fmt="", cmap="Blues",
-                            xticklabels=present_descriptions, yticklabels=present_descriptions, ax=ax)
-                ax.set_xlabel("Predicted Label", fontsize=12)
-                ax.set_ylabel("True Label", fontsize=12)
-                ax.set_title(f"Average Accuracy: {mean_value:.2f} ± {std_dev:.2f}", fontsize=14)
+                fig, ax = plt.subplots(figsize=(10, 8))
+                sns.heatmap(
+                    avg_cm,
+                    annot=ann,
+                    fmt="",
+                    cmap="Blues",
+                    xticklabels=present_descriptions,
+                    yticklabels=present_descriptions,
+                    annot_kws={"fontsize": 18},
+                    ax=ax
+                )
+                # increase tick‐label font size
+                ax.set_xticklabels(ax.get_xticklabels(), fontsize=18, rotation=0, ha="right")
+                ax.set_yticklabels(ax.get_yticklabels(), fontsize=18, rotation=90)
+                ax.set_xlabel("Predicted Label", fontsize=20)
+                ax.set_ylabel("True Label", fontsize=20)
+                ax.set_title(f"Average Accuracy: {mean_value:.2f} ± {std_dev:.2f}", fontsize=24)
+                
+                cbar = ax.collections[0].colorbar
+                cbar.ax.tick_params(labelsize=18)
+
                 os.makedirs(save_dir, exist_ok=True)
                 save_path = f"{save_dir}/{galaxy_classes}_{classifier}_{generator}_{subset_size}_{lr}_{reg}_{lambda_generate}_avg_confusion_matrix.png"
                 plt.savefig(save_path)
@@ -864,9 +838,9 @@ def plot_confusion_matrix(metrics, generators, dataset_sizes=dataset_sizes,  fol
                 colorbar = ax.collections[0].colorbar
                 colorbar.ax.tick_params(labelsize=16)
                 accuracy = accuracy_score(true_labels, pred_labels)
-                ax.set_title(f'Model: {generator} \n Total accuracy: {accuracy*100:.2f}%', fontsize=14)
-                ax.set_ylabel('True label', fontsize=16)
-                ax.set_xlabel('Predicted label', fontsize=16)
+                ax.set_title(f'Model: {generator} \n Total accuracy: {accuracy*100:.2f}%', fontsize=16)
+                ax.set_ylabel('True label', fontsize=18)
+                ax.set_xlabel('Predicted label', fontsize=18)
                 save_path = f'{save_dir}/{galaxy_classes}_{classifier}_{generator}_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}_confusion_matrix.png'
                 plt.savefig(save_path)
                 plt.close()
@@ -990,9 +964,9 @@ def plot_loss(
                     color=color, alpha=0.2
                 )
 
-        ax.set_title(f"Training and Validation Loss for Generator={generator}", fontsize=16)
-        ax.set_xlabel("Epochs", fontsize=14)
-        ax.set_ylabel("Loss", fontsize=14)
+        ax.set_title(f"Training and Validation Loss for Generator={generator}", fontsize=18)
+        ax.set_xlabel("Epochs", fontsize=16)
+        ax.set_ylabel("Loss", fontsize=16)
         ax.grid(True)
 
         # Build the color legend for each λ that was actually plotted
@@ -1013,11 +987,11 @@ def plot_loss(
         combined_labels  = color_labels  + ["Train", "Validation"]
 
         # Create a single legend with 2 columns
-        ax.legend(combined_handles, combined_labels, fontsize=14, loc="upper right",
+        ax.legend(combined_handles, combined_labels, fontsize=16, loc="upper right",
                   ncol=2, columnspacing=1.2, handletextpad=0.7)
 
         plt.tight_layout()
-        plt.savefig(f"./classifier/{galaxy_classes}_{classifier}_{generator}_{dataset_sizes[-1][-1]}_loss.png")
+        plt.savefig(f"./classifier/{galaxy_classes}_{classifier}_{generator}_{dataset_sizes[-1][-1]}_{lr}_{reg}_loss.png")
         plt.close(fig)
 
 def old_plot_loss(
@@ -1126,9 +1100,9 @@ def old_plot_loss(
                     color=color, alpha=0.2
                 )
 
-        ax.set_title(f"Training and Validation Loss for Generator={generator}", fontsize=16)
-        ax.set_xlabel("Epochs", fontsize=14)
-        ax.set_ylabel("Loss", fontsize=14)
+        ax.set_title(f"Training and Validation Loss for Generator={generator}", fontsize=18)
+        ax.set_xlabel("Epochs", fontsize=16)
+        ax.set_ylabel("Loss", fontsize=16)
 
         # Deduplicate legend labels
         handles, labels = ax.get_legend_handles_labels()
@@ -1147,39 +1121,40 @@ def old_plot_loss(
 
 class_descriptions = [cls['description'] for cls in classes if cls['tag'] in galaxy_classes]
 
-metric_rankings = {metric: [] for metric in ["accuracy", "precision", "recall", "f1_score"]}
-metric_stats = defaultdict(lambda: defaultdict(list))
-for lambda_generate in lambda_values:
-    try:
-        for fold in folds:
-            for experiment in range(num_experiments):
-                for lr in learning_rates:
-                    for reg in regularization_params:
-                        for metric in metric_rankings.keys():
-                            key = f"{generator}_{metric}_{dataset_sizes[folds[-1]][-1]}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}"
-                            try:
-                                value = metrics[key]
-                                metric_rankings[metric].append((value, fold, dataset_sizes[folds[-1]][-1], experiment, lr, reg, lambda_generate))
-                                metric_stats[lambda_generate][metric].append(value)
-                            except KeyError:
-                                continue
-    except KeyError:
-        print(f"No metrics found for lambda_generate {lambda_generate}")
+# ——— Compute averages over the last subset of each fold ———
+from collections import defaultdict
+import numpy as np
 
-for metric in metric_rankings:
-    print(f"\n{metric.capitalize()} Rankings (sorted by highest value):")
-    sorted_rankings = sorted(metric_rankings[metric], key=lambda x: x[0], reverse=True)
-    for rank, (value, fold, subset_size, experiment, lr, reg, lambda_generate) in enumerate(sorted_rankings, start=1):
-        print(f"{rank}: {metric.capitalize()}: {value[0]:.4f}, Fold: {fold}, Subset Size: {subset_size}, Experiment: {experiment}, LR: {lr}, Reg: {reg}, Lambda: {lambda_generate}")
 
-print("\nMetric Summary Statistics by Lambda:")
-for lambda_generate in lambda_values:
-    print(f"\nLambda: {lambda_generate}")
-    for metric in metric_stats[lambda_generate]:
-        values = metric_stats[lambda_generate][metric]
-        mean_value = np.mean(values)
-        std_dev = np.std(values)
-        print(f"{metric.capitalize()}: Mean = {mean_value:.4f}, Std Dev = {std_dev:.4f}")
+
+metrics_last = defaultdict(lambda: defaultdict(list))
+for λ in lambda_values:
+    for fold in folds:
+        subset = max(dataset_sizes[fold])      # the “last” (largest) subset of this fold
+        for exp, lr, reg in itertools.product(range(num_experiments), learning_rates, regularization_params):
+            for metric in ["accuracy","precision","recall","f1_score"]:
+                key = f"{generator}_{metric}_{subset}_{fold}_{exp}_{lr}_{reg}_{λ}"
+                val = metrics.get(key)
+                if val is not None:
+                    metrics_last[λ][metric].append(val[0])
+
+# ——— Rankings for each λ and metric ———
+for λ, stats in metrics_last.items():
+    print(f"\nRankings for λ = {λ}:")
+    for metric, vals in stats.items():
+        print(f"\n{metric.capitalize()} Rankings (sorted by highest value):")
+        # Sort the raw values, then enumerate
+        sorted_vals = sorted(vals, reverse=True)
+        for rank, v in enumerate(sorted_vals, start=1):
+            print(f"{rank}: {metric.capitalize()}: {v:.4f}")
+
+# ——— Five-point averages for each λ ———
+for λ, stats in metrics_last.items():
+    print(f"\nLambda = {λ}")
+    for metric, vals in stats.items():
+        mean = np.mean(vals)
+        std  = np.std(vals)
+        print(f"{metric.capitalize()}: Mean = {mean:.4f}, Std = {std:.4f}")
 
 print("\nTraining Times:")
 # Aggregate training times per merged category
@@ -1215,7 +1190,7 @@ if any(lam > 0 for lam in lambda_values):
         # --- build real‐data loader (test set) ---
         _, _, test_images, test_labels = load_galaxies(
             galaxy_class=galaxy_classes, fold=5,
-            img_shape=(1,128,128), sample_size=None,
+            crop_size=(128,128), downsample_size=(128,128), sample_size=None,
             REMOVEOUTLIERS=FILTERED, train=False
         )
         # ensure we have a channel dimension: (N, 1, H, W)
@@ -1269,9 +1244,9 @@ if any(lam > 0 for lam in lambda_values):
                 gen_model_name=generator,
                 cls=cls,
                 num_generate=len(test_images),
+                img_shape=(1, 128, 128), 
                 batch_size_generate=500,
                 galaxy_classes=galaxy_classes,
-                img_shape=(1,128,128),
                 FILTERGEN=FILTERED,
                 model_kwargs=model_kwargs,
                 fold=fold,
@@ -1348,5 +1323,7 @@ plot_avg_roc_curves(metrics, generators, merge_map=merge_map)
 plot_all_metrics_vs_dataset_size(metrics, generators, merge_map=merge_map)
 plot_accuracy_vs_lambda(lambda_values, metrics, generators)
 #plot_confusion_matrix(metrics, generators)
-plot_avg_std_confusion_matrix(metrics, generators, merge_map=merge_map, metric_stats=metric_stats)
-plot_diff_avg_std_confusion_matrix(metrics, generators, merge_map=merge_map, metric_stats=metric_stats)
+plot_avg_std_confusion_matrix(metrics, generators, metric_stats=metrics_last, merge_map=merge_map)
+plot_diff_avg_std_confusion_matrix(metrics, generators, metric_stats=metrics_last, merge_map=merge_map)
+
+print("Script finished successfully!")

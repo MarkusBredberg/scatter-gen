@@ -8,12 +8,9 @@ import pandas as pd
 import os
 import cv2
 from utils.plotting import vae_multmod
-from utils.GAN_models import load_gan_generator
-from utils.calc_tools import get_main_and_secondary_peaks, get_main_and_secondary_peaks_with_locations
-from utils.calc_tools import get_model_name, normalize_to_0_1, normalize_to_minus1_1
-from utils.calc_tools import augment_images, generate_from_noise
-from utils.calc_tools import load_model, get_scatshape
-from utils.data_loader import load_galaxies
+from utils.calc_tools import get_main_and_secondary_peaks_with_locations
+from kymatio.torch import Scattering2D
+from utils.data_loader import load_galaxies, get_synthetic, get_classes
 from skimage.metrics import structural_similarity as ssim
 from sklearn.manifold import TSNE
 from sklearn.linear_model import LinearRegression 
@@ -33,26 +30,22 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 ################################### CONFIGURATION ####################################################
 ######################################################################################################
 
-galaxy_class, num_galaxies = 11, 1101128
+galaxy_class = 11
 num_display, num_generate = 5, 1000 # Plotted images per model, generated images for statistics
-gen_model_names = ['Dual', 'CNN', 'STMLP', 'ldiffSTMLP', 'lavgSTMLP', 'GAN'] # Model names to be used for evaluation
+gen_model_names = ['GAN', 'DDPM'] # Model names to be used for evaluation
 
 classes = get_classes()
-#galaxy_classes = [31, 32, 33, 34, 35, 36]  # Classes to classify
-galaxy_classes = [10, 11, 12, 13]  # Classes to classify
+galaxy_classes = [10, 11, 12, 13]
 max_num_galaxies = 100000  # Upper limit for the all-classes combined training data before classical augmentation
-dataset_portions = [0.01, 0.1, 1]  # Portions of complete dataset for the accuracy vs dataset size
-J, L, order = 2, 12, 2  # Scatter transform parameters
+fold=4
+J, L, order = 2, 12, 2  # Scattering parameters
 classifier = ["ProjectModel", "Rustige", "ScatterNet", "ScatterDual"][1]  # Choose one classifier model model
-gen_model_names = ['DDPM'] #['GAN', 'Dual', 'CNN', 'STMLP', 'lavgSTMLP', 'ldiffSTMLP'] # Specify the generative model_name
 num_epochs_cuda = 200
 num_epochs_cpu = 100
-batch_size = 250
 learning_rates = [1e-3]  # Learning rates
 regularization_params = [0]  # Regularisation parameters
 img_shape = (1, 128, 128)
 num_experiments = 10
-folds = [5] # 0-4 for 5-fold cross validation, 5 for only one training
 lambda_values = [0, 0.25, 0.5, 1, 2, 3, 5]  # Ratio between generated images and original images per class. 8 is reserfved for TESTONGENERATED
 
 ES, patience = True, 10  # Use early stopping
@@ -67,153 +60,191 @@ FILTERED = True  # Remove in training, validation and test data for the classifi
 FILTERGEN = False  # Remove generated images that are too similar to other generated images
 USE_MEMMAP = False  # Use memmap for scattering coefficients
 
+# -------------------------- VAE CONFIGURATION --------------------------
+vae_number = 1101128
+
 # -------------------------- NEW GAN CONFIGURATION --------------------------
 gan_epoch = 500           # e.g., epoch number to load from
+gan_sample_size = 100         # e.g., number of images to generate
 gan_gen_loss = 'MSE'       # e.g., generator loss value (as used in filename)
 gan_disc_loss = 'BCE'      # e.g., discriminator loss value (as used in filename)
 gan_latent_dim = 128
 lr_gen = 1e-3
 lr_disc = 1e-4
-gan_adam_beta = (0.5, 0.999)
 gan_weight_decay = 0.0
-gan_label_smoothing = 0.9
-gan_lambda_div = 0.1
-gan_data_version = ['full', 'clean'][0] 
+gan_label_smoothing = 0.7
+gan_lambda_div = 0
+gan_data_version = ['full', 'clean'][1] 
 gan_type = ['Simple', 'Advanced'][0]
+gan_latent_dim = 128  # Latent dimension for GAN
+
+#################################################################################
+####################### SETUP ###################################################
+#################################################################################
+
+
+save_dir = f'./generator/eval/{galaxy_class}_{gen_model_names}'
+scatshape = None
+
+subdirs = [
+    "peak_locations",
+    "asymmetry",
+    "generations",
+    "peak_statistics",
+    "peak_statistics/values_gen",  
+]
+
+for sd in subdirs:
+    os.makedirs(os.path.join(save_dir, sd), exist_ok=True)
 
 # Define consistent color mapping
 colors = {
     'Real':      '#0072B2',  # blue
-    'STMLP':     '#E69F00',  # orange
-    'lavgSTMLP': '#CC79A7',  # reddish purple
-    'ldiffSTMLP':'#F0E442',  # yellow
-    'Dual':      '#009E73',  # bluish green
-    'CNN':       '#56B4E9',  # sky blue
-    'GAN':       '#FF0000'   # bright red
+    'VAE-STMLP':     '#E69F00',  # orange
+    'VAE-lavgSTMLP': "#CC79A7",  # reddish purple
+    'VAE-ldiffSTMLP':"#8340DB",  # yellow
+    'VAE-Dual':      '#009E73',  # bluish green
+    'VAE-CNN':       "#73C1EE",  # sky blue
+    'GAN':       '#FF0000',   # bright red
+    'DDPM':      "#D65D00",  # dark orange
+    'ST':        '#000000'   # black
 }
 
+
 ##################################################################################
-########################################### LOAD DATASET ######################################
-##############################################################################
+########################################### LOAD DATASET #########################
+##################################################################################
 
-images_list, labels_list = get_synthetic(
-    num_generate=num_generate,
-    gen_model_name=gen_model_name,
-    cls=cls,
-    galaxy_classes=galaxy_classes,
-    batch_size=batch_size_generate,
-    img_shape=img_shape,
-    FILTERGEN=FILTERGEN,
-    model_kwargs={
-        "gan_type":       gan_type,
-        "gan_latent_dim": gan_latent_dim,
-        "lr_gen":         lr_gen,
-        "lr_disc":        lr_disc,
-        "gan_gen_loss":   gan_gen_loss,
-        "gan_disc_loss":  gan_disc_loss,
-        "gan_adam_beta":  gan_adam_beta,
-        "gan_weight_decay":    gan_weight_decay,
-        "gan_label_smoothing": gan_label_smoothing,
-        "gan_lambda_div":      gan_lambda_div,
-        "gan_data_version":    gan_data_version,
-        "gan_epoch":           gan_epoch,
-        "VAE_train_size": VAE_train_size,
-        "scatshape":      scatshape,
-        "hidden_dim1":    hidden_dim1,
-        "hidden_dim2":    hidden_dim2,
-        "vae_latent_dim": vae_latent_dim,
-    },
-    fold=fold,
-    device='cpu'
-)
 
-# --- Assemble real, DDPM, VAE and GAN images for evaluation ---
+# --- Assemble real + generated images into a dict for easy lookup ---  
+images, labels = {}, {}
 
-# 1) Define the evaluation order
-vae_names = [n for n in gen_model_names if n not in ('DDPM','GAN')]
-model_names = ['Real', 'DDPM'] + vae_names + (['GAN'] if 'GAN' in gen_model_names else [])
+# 1) Real  
+real_images, real_labels, _, _, = load_galaxies(  
+    galaxy_class=galaxy_class,  
+    sample_size=max_num_galaxies,  
+    fold=5,  
+    crop_size=img_shape[1:],
+    downsample_size=img_shape[1:],  
+    REMOVEOUTLIERS=FILTERED,  
+    train=False  
+)  
+images['Real'] = real_images  
+labels['Real'] = real_labels  
 
-# 2) Initialize containers
-generated_images_list = []
-generated_labels_list = []
-
-# 3) Real images
-real_images, real_labels = load_galaxies(
-    galaxy_class=galaxy_class,
-    num_galaxies=num_galaxies,
-    dataset_portions=dataset_portions,
-    max_num_galaxies=max_num_galaxies,
-    folds=folds,
-    batch_size=batch_size,
-    img_shape=img_shape,
-    FILTERED=FILTERED,
-    train=False
-)
-generated_images_list.append(real_images)
-generated_labels_list.append(real_labels)
-
-# 4) DDPM images
-ddpm_imgs, ddpm_lbls = get_synthetic(
-    num_generate=num_generate,
-    gen_model_name='DDPM',
-    cls=galaxy_class,
-    galaxy_classes=galaxy_classes,
-    batch_size=batch_size,
-    img_shape=img_shape,
-    FILTERGEN=False,
-    model_kwargs=model_kwargs,
-    fold=fold,
-    device=device
-)
-# flatten the list of batches into one tensor
-ddpm_imgs = torch.cat(ddpm_imgs, dim=0)
-ddpm_lbls = torch.cat(ddpm_lbls, dim=0)
-generated_images_list.append(ddpm_imgs)
-generated_labels_list.append(ddpm_lbls)
-
-# 5) VAE models
-for name in vae_names:
-    vae_imgs, vae_lbls = get_synthetic(
+# 2) DDPM images
+if 'DDPM' in gen_model_names:
+    ddpm_imgs, ddpm_lbls = get_synthetic(
         num_generate=num_generate,
-        gen_model_name=name,
+        gen_model_name='DDPM',
         cls=galaxy_class,
         galaxy_classes=galaxy_classes,
-        batch_size=batch_size,
         img_shape=img_shape,
         FILTERGEN=False,
-        model_kwargs=model_kwargs,
-        fold=fold,
         device=device
     )
-    vae_imgs = torch.cat(vae_imgs, dim=0)
-    vae_lbls = torch.cat(vae_lbls, dim=0)
-    generated_images_list.append(vae_imgs)
-    generated_labels_list.append(vae_lbls)
+    # Shuffle the DDPM images and labels
+    perm = torch.randperm(ddpm_imgs.size(0))
+    ddpm_imgs = ddpm_imgs[perm]
+    ddpm_lbls = ddpm_lbls[perm]
+    
+    images['DDPM'] = ddpm_imgs  
+    labels['DDPM'] = ddpm_lbls 
 
-# 6) GAN images
+# 3) VAE models    
+if any(m.startswith('VAE-') for m in gen_model_names):
+    vae_model_names = [m for m in gen_model_names if m.startswith('VAE-')]
+    if scatshape is None:
+        scattering = Scattering2D(J=J, L=L, shape=img_shape[1:], max_order=order)       
+        with torch.no_grad():
+            dummy = torch.zeros((1, *img_shape)).cpu()
+            scat_dummy = scattering(dummy)
+            if scat_dummy.shape[1] == 1:
+                scat_dummy = scat_dummy.squeeze(1)
+        scatshape = tuple(scat_dummy.shape[1:])
+    model_kwargs = {
+        'VAE_train_size': vae_number,
+        'scatshape': scatshape,
+        'hidden_dim1': 128,
+        'hidden_dim2': 128,
+        'vae_latent_dim': 128
+    }
+
+    for name in vae_model_names:  # There are multiple VAE models
+        imgs, lbls = get_synthetic(
+            num_generate=num_generate,
+            gen_model_name=name,
+            cls=galaxy_class,
+            galaxy_classes=galaxy_classes,
+            img_shape=img_shape,
+            FILTERGEN=False,
+            model_kwargs=model_kwargs,
+            fold=fold,
+            device=device
+        )
+        images[name] = imgs
+        labels[name] = lbls
+
+    
+# 4) GAN images
 if 'GAN' in gen_model_names:
+    model_kwargs = {
+        'img_shape': img_shape,
+        'gan_sample_size': gan_sample_size,
+        'num_classes': len(galaxy_classes),
+        'lr_gen': lr_gen,
+        'gan_gen_loss': gan_gen_loss,
+        'lr_disc': lr_disc,
+        'gan_disc_loss': gan_disc_loss,
+        'gan_label_smoothing': gan_label_smoothing,
+        'gan_data_version': gan_data_version,
+        'gan_lambda_div': gan_lambda_div,
+        'data_version': gan_data_version,
+        'gan_epoch': gan_epoch,
+        'gan_type': gan_type,
+        'gan_latent_dim': gan_latent_dim
+    }
     gan_imgs, gan_lbls = get_synthetic(
         num_generate=num_generate,
         gen_model_name='GAN',
         cls=galaxy_class,
         galaxy_classes=galaxy_classes,
-        batch_size=batch_size,
         img_shape=img_shape,
         FILTERGEN=False,
         model_kwargs=model_kwargs,
         fold=fold,
         device=device
     )
-    gan_imgs = torch.cat(gan_imgs, dim=0)
-    gan_lbls = torch.cat(gan_lbls, dim=0)
-    generated_images_list.append(gan_imgs)
-    generated_labels_list.append(gan_lbls)
+    images['GAN'] = gan_imgs  
+    labels['GAN'] = gan_lbls
+    
+# 5) Scattering Transform images
+if 'ST' in gen_model_names:
+    model_kwargs = {'ST_code': '104to100'}
+    st_imgs, st_lbls = get_synthetic(
+        num_generate=num_generate,
+        gen_model_name='ST',
+        cls=galaxy_class,
+        galaxy_classes=galaxy_classes,
+        img_shape=img_shape,
+        FILTERGEN=False,
+        model_kwargs=model_kwargs,
+        fold=fold,
+        device=device
+    )
+    images['ST'] = st_imgs
+    labels['ST'] = st_lbls
+    
+#model_names = ['Real'] + [m for m in gen_model_names if m in images and m != 'Real']
+model_names = [m for m in gen_model_names if m in images]
 
-print(f"Prepared data for: {model_names}")
+generated_images_list = [ images[name] for name in model_names ]
+generated_labels_list = [ labels[name] for name in model_names ]
+
+print(f"Prepared data for: {gen_model_names}")
 for name, imgs in zip(model_names, generated_images_list):
-    print(f"  {name}: {imgs.shape[0]} images")
-
-
+    print(f"{name}: {imgs.shape[0]} images")
+    
 
 ###########################################################
 ################# EVALUATION FUNCTIONS #####################
@@ -380,32 +411,6 @@ def calculate_ssim(real_images, gen_images):
     return np.mean([ssim(real_img.squeeze(), gen_img.squeeze(), data_range=gen_img.max() - gen_img.min()) for real_img, gen_img in zip(real_images.cpu().numpy(), gen_images.cpu().numpy())])
 
 
-def interpolate_images(model, img_shape, num_steps=20):
-    # Generate two random latent vectors
-    z1 = torch.randn(1, latent_dim).to(DEVICE)
-    z2 = torch.randn(1, latent_dim).to(DEVICE)
-
-    # Interpolation steps
-    z_steps = [(1 - alpha) * z1 + alpha * z2 for alpha in np.linspace(0, 1, num_steps)]
-
-    interpolated_images = []
-
-    # Check if the model is conditional
-    if hasattr(model, 'decoder') and 'conditional' in str(type(model.decoder)).lower():
-        # Generate images from interpolated latent vectors for conditional model
-        labels = torch.ones(1, dtype=torch.long).to(DEVICE)  # Assuming label '0'
-        labels = torch.nn.functional.one_hot(labels, num_classes=num_classes).float()  # One-hot encode the labels
-        for z in z_steps:
-            img = model.decoder(z, labels).view(-1, *img_shape).cpu().detach().numpy()
-            interpolated_images.append(img)
-    else:
-        # Generate images from interpolated latent vectors for non-conditional model
-        for z in z_steps:
-            img = model.decoder(z).view(-1, *img_shape).cpu().detach().numpy()
-            interpolated_images.append(img)
-
-    return interpolated_images
-
 def extract_first_number(line):
     """Extract the first token that can be converted to a float."""
     parts = line.split(":")
@@ -455,37 +460,6 @@ def parse_log_file(file_path):
     epochs = epochs if epochs is not None else 0
 
     return scatter_time_1, scatter_time_2, train_time, epochs
-
-
-def old_evaluate_symmetry(image):
-    if isinstance(image, torch.Tensor):
-        image = image.cpu().numpy()  # Convert to NumPy if it's a tensor
-    
-    gray_image = np.squeeze(image, axis=0) #Reduce grayscale image dimension
-    height, width = gray_image.shape
-    
-    # Vertical symmetry (left vs. right)
-    left_half = gray_image[:, :width // 2]
-    right_half = gray_image[:, width // 2:]
-    right_half_flipped = np.flip(right_half, axis=1)
-    if left_half.shape[1] != right_half_flipped.shape[1]:
-        right_half_flipped = cv2.resize(right_half_flipped, (left_half.shape[1], left_half.shape[0]))
-    vertical_diff = np.sum(np.abs(left_half - right_half_flipped))
-    
-    # Horizontal symmetry (top vs. bottom)
-    top_half = gray_image[:height // 2, :]
-    bottom_half = gray_image[height // 2:, :]
-    bottom_half_flipped = np.flip(bottom_half, axis=0)
-    if top_half.shape[0] != bottom_half_flipped.shape[0]:
-        bottom_half_flipped = cv2.resize(bottom_half_flipped, (top_half.shape[1], top_half.shape[0]))
-    horizontal_diff = np.sum(np.abs(top_half - bottom_half_flipped))
-    
-    # Overall asymmetry score is the average of vertical and horizontal scores
-    vertical_score = vertical_diff / (width * height)
-    horizontal_score = horizontal_diff / (width * height)
-    overall_asymmetry_score = (vertical_score + horizontal_score) / 2
-    
-    return vertical_score, horizontal_score, overall_asymmetry_score
 
 def evaluate_symmetry(image):
     """
@@ -555,6 +529,11 @@ def calculate_mse(original, constructed):
     # Calculate Mean Squared Error
     mse_value = np.mean((original_gray - constructed_gray) ** 2)
     return mse_value
+
+def calculate_statistics(speed_data):
+    means = speed_data.mean(axis=0)
+    stds = speed_data.std(axis=0)
+    return means, stds
 
 
 #######################################################
@@ -687,6 +666,9 @@ def plot_images_by_asymmetry_bins(images, constructed_images, save_path='./gener
     
 
 def plot_images_with_peaks(images, peaks_info_all, save_path='./generator/eval/peaks.pdf'):
+    out_dir = os.path.dirname(save_path)
+    os.makedirs(out_dir, exist_ok=True)
+    
     start_time = time.time()
     # Ensure we only plot the first 3 images and their peaks
     images = images[:3]
@@ -712,7 +694,6 @@ def plot_images_with_peaks(images, peaks_info_all, save_path='./generator/eval/p
     plt.tight_layout()
     plt.savefig(save_path)
     plt.close()
-    print(f"Function plot_images_with_peaks executed in {time.time() - start_time:.2f} seconds")
 
 
 def plot_peak_statistics(peak_intensity_stats_real, peak_intensity_stats_produced, model_names, title, save_path, show_secondary=True):
@@ -1085,6 +1066,7 @@ def plot_stacked_images(real_images, reconstructed_images_list, generated_images
     else:
         plt.show()
     plt.close()
+    print("Stacked images plotted successfully at", save_path)
 
 
 def plot_intensity_histograms_individually(
@@ -1092,8 +1074,12 @@ def plot_intensity_histograms_individually(
     bottomx=9e-4, xlabel='Intensity sum', bins=None, bin_split_value=None, RMAE=True,
     save=True, save_path='./generator/eval/summedintensityhist.pdf', 
     FIXED_SCALE=False, fixed_xlim=(0, 1), fixed_ylim=(1e-6, 1), 
-    universallinestyle="-", models_to_plot = model_names, 
+    universallinestyle="-", 
+    models_to_plot = None,
     legend_location = 'upper right'):
+    
+    if models_to_plot is None:
+        models_to_plot = [m for m in model_names if m != 'Real']
     # Initialize the figure and axes
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), gridspec_kw={'height_ratios': [3, 1]})
 
@@ -1149,7 +1135,7 @@ def plot_intensity_histograms_individually(
 
     # Set axis labels, scales, and legend
     ax1.set_yscale('log')
-    ax1.set_ylabel('Frequency', fontsize=18)
+    ax1.set_ylabel('Normalised counts', fontsize=18)
     ax1.legend(loc=legend_location, fontsize=16)
     ax1.grid(True)
     ax1.tick_params(axis='both', labelsize=16)
@@ -1164,7 +1150,7 @@ def plot_intensity_histograms_individually(
     plt.tight_layout()
     plt.savefig(save_path) if save else plt.show()
     plt.close()
-
+    print(f"Function plot_intensity_histograms_individually executed with title '{title}' and saved to {save_path}")
 
 
 def plot_latent_spaces(latent_representations, model_names, default_perplexity=30, learning_rate=200, n_iter=1000, save_path=None):
@@ -1220,6 +1206,7 @@ def plot_latent_spaces(latent_representations, model_names, default_perplexity=3
         cbar.set_label('Latent Space Value')
 
     plt.savefig(save_path, dpi=300, bbox_inches='tight') if save_path else plt.show()
+    print(f"Function plot_latent_spaces executed with {num_models} models and saved to {save_path if save_path else 'displayed on screen'}")
     
 def plot_latent_distributions_for_each_model(latent_representations, model_names, save=True, save_dir='./latent_distributions'):
     # Ensure the save directory exists
@@ -1312,8 +1299,7 @@ def plot_latent_cross_correlation(latent_representations, model_names, save_dir=
             plt.savefig(plot_save_path)
             plt.close()
             print(f"Function plot_latent_cross_correlation executed in {time.time() - start_time:.2f} seconds")
-
-
+            print("Images saved to", plot_save_path)
 
 
 def plot_covariance(latent_vectors, num_dimensions=5, save=True, save_path='./covariance.pdf'):
@@ -1358,10 +1344,7 @@ def plot_interpolated_images(interpolated_images, save=True, save_path='./interp
     plt.savefig(save_path) if save else plt.show()
     plt.close()
     
-def calculate_statistics(speed_data):
-    means = speed_data.mean(axis=0)
-    stds = speed_data.std(axis=0)
-    return means, stds
+
 
 
 def plot_generation_speed(models, save=True, save_path='./generator/eval/speedhist.pdf'):
@@ -1410,74 +1393,6 @@ def plot_generation_speed(models, save=True, save_path='./generator/eval/speedhi
     plt.close()
     print(f"Function plot_generation_speed executed in {time.time() - start_time:.2f} seconds")
     
-
-def old_plot_model_times_with_error_bars(models, save=True, save_path='./generator/eval/time_with_errors.pdf'):
-    # Dictionaries to store times by model name
-    scatter_times_1 = {}
-    scatter_times_2 = {}
-    train_times = {}
-    
-    # Collecting data for each model, grouping by model name
-    for model_info in models:
-        if os.path.exists(model_info["path"]):
-            scatter_time_1, scatter_time_2, train_time, epochs = parse_log_file(model_info["path"])            
-            model_name = model_info["name"]
-            
-            # Initialize lists for each model name if not already present
-            if model_name not in scatter_times_1:
-                scatter_times_1[model_name] = []
-                scatter_times_2[model_name] = []
-                train_times[model_name] = []
-            
-            # Append the times for each run to the corresponding model
-            scatter_times_1[model_name].append(scatter_time_1)
-            scatter_times_2[model_name].append(scatter_time_2)
-            train_times[model_name].append(train_time)
-    
-    # Prepare data for plotting: calculate means and standard deviations
-    avg_scatter_times_1 = []
-    std_scatter_times_1 = []
-    avg_scatter_times_2 = []
-    std_scatter_times_2 = []
-    avg_train_times = []
-    std_train_times = []
-    model_names = list(scatter_times_1.keys())
-
-    for model_name in model_names:
-        avg_scatter_times_1.append(np.mean(scatter_times_1[model_name]))
-        std_scatter_times_1.append(np.std(scatter_times_1[model_name]))
-        
-        avg_scatter_times_2.append(np.mean(scatter_times_2[model_name]))
-        std_scatter_times_2.append(np.std(scatter_times_2[model_name]))
-        
-        avg_train_times.append(np.mean(train_times[model_name]))
-        std_train_times.append(np.std(train_times[model_name]))
-    
-    # Plotting
-    fig, ax = plt.subplots(figsize=(12, 8))
-    bar_width = 0.2
-    index = np.arange(len(model_names))
-
-    # Plot with error bars
-    ax.bar(index - bar_width, avg_scatter_times_1, bar_width, yerr=std_scatter_times_1, label='Train Scattering Time', capsize=5, color='blue')
-    ax.bar(index, avg_scatter_times_2, bar_width, yerr=std_scatter_times_2, label='Test Scattering Time', capsize=5, color='orange')
-    ax.bar(index + bar_width, avg_train_times, bar_width, yerr=std_train_times, label='Training Time', capsize=5, color='green')
-
-    ax.set_xlabel('Model')
-    ax.set_ylabel('Time (seconds)')
-    ax.set_title('Model Times')
-    ax.set_xticks(index)
-    ax.set_xticklabels(model_names, rotation=45)
-    ax.legend()
-
-    plt.tight_layout()
-
-    if save:
-        plt.savefig(save_path)
-    else:
-        plt.show()
-
-    plt.close()
     
 def plot_model_times_with_error_bars(models, save=True, save_path='./generator/eval/time_with_errors.pdf'):
     # Dictionaries to store times by model name
@@ -1548,7 +1463,7 @@ def plot_model_times_with_error_bars(models, save=True, save_path='./generator/e
     plt.close()
 
 
-def plot_image_grid(images, img_shape, nrow=10, ncol=10, title='Image grid', savepath=f'{save_dir}/image_grid.pdf', cmap='viridis'):
+def plot_image_grid(images, img_shape, nrow=10, ncol=10, title='Image grid', savepath=f'figures/image_grid.pdf', cmap='viridis'):
     # Plot a grid of images with nrow x ncol
     fig, axs = plt.subplots(nrow, ncol, figsize=(ncol, nrow))
     axs = axs.ravel()
@@ -1565,19 +1480,15 @@ def plot_image_grid(images, img_shape, nrow=10, ncol=10, title='Image grid', sav
     plt.savefig(savepath, bbox_inches='tight', pad_inches=0)
     plt.close(fig)
 
-
+##########################################################################################################
+############################################# MAIN CODE ##################################################
+##`########################################################################################################`
 
 # Plot generated vs original images
-if not USE_GAN:
-    vae_multmod(
-        test_images[:num_display],
-        reconstructed_images_list,
-        vae_model_names,  # Use filtered names here
-        save=True,
-        save_path=f"{save_dir}/reconstructed.pdf",
-        show_title=False,
-        show_originals=True
-    )
+#if model_names == ['VAE']:
+#    vae_multmod(real_images[:num_display], reconstructed_images_list,vae_model_names,  # Use filtered names here
+#        save=True, save_path=f"{save_dir}/reconstructed.pdf", show_title=False,
+#        show_originals=True)
     # Ensure tensors are moved to CPU and then convert to numpy for shape printing
 vae_multmod(old_images=None, generated_images=generated_images_list, model_names=model_names,
             save=True, save_path=f"{save_dir}/generated.pdf", show_title=False, show_originals=False)
@@ -1585,9 +1496,9 @@ vae_multmod(old_images=None, generated_images=generated_images_list, model_names
 # SIMILAR GENERATED IMAGES AND ORIGINAL IMAGES
 most_similar_images_list = []
 for generated_images in generated_images_list:
-    most_similar_images = find_most_similar_images(test_images[:num_display], generated_images)
+    most_similar_images = find_most_similar_images(real_images[:num_display], generated_images)
     most_similar_images_list.append(most_similar_images)
-vae_multmod(test_images[:num_display], most_similar_images_list, model_names,
+vae_multmod(real_images[:num_display], most_similar_images_list, model_names,
             save=True, save_path=f"{save_dir}/generated_similar.pdf", show_title=False, show_originals=True)
 
 #COMPONENT PEAK STATISTICS
@@ -1595,97 +1506,65 @@ vae_multmod(test_images[:num_display], most_similar_images_list, model_names,
 all_peak_intensity_stats_rec = []
 all_peak_intensity_stats_gen = []
 
-#plot_asymmetry_vs_mse(test_images, reconstructed_images, save_path=f"{save_dir}/asymmetry_{encoder_name}.pdf")
+#plot_asymmetry_vs_mse(real_images, reconstructed_images, save_path=f"{save_dir}/asymmetry_{encoder_name}.pdf")
 
 # Loop through each encoder and accumulate the peak statistics
-peaks_info_real = get_main_and_secondary_peaks_with_locations(test_images, threshold=0.1)
-plot_images_with_peaks(test_images, peaks_info_real, save_path=f'{save_dir}/peak_locations/real.pdf')
+peaks_info_real = get_main_and_secondary_peaks_with_locations(real_images, threshold=0.1)
+plot_images_with_peaks(real_images, peaks_info_real, save_path=f'{save_dir}/peak_locations/real.pdf')
 for i, encoder_name in enumerate(model_names):
     generated_images = generated_images_list[i]
     peaks_info_gen = get_main_and_secondary_peaks_with_locations(generated_images)
     all_peak_intensity_stats_gen.append(peaks_info_gen)     # Accumulate the statistics for the reconstructed and generated images for all model_names
-    plot_asymmetry_score_histogram(test_images, num_bins=21, save_path=f"{save_dir}/asymmetry/histogram_{encoder_name}.pdf")
+    plot_asymmetry_score_histogram(real_images, num_bins=21, save_path=f"{save_dir}/asymmetry/histogram_{encoder_name}.pdf")
     plot_images_with_peaks(generated_images, peaks_info_gen, save_path=f'{save_dir}/peak_locations/generations_{encoder_name}.pdf')
     plot_image_grid(generated_images, img_shape, 10, 10, title="Generations", savepath=f"{save_dir}/generations/{encoder_name}_generations.pdf")
     #plot_covariance(latent_representations[i], num_dimensions=5, save_path=f"{save_dir}/latent/{encoder_name}_covariance.pdf")
 
-    if not USE_GAN and encoder_name not in ['GAN']:
-        reconstructed_images = reconstructed_images_list[i]
-        peaks_info_rec = get_main_and_secondary_peaks_with_locations(reconstructed_images)
-        all_peak_intensity_stats_rec.append(peaks_info_rec)
-        plot_asymmetry_vs_mse(test_images, reconstructed_images, encoder_name, save_path=f"{save_dir}/asymmetry/MSE_vs_asym_{encoder_name}.pdf")
-        plot_images_by_asymmetry_bins(test_images, reconstructed_images, save_path=f'{save_dir}/asymmetry/reconstructions_{encoder_name}.pdf')
-        plot_images_with_peaks(reconstructed_images, peaks_info_rec, save_path=f'{save_dir}/peak_locations/reconstructions_{encoder_name}.pdf')
+    #if not any(model in gen_model_names for model in ['GAN', 'DDPM', 'ST']) and encoder_name not in ['GAN']:
+    #    reconstructed_images = reconstructed_images_list[i]
+    #    peaks_info_rec = get_main_and_secondary_peaks_with_locations(reconstructed_images)
+    #    all_peak_intensity_stats_rec.append(peaks_info_rec)
+    #    plot_asymmetry_vs_mse(real_images, reconstructed_images, encoder_name, save_path=f"{save_dir}/asymmetry/MSE_vs_asym_{encoder_name}.pdf")
+    #    plot_images_by_asymmetry_bins(real_images, reconstructed_images, save_path=f'{save_dir}/asymmetry/reconstructions_{encoder_name}.pdf')
+    #    plot_images_with_peaks(reconstructed_images, peaks_info_rec, save_path=f'{save_dir}/peak_locations/reconstructions_{encoder_name}.pdf')
 
 
 # Plot primary and secondary peak statistics for all model_names together
-if not USE_GAN:
-    plot_peak_statistics(peaks_info_real, all_peak_intensity_stats_rec, vae_model_names, 
-                     title='Primary and Secondary Peak Intensities (Reconstructed vs Real)',
-                     save_path=f'{save_dir}/peak_statistics/values_recon.pdf')
 plot_peak_statistics(peaks_info_real, all_peak_intensity_stats_gen, model_names, 
                      title='Primary and Secondary Peak Intensities (Generated vs Real)',
                      save_path=f'{save_dir}/peak_statistics/values_gen.pdf')
 
 # Plot distribution of primary-to-secondary peak intensity ratios for all model_names
-if not USE_GAN:
-    plot_peak_ratio_distribution(peaks_info_real, all_peak_intensity_stats_rec, vae_model_names, 
-                                save_path=f'{save_dir}/peak_statistics/ratio_dist_recon.pdf')
 plot_peak_ratio_distribution(peaks_info_real, all_peak_intensity_stats_gen, model_names, 
                              save_path=f'{save_dir}/peak_statistics/ratio_dist_gen.pdf')
 
 # Plot histograms for primary and secondary peaks for all model_names together
-if not USE_GAN:
-    plot_peak_histograms_combined(peaks_info_real, all_peak_intensity_stats_rec, vae_model_names, prodtype='Reconstructed',
-                        save_path=f'{save_dir}/peak_statistics/histograms_recon.pdf')
 plot_peak_histograms_combined(peaks_info_real, all_peak_intensity_stats_gen, model_names, prodtype='Generated',
                      save_path=f'{save_dir}/peak_statistics/histograms_gen.pdf')
 
 # Plot heatmap for primary-to-secondary peak intensity ratios for all model_names together
-if not USE_GAN: 
-    plot_peak_ratio_heatmap(peaks_info_real, all_peak_intensity_stats_rec, vae_model_names, prodtype='Reconstructed',
-                            save_path=f'{save_dir}/peak_statistics/ratio_rec_heatmap')
 plot_peak_ratio_heatmap(peaks_info_real, all_peak_intensity_stats_gen, model_names, prodtype='Generated',
                         save_path=f'{save_dir}/peak_statistics/ratio_gen_heatmap')
 
 
 # PIXEL DISTRIBUTIONS
 # Calculate summed intensities and plot
-if not USE_GAN: 
-    real_intensity_sum, all_reconstructed_sums, real_rec_combinations = calculate_summed_intensities(test_images, reconstructed_images_list, vae_model_names)
-    real_intensity_sum = np.array(real_intensity_sum, dtype=np.float32)
-    max_real = np.max(real_intensity_sum)
-    print("Shape of real_intensity_sum:", np.shape(real_intensity_sum))
-    print("Length of all_reconstructed_sums:", len(all_reconstructed_sums))
-    print("Lengths of individual arrays in all_reconstructed_sums:", [len(arr) for arr in all_reconstructed_sums])
-    print("Max of real_intensity_sum: ", max(real_intensity_sum))
-    plot_intensity_histograms_individually(
-        real_intensity_sum,
-        all_reconstructed_sums,
-        real_rec_combinations,
-        vae_model_names,
-        title=f"Reconstructions of {galaxy_class} coded {num_galaxies}",
-        xlabel='Accumulated pixel intensity per image',
-        FIXED_SCALE=True,
-        fixed_xlim=(0, max_real+30),
-        fixed_ylim=(9e-4, 1),
-        save_path=f"{save_dir}/summedintensitydist_recon.pdf"
-    )
-real_intensity_sum, all_generated_sums, real_gen_combinations = calculate_summed_intensities(test_images, generated_images_list, model_names)
+real_intensity_sum, all_generated_sums, real_gen_combinations = calculate_summed_intensities(real_images, generated_images_list, model_names)
 real_intensity_sum = np.array(real_intensity_sum, dtype=np.float32)
 max_real = np.max(real_intensity_sum)
 plot_intensity_histograms_individually(
     real_intensity_sum,
-    all_generated_sums,
+    { m: all_generated_sums[m] for m in ['DDPM', 'GAN'] },
     real_gen_combinations,
-    model_names,
-    title=f"Generations of {galaxy_class} coded {num_galaxies}",
+    ['DDPM', 'GAN'],
+    title="Summed intensity distribution: DDPM vs GAN",
     xlabel='Accumulated pixel intensity per image',
     FIXED_SCALE=True,
-    fixed_xlim=(0, max_real+30),
+    fixed_xlim=(0, max_real + 30),
     fixed_ylim=(9e-4, 1),
-    save_path=f"{save_dir}/summedintensitydist_gen.pdf"
+    save_path=f"{save_dir}/summedintensitydist_GAN_vs_DDPM.pdf"
 )
+
 
 # For each encoder, calculate Bhattacharyya coefficient, TVD, and histogram intersection
 print("Calculating Bhattacharyya coefficient, TVD, and histogram intersection for summed intensities...")
@@ -1697,30 +1576,34 @@ for i, encoder in enumerate(model_names):
     intersection = histogram_intersection(real_intensity_sum, generated_intensity_sum)
     print(f"Model: {encoder}, Bhattacharyya: {bhattacharyya:.4f}, TVD: {tvd:.4f}, Intersection: {intersection:.4f}")
 
+# —————————————————————————————————————————————————————————
+# Build a summary table of all metrics
+# —————————————————————————————————————————————————————————
+metrics_list = []
+
+# Summed‐intensity metrics
+for encoder in model_names:
+    bh = bhattacharyya_coefficient(real_intensity_sum, all_generated_sums[encoder])
+    tvd_ = total_variation_distance(real_intensity_sum, all_generated_sums[encoder])
+    inter = histogram_intersection(real_intensity_sum, all_generated_sums[encoder])
+    metrics_list.append({
+        'Model': encoder,
+        'Summed Bhattacharyya': bh,
+        'Summed TVD': tvd_,
+        'Summed Intersection': inter
+    })
+
+
+
 
 # Calculate peak intensities and plot
-if not USE_GAN:
-    real_peak_intensity, all_reconstructed_peaks, real_rec_combinations = calculate_peak_intensities(test_images, reconstructed_images_list, vae_model_names)
-    plot_intensity_histograms_individually(
-        real_peak_intensity,
-        all_reconstructed_peaks,
-        real_rec_combinations,
-        vae_model_names,
-        title=f"Reconstructions of {galaxy_class} coded {num_galaxies}",
-        xlabel='Intensity for the brightest pixel in each image',
-        FIXED_SCALE=True,
-        fixed_xlim=(0, 1),
-        fixed_ylim=(9e-4, 1),
-        save_path=f"{save_dir}/peakintensitydist_recon.pdf",
-        legend_location='upper left'
-    )
-real_peak_intensity, all_generated_peaks, real_gen_combinations = calculate_peak_intensities(test_images, generated_images_list, model_names)
+real_peak_intensity, all_generated_peaks, real_gen_combinations = calculate_peak_intensities(real_images, generated_images_list, model_names)
 plot_intensity_histograms_individually(
     real_peak_intensity,
     all_generated_peaks,
     real_gen_combinations,
     model_names,
-    title=f"Generations of {galaxy_class} coded {num_galaxies}",
+    title=f"Generations of {galaxy_class} coded {vae_number}",
     xlabel='Intensity for the brightest pixel in each image',
     FIXED_SCALE=True,
     fixed_xlim=(0, 1),
@@ -1737,31 +1620,29 @@ for i, encoder in enumerate(model_names):
     tvd = total_variation_distance(real_peak_intensity, generated_peak_intensity)
     intersection = histogram_intersection(real_peak_intensity, generated_peak_intensity)
     print(f"Model: {encoder}, Bhattacharyya: {bhattacharyya:.4f}, TVD: {tvd:.4f}, Intersection: {intersection:.4f}")
+    
+# Peak‐intensity metrics
+for encoder in model_names:
+    bh = bhattacharyya_coefficient(real_peak_intensity, all_generated_peaks[encoder])
+    tvd_ = total_variation_distance(real_peak_intensity, all_generated_peaks[encoder])
+    inter = histogram_intersection(real_peak_intensity, all_generated_peaks[encoder])
+    metrics_list.append({
+        'Model': encoder,
+        'Peak Bhattacharyya': bh,
+        'Peak TVD': tvd_,
+        'Peak Intersection': inter
+    })
+
 
 
 # Calculate total intensities and plot
-if not USE_GAN:
-    real_total_intensity, all_reconstructed_total_intensities, real_rec_combinations = calculate_total_intensities(test_images, reconstructed_images_list, vae_model_names)
-    plot_intensity_histograms_individually(
-        real_total_intensity,
-        all_reconstructed_total_intensities,
-        real_rec_combinations,
-        vae_model_names,
-        title=f"Reconstructions of {galaxy_class} coded {num_galaxies}",
-        xlabel='Intensity for each generated pixel',
-        FIXED_SCALE=True,
-        fixed_xlim=(0, 1),
-        fixed_ylim=(9e-9, 1),
-        save_path=f"{save_dir}/totalintensitydist_recon.pdf",
-        legend_location='lower left'
-    )
-real_total_intensity, all_generated_total_intensities, real_gen_combinations = calculate_total_intensities(test_images, generated_images_list, model_names)
+real_total_intensity, all_generated_total_intensities, real_gen_combinations = calculate_total_intensities(real_images, generated_images_list, model_names)
 plot_intensity_histograms_individually(
     real_total_intensity,
     all_generated_total_intensities,
     real_gen_combinations,
     model_names,
-    title=f"Generations of {galaxy_class} coded {num_galaxies}",
+    title=f"Generations of {galaxy_class} coded {vae_number}",
     xlabel='Intensity for each generated pixel',
     FIXED_SCALE=True,
     fixed_xlim=(0, 1),
@@ -1778,24 +1659,32 @@ for i, encoder in enumerate(model_names):
     tvd = total_variation_distance(real_total_intensity, generated_total_intensity)
     intersection = histogram_intersection(real_total_intensity, generated_total_intensity)
     print(f"Model: {encoder}, Bhattacharyya: {bhattacharyya:.4f}, TVD: {tvd:.4f}, Intersection: {intersection:.4f}")
+    
+
+for encoder in model_names:
+    bh = bhattacharyya_coefficient(real_total_intensity, all_generated_total_intensities[encoder])
+    tvd_ = total_variation_distance(real_total_intensity, all_generated_total_intensities[encoder])
+    inter = histogram_intersection(real_total_intensity, all_generated_total_intensities[encoder])
+    metrics_list.append({
+        'Model': encoder,
+        'Total Bhattacharyya': bh,
+        'Total TVD': tvd_,
+        'Total Intersection': inter
+    })
+
 
 
 
 # RADIAL INTENSITY COMPARISON
-original_radial_intensity = compute_radial_intensity(test_images[:num_display], img_shape)
+original_radial_intensity = compute_radial_intensity(real_images[:num_display], img_shape)
 models_gen_radial_intensity, models_rec_radial_intensity = [], []
 for i, generated_images in enumerate(generated_images_list):
     radial_intensity = compute_radial_intensity(generated_images, img_shape)
     models_gen_radial_intensity.append(radial_intensity)
-if not USE_GAN:
-    for i, reconstructed_images in enumerate(reconstructed_images_list):
-        radial_intensity = compute_radial_intensity(reconstructed_images, img_shape)
-        models_rec_radial_intensity.append(radial_intensity)    
 title = f'Radial Intensity of {galaxy_class}'
 plot_radial_intensity(original_radial_intensity, models_rec_radial_intensity, models_gen_radial_intensity, model_names, title, save_path_generated=f"{save_dir}/radial_generated.pdf", save_path_reconstructed=f"{save_dir}/radial_reconstructed.pdf")
-plot_stacked_images(test_images, reconstructed_images_list=None, generated_images_list=generated_images_list, model_names=model_names, save_path=f"{save_dir}/stacked_images.pdf")
-plot_generation_speed(models, save_path=f'{save_dir}/speedhist.pdf')
-plot_model_times_with_error_bars(models, save_path=f'{save_dir}/timehist.pdf')
+plot_stacked_images(real_images, reconstructed_images_list=None, generated_images_list=generated_images_list, model_names=model_names, save_path=f"{save_dir}/stacked_images.pdf")
+
 
 # For each encoder, calculate Bhattacharyya coefficient, TVD, and histogram intersection for radial intensities
 print("Calculating Bhattacharyya coefficient, TVD, and histogram intersection for radial intensities...")
@@ -1805,14 +1694,104 @@ for i, encoder in enumerate(model_names):
     tvd = total_variation_distance(original_radial_intensity, generated_radial_intensity)
     intersection = histogram_intersection(original_radial_intensity, generated_radial_intensity)
     print(f"Model: {encoder}, Bhattacharyya: {bhattacharyya:.4f}, TVD: {tvd:.4f}, Intersection: {intersection:.4f}")
+    
+# Radial‐intensity metrics
+for encoder, gen_rad in zip(model_names, models_gen_radial_intensity):
+    bh = bhattacharyya_coefficient(original_radial_intensity, gen_rad)
+    tvd_ = total_variation_distance(original_radial_intensity, gen_rad)
+    inter = histogram_intersection(original_radial_intensity, gen_rad)
+    metrics_list.append({
+        'Model': encoder,
+        'Radial Bhattacharyya': bh,
+        'Radial TVD': tvd_,
+        'Radial Intersection': inter
+    })
 
-# LATENT SPACE
-if not USE_GAN:
+import pandas as pd
+df_summary = pd.DataFrame(metrics_list)
+
+# Print and save
+print(df_summary.to_string(index=False))
+df_summary.to_latex(f"{save_dir}/evaluation_summary.tex", index=False)
+
+""" 
+# To show the VAE reconstructions
+if not any(model in gen_model_names for model in ['GAN', 'DDPM', 'ST']):
+    plot_generation_speed(models, save_path=f'{save_dir}/speedhist.pdf')
+    plot_model_times_with_error_bars(models, save_path=f'{save_dir}/timehist.pdf')
+
+    plot_peak_statistics(peaks_info_real, all_peak_intensity_stats_rec, vae_model_names, 
+                     title='Primary and Secondary Peak Intensities (Reconstructed vs Real)',
+                     save_path=f'{save_dir}/peak_statistics/values_recon.pdf')
+    
+    plot_peak_ratio_distribution(peaks_info_real, all_peak_intensity_stats_rec, vae_model_names, 
+                                save_path=f'{save_dir}/peak_statistics/ratio_dist_recon.pdf')
+    
+    plot_peak_histograms_combined(peaks_info_real, all_peak_intensity_stats_rec, vae_model_names, prodtype='Reconstructed',
+                    save_path=f'{save_dir}/peak_statistics/histograms_recon.pdf')
+    
+    plot_peak_ratio_heatmap(peaks_info_real, all_peak_intensity_stats_rec, vae_model_names, prodtype='Reconstructed',
+                        save_path=f'{save_dir}/peak_statistics/ratio_rec_heatmap')
+    
+    real_intensity_sum, all_reconstructed_sums, real_rec_combinations = calculate_summed_intensities(real_images, reconstructed_images_list, vae_model_names)
+    real_intensity_sum = np.array(real_intensity_sum, dtype=np.float32)
+    max_real = np.max(real_intensity_sum)
+    print("Shape of real_intensity_sum:", np.shape(real_intensity_sum))
+    print("Length of all_reconstructed_sums:", len(all_reconstructed_sums))
+    print("Lengths of individual arrays in all_reconstructed_sums:", [len(arr) for arr in all_reconstructed_sums])
+    print("Max of real_intensity_sum: ", max(real_intensity_sum))
+    plot_intensity_histograms_individually(
+        real_intensity_sum,
+        all_reconstructed_sums,
+        real_rec_combinations,
+        vae_model_names,
+        title=f"Reconstructions of {galaxy_class} coded {vae_number}",
+        xlabel='Accumulated pixel intensity per image',
+        FIXED_SCALE=True,
+        fixed_xlim=(0, max_real+30),
+        fixed_ylim=(9e-4, 1),
+        save_path=f"{save_dir}/summedintensitydist_recon.pdf"
+    )
+    
+    real_peak_intensity, all_reconstructed_peaks, real_rec_combinations = calculate_peak_intensities(real_images, reconstructed_images_list, vae_model_names)
+    plot_intensity_histograms_individually(
+        real_peak_intensity,
+        all_reconstructed_peaks,
+        real_rec_combinations,
+        vae_model_names,
+        title=f"Reconstructions of {galaxy_class} coded {vae_number}",
+        xlabel='Intensity for the brightest pixel in each image',
+        FIXED_SCALE=True,
+        fixed_xlim=(0, 1),
+        fixed_ylim=(9e-4, 1),
+        save_path=f"{save_dir}/peakintensitydist_recon.pdf",
+        legend_location='upper left'
+    )
+    
+    real_total_intensity, all_reconstructed_total_intensities, real_rec_combinations = calculate_total_intensities(real_images, reconstructed_images_list, vae_model_names)
+    plot_intensity_histograms_individually(
+        real_total_intensity,
+        all_reconstructed_total_intensities,
+        real_rec_combinations,
+        vae_model_names,
+        title=f"Reconstructions of {galaxy_class} coded {vae_number}",
+        xlabel='Intensity for each generated pixel',
+        FIXED_SCALE=True,
+        fixed_xlim=(0, 1),
+        fixed_ylim=(9e-9, 1),
+        save_path=f"{save_dir}/totalintensitydist_recon.pdf",
+        legend_location='lower left'
+    )
+    
+    for i, reconstructed_images in enumerate(reconstructed_images_list):
+        radial_intensity = compute_radial_intensity(reconstructed_images, img_shape)
+        models_rec_radial_intensity.append(radial_intensity) 
+        
+    # LATENT SPACE
     latent_representations_combined = torch.cat(latent_representations, dim=0)
     plot_latent_spaces(latent_representations, vae_model_names, save_path=f'{save_dir}/latent_spaces.pdf')
     plot_latent_distributions_for_each_model(latent_representations, vae_model_names, save=True, save_dir=f'{save_dir}/latent')
     plot_latent_cross_correlation(latent_representations, vae_model_names, save_dir=f'{save_dir}/latent')
-else:
-    print("Skipping latent space plots because GAN is used.")
+"""
 
 print("Plots generated and saved.")

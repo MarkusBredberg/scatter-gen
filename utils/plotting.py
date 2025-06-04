@@ -587,6 +587,12 @@ def vae_multmod(old_images, generated_images, model_names, save=False, save_path
     model_names = [model_names[i] for i in unique_indices]
     generated_images = [generated_images[i] for i in unique_indices]
 
+    # when showing originals, drop “Real” from the generated‐images list
+    if show_originals and old_images is not None and "Real" in model_names:
+        rm = model_names.index("Real")
+        model_names.pop(rm)
+        generated_images.pop(rm)
+
     if old_images is not None:
         num_images = len(old_images)
     else:

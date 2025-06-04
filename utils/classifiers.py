@@ -49,7 +49,7 @@ class ProjectModel(nn.Module):
     def forward(self, x):
         x = self.feature_extractor(x)
         x = self.classifier(x)
-        return x
+        return torch.softmax(x)
 
 
 class NEWRustigeClassifier(nn.Module):
@@ -120,6 +120,8 @@ class NEWRustigeClassifier(nn.Module):
         x = self.softmax(x)
         return x
 
+
+#Original
 class BinaryClassifier(nn.Module):
     def __init__(self, input_shape, num_classes=2):
         super(BinaryClassifier, self).__init__()
@@ -165,7 +167,118 @@ class BinaryClassifier(nn.Module):
         self.fc1   = nn.Linear(16 * (height // 32) * (width // 32), 100)
         self.act6  = nn.LeakyReLU()
         self.num_classes = num_classes
-        self.fc2 = nn.Linear(100, 1)
+        self.fc2 = nn.Linear(100, 2)
+
+    def forward(self, x):
+        x = self.act1(self.bn1(self.conv1(x)))
+        x = self.act2(self.bn2(self.conv2(x)))
+        x = self.act3(self.bn3(self.conv3(x)))
+        x = self.act4(self.bn4(self.conv4(x)))
+        x = self.act5(self.bn5(self.conv5(x)))
+        x = x.view(x.size(0), -1)
+        x = self.act6(self.fc1(x))
+        logits = self.fc2(x)
+        # logits = sigmoid(logits)
+        return logits
+    
+
+class ResidualBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, stride=1):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1   = nn.BatchNorm2d(out_ch)
+        self.act   = nn.LeakyReLU(inplace=True)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2   = nn.BatchNorm2d(out_ch)
+        self.down = nn.Sequential()
+        if stride != 1 or in_ch != out_ch:
+            self.down = nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_ch)
+            )
+
+    def forward(self, x):
+        identity = self.down(x)
+        out = self.act(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        return self.act(out + identity)
+
+class BinaryClassifier(nn.Module):
+    def __init__(self, input_shape, num_classes=2):
+        super().__init__()
+        in_channels = input_shape[0]
+
+        self.features = nn.Sequential(
+            nn.Conv2d(in_channels, 32, kernel_size=7, stride=2, padding=3, bias=False),
+            nn.BatchNorm2d(32),
+            nn.LeakyReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
+            # Could try with convolutional layer here instead of maxpool
+            #ResidualBlock(32,  32, stride=1),
+
+            ResidualBlock(32,  64, stride=2),
+            ResidualBlock(64, 128, stride=2),
+            ResidualBlock(128,256, stride=2),
+            ResidualBlock(256,256, stride=2),
+        )
+
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.dropout = nn.Dropout(p=0.5)
+        self.fc      = nn.Linear(256, 2)
+
+    def forward(self, x):
+        x = self.features(x)
+        x = self.gap(x).view(x.size(0), -1)
+        x = self.dropout(x)
+        return self.fc(x)
+
+
+"""
+class BinaryClassifier(nn.Module):
+    def __init__(self, input_shape, num_classes=2):
+        super(BinaryClassifier, self).__init__()
+
+        # Parse (channels, height, width) from input_shape
+        in_channels = input_shape[0]
+        height = input_shape[1]
+        width = input_shape[2]
+
+        # Convolutional block 1
+        self.conv1 = nn.Conv2d(
+            in_channels=in_channels, 
+            out_channels=32, 
+            kernel_size=3, 
+            stride=2, 
+            padding=1
+        )
+        self.bn1 = nn.BatchNorm2d(32)    
+        self.act1 = nn.LeakyReLU()
+        
+        # Convolutional block 2
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1)
+        self.bn2 = nn.BatchNorm2d(64)
+        self.act2 = nn.LeakyReLU()
+        
+        # Convolutional block 3
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1)
+        self.bn3 = nn.BatchNorm2d(128)
+        self.act3 = nn.LeakyReLU()
+        
+        # Convolutional block 4
+        self.conv4 = nn.Conv2d(128, 64, kernel_size=3, stride=2, padding=1)
+        self.bn4 = nn.BatchNorm2d(64)
+        self.act4 = nn.LeakyReLU()
+        
+        # Convolutional block 5
+        self.conv5 = nn.Conv2d(64, 32, kernel_size=2, stride=2)
+        self.bn5 = nn.BatchNorm2d(32)
+        self.act5 = nn.LeakyReLU()
+        
+        # Fully connected layers
+        # For (1, 128, 128) input, final size is (16, 4, 4) => 16 * 4 * 4 = 256
+        self.fc1 = nn.Linear(32 * (height // 32) * (width // 32), 100)
+        self.act6  = nn.LeakyReLU()
+        self.fc2 = nn.Linear(100, 2)
 
     def forward(self, x, activation: bool = False):
         x = self.act1(self.bn1(self.conv1(x)))
@@ -176,147 +289,38 @@ class BinaryClassifier(nn.Module):
         x = x.view(x.size(0), -1)
         x = self.act6(self.fc1(x))
         logits = self.fc2(x)
-        return logits.squeeze(1)
-    
+        return logits
 
-if False:
-    class ResidualBlock(nn.Module):
-        def __init__(self, in_ch, out_ch, stride=1):
-            super().__init__()
-            self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=stride, padding=1, bias=False)
-            self.bn1   = nn.BatchNorm2d(out_ch)
-            self.act   = nn.LeakyReLU(inplace=True)
-            self.conv2 = nn.Conv2d(out_ch, out_ch, kernel_size=3, stride=1, padding=1, bias=False)
-            self.bn2   = nn.BatchNorm2d(out_ch)
-            self.down = nn.Sequential()
-            if stride != 1 or in_ch != out_ch:
-                self.down = nn.Sequential(
-                    nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=stride, bias=False),
-                    nn.BatchNorm2d(out_ch)
-                )
+class BinaryClassifier(nn.Module):
+    def __init__(self, input_shape):
+        super(BinaryClassifier, self).__init__()
+        in_channels = input_shape[0]  # should be 1 for grayscale
 
-        def forward(self, x):
-            identity = self.down(x)
-            out = self.act(self.bn1(self.conv1(x)))
-            out = self.bn2(self.conv2(out))
-            return self.act(out + identity)
-    
-    class BinaryClassifier(nn.Module):
-        def __init__(self, input_shape, num_classes=2):
-            super().__init__()
-            in_channels = input_shape[0]
+        self.conv_layers = nn.Sequential(
+            nn.Conv2d(in_channels, 32, kernel_size=7, stride=2, padding=3),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2),
 
-            self.features = nn.Sequential(
-                nn.Conv2d(in_channels, 32, kernel_size=7, stride=2, padding=3, bias=False),
-                nn.BatchNorm2d(32),
-                nn.LeakyReLU(inplace=True),
-                nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
+            nn.Conv2d(32, 64, kernel_size=5, stride=2, padding=2),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2),
 
-                ResidualBlock(32,  64, stride=2),
-                ResidualBlock(64, 128, stride=2),
-                ResidualBlock(128,256, stride=2),
-                ResidualBlock(256,256, stride=2),
-            )
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            # collapse spatial dims to 1×1
+            nn.AdaptiveAvgPool2d((1, 1))
+        )
 
-            self.gap = nn.AdaptiveAvgPool2d(1)
-            self.fc  = nn.Linear(256, 1)
+        self.classifier = nn.Linear(128, 1)
 
-        def forward(self, x):
-            x = self.features(x)
-            x = self.gap(x).view(x.size(0), -1)
-            return self.fc(x)
-
-else: 
-    if False:
-        class BinaryClassifier(nn.Module):
-            def __init__(self, input_shape, num_classes=2):
-                super(BinaryClassifier, self).__init__()
-
-                # Parse (channels, height, width) from input_shape
-                in_channels = input_shape[0]
-                height = input_shape[1]
-                width = input_shape[2]
-
-                # Convolutional block 1
-                self.conv1 = nn.Conv2d(
-                    in_channels=in_channels, 
-                    out_channels=32, 
-                    kernel_size=3, 
-                    stride=2, 
-                    padding=1
-                )
-                self.bn1 = nn.BatchNorm2d(32)    
-                self.act1 = nn.LeakyReLU()
-                
-                # Convolutional block 2
-                self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1)
-                self.bn2 = nn.BatchNorm2d(64)
-                self.act2 = nn.LeakyReLU()
-                
-                # Convolutional block 3
-                self.conv3 = nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1)
-                self.bn3 = nn.BatchNorm2d(128)
-                self.act3 = nn.LeakyReLU()
-                
-                # Convolutional block 4
-                self.conv4 = nn.Conv2d(128, 64, kernel_size=3, stride=2, padding=1)
-                self.bn4 = nn.BatchNorm2d(64)
-                self.act4 = nn.LeakyReLU()
-                
-                # Convolutional block 5
-                self.conv5 = nn.Conv2d(64, 32, kernel_size=2, stride=2)
-                self.bn5 = nn.BatchNorm2d(32)
-                self.act5 = nn.LeakyReLU()
-                
-                # Fully connected layers
-                # For (1, 128, 128) input, final size is (16, 4, 4) => 16 * 4 * 4 = 256
-                self.fc1 = nn.Linear(32 * (height // 32) * (width // 32), 100)
-                self.act6  = nn.LeakyReLU()
-                self.num_classes = num_classes
-                self.fc2 = nn.Linear(100, 1)
-
-            def forward(self, x, activation: bool = False):
-                x = self.act1(self.bn1(self.conv1(x)))
-                x = self.act2(self.bn2(self.conv2(x)))
-                x = self.act3(self.bn3(self.conv3(x)))
-                x = self.act4(self.bn4(self.conv4(x)))
-                x = self.act5(self.bn5(self.conv5(x)))
-                x = x.view(x.size(0), -1)
-                x = self.act6(self.fc1(x))
-                logits = self.fc2(x)
-                return logits.squeeze(1)
-    else:
-
-        class BinaryClassifier(nn.Module):
-            def __init__(self, input_shape):
-                super(BinaryClassifier, self).__init__()
-                in_channels = input_shape[0]  # should be 1 for grayscale
-
-                self.conv_layers = nn.Sequential(
-                    nn.Conv2d(in_channels, 32, kernel_size=7, stride=2, padding=3),
-                    nn.BatchNorm2d(32),
-                    nn.ReLU(inplace=True),
-                    nn.MaxPool2d(kernel_size=2),
-
-                    nn.Conv2d(32, 64, kernel_size=5, stride=2, padding=2),
-                    nn.BatchNorm2d(64),
-                    nn.ReLU(inplace=True),
-                    nn.MaxPool2d(kernel_size=2),
-
-                    nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
-                    nn.BatchNorm2d(128),
-                    nn.ReLU(inplace=True),
-                    # collapse spatial dims to 1×1
-                    nn.AdaptiveAvgPool2d((1, 1))
-                )
-
-                self.classifier = nn.Linear(128, 1)
-
-            def forward(self, x):
-                x = self.conv_layers(x)                 # [B,128,1,1]
-                x = x.view(x.size(0), -1)               # [B,128]
-                return self.classifier(x)               # [B,1]
-
+    def forward(self, x):
+        x = self.conv_layers(x)                 # [B,128,1,1]
+        x = x.view(x.size(0), -1)               # [B,128]
+        return self.classifier(x)               # [B,1]
+"""
 
 class RustigeClassifier(nn.Module):
     def __init__(self, input_shape, num_classes=4):
@@ -365,7 +369,7 @@ class RustigeClassifier(nn.Module):
         self.num_classes = num_classes
         self.fc2 = nn.Linear(100, num_classes)
 
-    def forward(self, x, activation: bool = False):
+    def forward(self, x):
         x = self.act1(self.ln1(self.conv1(x)))
         x = self.act2(self.ln2(self.conv2(x)))
         x = self.act3(self.ln3(self.conv3(x)))
@@ -374,8 +378,9 @@ class RustigeClassifier(nn.Module):
         x = x.view(x.size(0), -1)
         x = self.act6(self.fc1(x))
         logits = self.fc2(x)
-        return logits
-
+        return torch.softmax(logits, dim=1)
+#(Tensor input, int dim, torch.dtype dtype = None, *, Tensor out = None)
+# * (Tensor input, name dim, *, torch.dtype dtype = None)
 
 
 # DANN classifier
@@ -419,6 +424,7 @@ class DANNClassifier(nn.Module):
         domain_logits = self.domain_head(dom_feat)       # [B,2]
         return class_logits, domain_logits
 
+
 # Scattering classifier
 class MLPClassifier(nn.Module):
     def __init__(self, input_dim, num_classes=4, hidden_dim=120):
@@ -430,7 +436,7 @@ class MLPClassifier(nn.Module):
         self.fc3 = nn.Linear(fc2_dim, num_classes)
         self.relu = nn.ReLU(inplace=True)
         self.dropout = nn.Dropout(0.5)
-        self.sigmoid = nn.Sigmoid()
+        #self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
         x = x.view(x.size(0), -1)  # Flatten input if necessary
@@ -440,10 +446,8 @@ class MLPClassifier(nn.Module):
         x = self.relu(x)
         x = self.dropout(x)
         x = self.fc3(x)
-        x = self.sigmoid(x)
-        return x
-
-
+        #x = self.sigmoid(x)
+        return torch.softmax(x)
 
 
 class DualClassifier(nn.Module):
@@ -576,3 +580,160 @@ class DualClassifier(nn.Module):
         logits = self.FC_classifier(h)
         return logits
 
+class ScatterResNet(nn.Module):
+    def __init__(self, scat_shape, num_classes=2):
+        super().__init__()
+        # scat_shape is (C_s, H_s, W_s)
+        in_ch = scat_shape[0]
+        self.features = nn.Sequential(
+            ResidualBlock(in_ch,  32, stride=1),
+            ResidualBlock(32,  64, stride=2),
+            ResidualBlock(64, 128, stride=2),
+            ResidualBlock(128,256, stride=2),
+        )
+        self.gap     = nn.AdaptiveAvgPool2d(1)
+        self.dropout = nn.Dropout(p=0.5)
+        self.fc      = nn.Linear(256, num_classes)
+
+    def forward(self, scat):
+        # scat: scattering coefficients [B, C_s, H_s, W_s]
+        x = self.features(scat)
+        x = self.gap(x).view(x.size(0), -1)
+        x = self.dropout(x)
+        return self.fc(x)
+
+
+
+class SEBlock(nn.Module):
+    """
+    Squeeze-and-Excitation block for channel-wise attention.
+    """
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Conv2d(channels, channels // reduction, 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // reduction, channels, 1, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        return x * self.fc(self.pool(x))
+
+
+
+class ScatterSqueezeNet(nn.Module):
+    def __init__(self, img_shape, scat_shape, num_classes,
+                 hidden_dim1=256, hidden_dim2=128, classifier_hidden_dim=256,
+                 dropout_rate=0.3, J=2):
+        super(ScatterSqueezeNet, self).__init__()
+        C_img, H_img, W_img = img_shape
+        C_scat, H_scat, W_scat = scat_shape
+
+        # ----------------------
+        # Image Branch Encoder (same as DualClassifier)
+        # ----------------------
+        self.cnn_encoder = nn.Sequential(
+            nn.Conv2d(C_img, 32, kernel_size=5, stride=1, padding=2, bias=True),
+            nn.BatchNorm2d(32),
+            nn.LeakyReLU(0.2),
+            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.BatchNorm2d(64),
+            nn.LeakyReLU(0.2),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Conv2d(64, 128, kernel_size=5, stride=1, padding=2, bias=True),
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(0.2)
+        )
+        self.conv_to_latent_img = nn.Sequential(
+            nn.Conv2d(128, 128, kernel_size=3, stride=2, padding=1, bias=True),
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(0.2),
+            nn.Conv2d(128, 128, kernel_size=3, stride=2, padding=1, bias=True),
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(0.2),
+            nn.Conv2d(128, 128, kernel_size=3, stride=2, padding=1, bias=True),
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(0.2),
+            nn.Conv2d(128, 128, kernel_size=3, stride=2, padding=1, bias=True),
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(0.2)
+        )
+
+        # -------------------------------
+        # Scattering Branch with SE attention
+        # -------------------------------
+        def conv_block(in_ch, out_ch, k, s, p):
+            return nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, k, stride=s, padding=p, bias=True),
+                nn.BatchNorm2d(out_ch),
+                nn.LeakyReLU(0.2)
+            )
+
+        # Determine number of downsampling stages
+        if J == 4:
+            downsample_blocks = 1
+        elif J == 3:
+            downsample_blocks = 2
+        elif J == 2:
+            downsample_blocks = 3
+        elif J == 1:
+            downsample_blocks = 4
+        else:
+            raise ValueError("J must be 1, 2, 3, or 4")
+
+        # Build scattering branch with SE blocks
+        scat_blocks = []
+        # initial conv + SE
+        scat_blocks.append(conv_block(C_scat, hidden_dim2, 3, 1, 1))
+        scat_blocks.append(SEBlock(hidden_dim2))
+        # repeated downsampling + SE
+        for _ in range(downsample_blocks):
+            scat_blocks.append(conv_block(hidden_dim2, hidden_dim2, 3, 1, 1))
+            scat_blocks.append(SEBlock(hidden_dim2))
+            scat_blocks.append(conv_block(hidden_dim2, hidden_dim2, 3, 2, 1))
+            scat_blocks.append(SEBlock(hidden_dim2))
+
+        self.conv_to_latent_scat = nn.Sequential(*scat_blocks)
+
+        # ---------------------------
+        # Compute combined feature size
+        # ---------------------------
+        with torch.no_grad():
+            dummy_img  = torch.zeros(1, C_img, H_img, W_img)
+            dummy_scat = torch.zeros(1, C_scat, H_scat, W_scat)
+            img_f = self.cnn_encoder(dummy_img)
+            img_f = self.conv_to_latent_img(img_f)
+            scat_f = self.conv_to_latent_scat(dummy_scat)
+            img_dim  = img_f.view(1, -1).size(1)
+            scat_dim = scat_f.view(1, -1).size(1)
+            combined_dim = img_dim + scat_dim
+
+        # ----------------------
+        # Classifier Head
+        # ----------------------
+        self.FC_input       = nn.Linear(combined_dim, hidden_dim1)
+        self.bn1            = nn.BatchNorm1d(hidden_dim1)
+        self.FC_hidden      = nn.Linear(hidden_dim1, classifier_hidden_dim)
+        self.bn2            = nn.BatchNorm1d(classifier_hidden_dim)
+        self.FC_classifier  = nn.Linear(classifier_hidden_dim, num_classes)
+        self.act            = nn.LeakyReLU(0.2)
+        self.dropout        = nn.Dropout(dropout_rate)
+
+    def forward(self, img, scat):
+        # Image path
+        x_img = self.cnn_encoder(img)
+        x_img = self.conv_to_latent_img(x_img)
+        # Scattering path
+        x_scat = self.conv_to_latent_scat(scat)
+        # Flatten and concat
+        x_img = x_img.view(x_img.size(0), -1)
+        x_scat = x_scat.view(x_scat.size(0), -1)
+        x = torch.cat([x_img, x_scat], dim=1)
+        # MLP head
+        x = self.act(self.bn1(self.FC_input(x)))
+        x = self.dropout(x)
+        x = self.act(self.bn2(self.FC_hidden(x)))
+        x = self.dropout(x)
+        return self.FC_classifier(x)
