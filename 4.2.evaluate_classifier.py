@@ -30,17 +30,17 @@ np.random.seed(seed)
 ###############################################
 
 FILTERED = True       # Evaluation with filtered data (REMOVEOUTLIERS = True)
-TRAINONGENERATED = True # Use generated data as testdata
+TRAINONGENERATED = False # Use generated data as testdata
 
 classes = get_classes()
-galaxy_classes = [10, 11, 12, 13]
+galaxy_classes = [50, 51] # e.g., [10, 11, 12, 13] for FRI, FRII, Compact, Bent
 learning_rates = [1e-3]
 regularization_params = [1e-3]
-lambda_values = [0, 0.25, 0.5, 1]
+lambda_values = [0]
 num_experiments = 5
 folds = [5] # Number of folds for cross-validation
-generators = ['wGAN']
-classifier = ["ProjectModel", "Rustige", "DANN", "ScatterNet", "ScatterDual", "Binary", "ScatterResNet"][1]
+generators = ['DDPM']
+classifier = ["TinyCNN", "Rustige", "SCNN", "CNNSqueezeNet", "DualCNNSqueezeNet", "CloudNet", "DANN", "ScatterNet", "ScatterDual", "ScatterSqueezeNet2", "Binary", "ScatterResNet"][-3]
 print("Classifier:", classifier)
 
 # -------------------------- NEW GAN CONFIGURATION --------------------------
@@ -70,6 +70,12 @@ colors = {
     'GAN': '#D55E00'         # vermillion
 }
 
+# Define colormaps for visualization
+cmap_green = LinearSegmentedColormap.from_list( 
+    'white_to_green',
+    ['white', '#006400']
+)
+
 ###############################################
 ######### SETTING THE RIGHT PARAMETERS ########
 ###############################################
@@ -86,7 +92,8 @@ elif galaxy_classes == [50, 51]:
     if TRAINONGENERATED:
         dataset_sizes = [[1600, 8000, 16000], [1600, 8000, 16000], [1600, 8000, 16000], [1600, 8000, 16000], [1600, 8000, 16000],  [1600, 8000, 16000]]
     else:
-        dataset_sizes = [[121, 608, 1216], [121, 608, 1216], [121, 608, 1216], [121, 608, 1216], [121, 608, 1216], [121, 608, 1216]]
+        #dataset_sizes = [[121, 608, 1216], [121, 608, 1216], [121, 608, 1216], [121, 608, 1216], [121, 608, 1216], [121, 608, 1216]]
+        dataset_sizes = [[121, 1216], [121, 1216], [121, 1216], [121, 1216], [121, 1216], [121, 1216]]
 elif galaxy_classes == [11, 12]:
     dataset_sizes = [[885, 4428, 8856], [885, 4428, 8856], [885, 4428, 8856], [885, 4428, 8856], [885, 4428, 8856], [885, 4428, 8856]]
 elif galaxy_classes == [10, 11, 12, 13]:
@@ -95,7 +102,9 @@ elif galaxy_classes == [10, 11, 12, 13]:
             if TRAINONGENERATED:
                 dataset_sizes = [[1391, 6956, 13912], [1391, 6956, 13912], [1391, 6956, 13912], [1391, 6956, 13912], [1391, 6956, 13912], [1391, 6956, 13912]]
             else:
-                dataset_sizes = [[1393, 6968, 13936], [1393, 6968, 13936], [1393, 6968, 13936], [1393, 6968, 13936], [1393, 6968, 13936], [1393, 6968, 13936]]
+                #dataset_sizes = [[1393, 6968, 13936], [1393, 6968, 13936], [1393, 6968, 13936], [1393, 6968, 13936], [1393, 6968, 13936], [1393, 6968, 13936]]
+                dataset_sizes = [[1393, 13936], [1393, 13936], [1393, 13936], [1393, 13936], [1393, 13936], [1393, 13936]]
+                #dataset_sizes = [[5574, 55744], [5574, 55744], [5574, 55744], [5574, 55744], [5574, 55744], [5574, 55744]] # When translations are used
             #dataset_sizes = [[123, 1236, 12368], [123, 1233, 12336], [123, 1236, 12368], [123, 1236, 12368], [123, 1236, 12368]] 
             #dataset_sizes = [[200], [200], [200], [200], [200], [200]]
         else:
@@ -744,9 +753,11 @@ def plot_diff_avg_std_confusion_matrix(metrics, generators, metric_stats,
             save_path = f"{save_dir}/{galaxy_classes}_{classifier}_{generator}_{merged_size}_{lr}_{reg}_{lambda_vals[1]}-{lambda_vals[0]}_diff_confusion_matrix.png"
             plt.savefig(save_path)
             plt.close(fig)
+            print("Saved difference in average confusion matrix to", save_path)
 
 
 def plot_avg_std_confusion_matrix(metrics, generators, metric_stats, merge_map={249: "250", 250: "250", 2492: "2500", 2505: "2500", 24928: "25000", 25056: "25000"}, save_dir='./classifier'):
+    
     for generator in generators:
         for lr, reg, lambda_generate in itertools.product(learning_rates, regularization_params, lambda_values):
             subset_conf_matrices = {}
@@ -792,26 +803,28 @@ def plot_avg_std_confusion_matrix(metrics, generators, metric_stats, merge_map={
                     avg_cm,
                     annot=ann,
                     fmt="",
-                    cmap="Blues",
+                    #cmap="Blues",
+                    cmap=cmap_green,
                     xticklabels=present_descriptions,
                     yticklabels=present_descriptions,
-                    annot_kws={"fontsize": 18},
+                    annot_kws={"fontsize": 22},
                     ax=ax
                 )
                 # increase tick‐label font size
-                ax.set_xticklabels(ax.get_xticklabels(), fontsize=18, rotation=0, ha="right")
-                ax.set_yticklabels(ax.get_yticklabels(), fontsize=18, rotation=90)
-                ax.set_xlabel("Predicted Label", fontsize=20)
-                ax.set_ylabel("True Label", fontsize=20)
+                ax.set_xticklabels(ax.get_xticklabels(), fontsize=20, rotation=0, ha="right")
+                ax.set_yticklabels(ax.get_yticklabels(), fontsize=20, rotation=90)
+                ax.set_xlabel("Predicted Label", fontsize=22)
+                ax.set_ylabel("True Label", fontsize=22)
                 ax.set_title(f"Average Accuracy: {mean_value:.2f} ± {std_dev:.2f}", fontsize=24)
                 
                 cbar = ax.collections[0].colorbar
-                cbar.ax.tick_params(labelsize=18)
+                cbar.ax.tick_params(labelsize=20)
 
                 os.makedirs(save_dir, exist_ok=True)
                 save_path = f"{save_dir}/{galaxy_classes}_{classifier}_{generator}_{subset_size}_{lr}_{reg}_{lambda_generate}_avg_confusion_matrix.png"
                 plt.savefig(save_path)
                 plt.close(fig)
+                print(f"Saved average confusion matrix to {save_path}")
 
 
 def plot_confusion_matrix(metrics, generators, dataset_sizes=dataset_sizes,  folds= folds, num_experiments=num_experiments, 
@@ -833,7 +846,7 @@ def plot_confusion_matrix(metrics, generators, dataset_sizes=dataset_sizes,  fol
                     continue
                 cm = confusion_matrix(true_labels, pred_labels, normalize='true')
                 fig, ax = plt.subplots(figsize=(6, 5))
-                sns.heatmap(cm, annot=True, fmt=".1%", linewidths=.5, square=True, cmap='Blues', ax=ax,
+                sns.heatmap(cm, annot=True, fmt=".1%", linewidths=.5, square=True, cmap=cmap_green, ax=ax,
                             xticklabels=class_descriptions, yticklabels=class_descriptions, annot_kws={"size": 16})
                 colorbar = ax.collections[0].colorbar
                 colorbar.ax.tick_params(labelsize=16)
@@ -1316,14 +1329,14 @@ if any(lam > 0 for lam in lambda_values):
         )
 
         plot_overlap_image_grids(model, real_loader, gen_loader, device=device)
-
-plot_loss(generators, history=history)
-#plot_roc_curves(metrics, generators)
-plot_avg_roc_curves(metrics, generators, merge_map=merge_map)
-plot_all_metrics_vs_dataset_size(metrics, generators, merge_map=merge_map)
-plot_accuracy_vs_lambda(lambda_values, metrics, generators)
-#plot_confusion_matrix(metrics, generators)
+#
+#plot_loss(generators, history=history)
+##plot_roc_curves(metrics, generators)
+#plot_avg_roc_curves(metrics, generators, merge_map=merge_map)
+#plot_all_metrics_vs_dataset_size(metrics, generators, merge_map=merge_map)
+#plot_accuracy_vs_lambda(lambda_values, metrics, generators)
+##plot_confusion_matrix(metrics, generators)
 plot_avg_std_confusion_matrix(metrics, generators, metric_stats=metrics_last, merge_map=merge_map)
-plot_diff_avg_std_confusion_matrix(metrics, generators, metric_stats=metrics_last, merge_map=merge_map)
+#plot_diff_avg_std_confusion_matrix(metrics, generators, metric_stats=metrics_last, merge_map=merge_map)
 
 print("Script finished successfully!")

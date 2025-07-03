@@ -85,8 +85,17 @@ def plot_image_grid(images, num_images=36, save_path="grid.png"):
         if idx >= num_images or idx >= len(images):
             break
         # If images are [N, 1, H, W], call .squeeze() to remove the extra dimension
-        ax.imshow(images[idx].squeeze(), cmap='gray')
+        #ax.imshow(images[idx].squeeze(), cmap='gray')
+        #ax.axis('off')
+        
+        # select the cube
+        img = images[idx].cpu().numpy()
+        # if it’s C×H×W, average down to H×W for display
+        if img.ndim == 3:
+            img = img.mean(axis=0)
+        ax.imshow(img, cmap='gray')
         ax.axis('off')
+
 
     plt.tight_layout()
     plt.savefig(save_path)
@@ -259,8 +268,15 @@ def plot_background_histogram(orig_imgs, gen_imgs, img_shape=(1, 128, 128), titl
     def total_background(images):
         sums = []
         for im in images.cpu().numpy():
-            im = im.squeeze()           # shape (H, W)
-            sums.append(im[bkg_mask].sum())
+            print("shape of image in total_background: ", im.shape)
+            im = im.reshape(h, w)       # enforce 2D (H, W)
+            print("shape of image after reshape: ", im.shape)
+            if im.ndim == 3:
+                # stack the 2D mask into a (C, H, W) boolean array
+                mask3d = np.stack([bkg_mask] * im.shape[0], axis=0)
+                sums.append((im * mask3d).sum())
+            else:
+                sums.append(im[bkg_mask].sum())
         return sums
 
     # compute for one class (you can loop over classes as needed)

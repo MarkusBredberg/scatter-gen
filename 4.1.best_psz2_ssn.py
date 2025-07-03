@@ -1,12 +1,12 @@
 import numpy as np
-import torch, math, time, random
+import torch
+import time
 import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader, Subset, Dataset
 from torchsummary import summary
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score 
-from utils.data_loader import load_galaxies, get_classes,  get_synthetic, augment_images
-from utils.classifiers import RustigeClassifier, TinyCNN, MLPClassifier, SCNN, CNNSqueezeNet, ScatterResNet, DANNClassifier, BinaryClassifier, ScatterSqueezeNet, ScatterSqueezeNet2, DualCNNSqueezeNet
-#from utils.Cloud_Net import CloudNet
+from utils.data_loader2 import load_galaxies, get_classes,  get_synthetic, augment_images
+from utils.classifiers import RustigeClassifier, MLPClassifier, DualClassifier, ScatterResNet, DANNClassifier, BinaryClassifier, ScatterSqueezeNet
 from utils.training_tools import EarlyStopping, reset_weights
 from utils.calc_tools import cluster_metrics, normalise_images
 from utils.plotting import plot_histograms, plot_images_by_class, plot_image_grid, plot_background_histogram
@@ -17,27 +17,13 @@ from tqdm import tqdm
 from torch.optim import AdamW
 import itertools
 import matplotlib 
-import sys, os
-
-SEED = 42  # Set a seed for reproducibility
-def set_seed(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    # make cuDNN deterministic (may slow a bit)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-set_seed(SEED)
-
-
+import os
 os.makedirs('./classifier/trained_models', exist_ok=True)
 os.makedirs('./classifier/trained_models_filtered', exist_ok=True)
 matplotlib.use('Agg')
 tqdm.pandas(disable=True)
 
-print("Running script 4.1 Latest version with seed", SEED)
+print("Running script 4.1")
 
 #Update the classifiers so that they are okay for just two classes
 #EDIT: Allow for max_num_galaxies as None
@@ -51,26 +37,19 @@ galaxy_classes = [50, 51]  # Classes to classify
 max_num_galaxies = 1000000  # Upper limit for the all-classes combined training data before classical augmentation
 dataset_portions = [0.1, 1]  # Portions of complete dataset for the accuracy vs dataset size
 J, L, order = 2, 12, 2  # Scatter transform parameters
-classifier = ["TinyCNN", # Very Simple CNN
-              "Rustige", # Simple CNN from Rustige et al. 2023, https://github.com/floriangriese/wGAN-supported-augmentation/blob/main/src/Classifiers/SimpleClassifiers/Classifiers.py
-              "SCNN", # Simple CNN similar to Rustige's
-              "CNNSqueezeNet", # SCNN with Squeeze-and-Excitation blocks
-              "DualCNNSqueezeNet", # Dual CNN with Squeeze-and-Excitation blocks
-              "CloudNet", # From https://github.com/SorourMo/Cloud-Net-A-semantic-segmentation-CNN-for-cloud-detection/tree/master
-              "DANN", # Domain-Adversarial Neural Network
-              "ScatterNet", "ScatterSqueezeNet", "ScatterSqueezeNet2",
-              "Binary", "ScatterResNet"][-3]
-gen_model_names = ['DDPM'] #['ST', 'DDPM', 'wGAN', 'GAN', 'Dual', 'CNN', 'STMLP', 'lavgSTMLP', 'ldiffSTMLP'] # Specify the generative model_name
+classifier = ["ProjectModel", "Rustige", "DANN", "ScatterNet", "ScatterDual", "Binary", "ScatterResNet"][-3]
+gen_model_names = ['DDPM'] #['GAN', 'Dual', 'CNN', 'STMLP', 'lavgSTMLP', 'ldiffSTMLP'] # Specify the generative model_name
 num_epochs_cuda = 200
 num_epochs_cpu = 100
+batch_size = 16
 learning_rates = [1e-3]  # Learning rates
 regularization_params = [1e-3]  # Regularisation parameters
 label_smoothing = 0.2  # Label smoothing for the classifier
+img_shape = (1, 128, 128)
 num_experiments = 5
 folds = [5] # 0-4 for 5-fold cross validation, 5 for only one training
 lambda_values = [0]  # Ratio between generated images and original images per class. 8 is reserfved for TRAINONGENERATED
 
-STRETCH = True  # Stretch the images with mathematical morphology
 ES, patience = True, 10  # Use early stopping
 SHOWIMGS = True  # Show some generated images for each class (Tool for control)
 NORMALISEIMGS = False  # Normalise images to [0, 1]
@@ -110,21 +89,20 @@ forbidden_classes = 12  # Generated bent sources look awful
 if any (cls in galaxy_classes for cls in [10, 11, 12, 13]):
     crop_size = (128, 128)  # Crop size for the images
     downsample_size = (128, 128)  # Downsample size for the images
-    batch_size = 128
 elif galaxy_classes == [40, 41]:
-    crop_size = (1600, 1600)  # Crop size for the images
+    crop_size = crop_size = (1600, 1600)  # Crop size for the images
     downsample_size = (128, 128)  # Downsample size for the images
-    batch_size = 16
 elif galaxy_classes == [50, 51]:
-    crop_size = (4, 369, 369)  # Crop size for the images
-    downsample_size = (4, 369, 369)  # Downsample size for the images
-    batch_size = 16 
-
-img_shape = downsample_size
+    crop_size = crop_size = (128, 128)  # Crop size for the images
+    downsample_size = (128, 128)  # Downsample size for the images
 
 if TRAINONGENERATED:
     lambda_values = [8]  # To identify and distinguish TRAINONGENERATED from other runs
     print("Using generated data for testing.")
+
+SEED = 42
+np.random.seed(SEED)
+torch.manual_seed(SEED)
 
 if torch.cuda.is_available():
     DEVICE = "cuda"
@@ -216,20 +194,7 @@ def compute_scattering_coeffs(images, scattering=scattering, batch_size=128, dev
     with torch.no_grad():
         for i in range(0, len(images), batch_size):
             batch = images[i:i + batch_size].to(device)
-            if img_shape[0] == 1:  # If images are grayscale, add a channel dimension
-                batch_scat = scattering(batch).detach()  # e.g. shape [B, 1, C, H, W]
-            else:
-                #scat_channels = [scattering(batch[:, i:i+1, :, :]).detach() for i in range(batch.shape[1])]
-                # ensure the whole batch is contiguous
-                batch = batch.contiguous()
-                # and each channel‐slice, too
-                scat_channels = [
-                    scattering(batch[:, i:i+1, :, :].contiguous()).detach()
-                    for i in range(batch.shape[1])
-                ]
-
-                batch_scat = torch.cat(scat_channels, dim=1)
-
+            batch_scat = scattering(batch).detach()  # e.g. shape [B, 1, C, H, W]
             # Squeeze out the singleton dimension at index 1 if present.
             if batch_scat.shape[1] == 1:
                 batch_scat = batch_scat.squeeze(1)  # becomes [B, C, H, W]
@@ -341,25 +306,6 @@ def filter_generated_images(generated_images_list, generated_labels_list):
 
     return filtered_images_list, filtered_labels_list
 
-def check_tensor(name, tensor):
-        # skip completely empty tensors
-        if tensor.numel() == 0:
-            print(f"Warning: {name} is empty, skipping stats.")
-            return
-
-        if torch.isnan(tensor).any():
-            print(f"Warning: {name} contains NaNs")
-        if torch.isinf(tensor).any():
-            print(f"Warning: {name} contains Infs")
-        if tensor.is_floating_point():
-            print(f"{name} stats: min={tensor.min().item():.3f}, "
-                f"max={tensor.max().item():.3f}, "
-                f"mean={tensor.mean().item():.3f}, "
-                f"std={tensor.std().item():.3f}")
-        else:
-            vals, counts = torch.unique(tensor, return_counts=True)
-            print(f"{name} unique values: {vals.tolist()}, counts: {counts.tolist()}")
-
 
 ###############################################
 ########### READ IN TEST DATA #################
@@ -378,8 +324,7 @@ for gen_model_name in gen_model_names:
     hidden_dim1 = 256
     hidden_dim2 = 128
     vae_latent_dim = 64
-    
-    print("crop_size: ", crop_size)
+
     train_imgs, train_lbls, test_images, test_labels  = load_galaxies(galaxy_class=galaxy_classes, 
                 fold=max(folds), #Any fold other than 5 gives me the test data for the five fold cross validation
                 crop_size=crop_size,
@@ -391,6 +336,26 @@ for gen_model_name in gen_model_names:
     
     # ——— Data sanity checks ———
     print("Shape of test_images: ", np.shape(test_images))
+    
+    def check_tensor(name, tensor):
+        # skip completely empty tensors
+        if tensor.numel() == 0:
+            print(f"Warning: {name} is empty, skipping stats.")
+            return
+
+        if torch.isnan(tensor).any():
+            print(f"Warning: {name} contains NaNs")
+        if torch.isinf(tensor).any():
+            print(f"Warning: {name} contains Infs")
+        if tensor.is_floating_point():
+            print(f"{name} stats: min={tensor.min().item():.3f}, "
+                f"max={tensor.max().item():.3f}, "
+                f"mean={tensor.mean().item():.3f}, "
+                f"std={tensor.std().item():.3f}")
+        else:
+            vals, counts = torch.unique(tensor, return_counts=True)
+            print(f"{name} unique values: {vals.tolist()}, counts: {counts.tolist()}")
+
             
     check_tensor("Test images", test_images)
     check_tensor("Train images", train_imgs)
@@ -426,23 +391,15 @@ for gen_model_name in gen_model_names:
     unique_labels, counts = torch.unique(test_labels, return_counts=True)
     print("Test labels distribution (raw):", dict(zip(unique_labels.tolist(), counts.tolist())))
     
-    if STRETCH:
-        check_tensor("Test images before stretch", test_images)
-        asinhalpha = 10
-        #test_images = torch.log1p(test_images) /math.log(2)  # Log stretch to [0, 1]
-        #test_images = torch.sqrt(test_images) 
-        #test_images = test_images.pow(1/3)
-        test_images = torch.asinh(asinhalpha * test_images) / math.asinh(asinhalpha)
-        check_tensor("Test images after stretch", test_images)
-    
-    if NORMALISEIMGS or NORMALISEIMGSTOPM:
-        if NORMALISEIMGSTOPM:
-            test_images = normalise_images(test_images, -1, 1)
-        else:
-            test_images = normalise_images(test_images, 0, 1)
+    if classifier in ['ProjectModel', 'Rustige', 'ScatterDual', 'Binary']:
+        if NORMALISEIMGS or NORMALISEIMGSTOPM:
+            if NORMALISEIMGSTOPM:
+                test_images = normalise_images(test_images, -1, 1)
+            else:
+                test_images = normalise_images(test_images, 0, 1)
 
     # Handle scattering coefficients normalization in a similar way
-    if classifier in ['ScatterNet', 'ScatterSqueezeNet', 'ScatterSqueezeNet2']:
+    if classifier in ['ScatterNet', 'ScatterDual']:
         if NORMALISESCS or NORMALISESCSTOPM:
             if NORMALISESCSTOPM:
                 test_scat_coeffs = normalise_images(test_scat_coeffs, -1, 1)
@@ -453,11 +410,11 @@ for gen_model_name in gen_model_names:
     # Produce an empty tensor to occupy the not used component of the datasets. 
     # It should have the same size as the test images
     mock_tensor = torch.zeros_like(test_images)
-    if classifier in ['ScatterNet', 'ScatterResNet', 'ScatterSqueezeNet', 'ScatterSqueezeNet2']:
+    if classifier in ['ScatterNet', 'ScatterResNet', 'ScatterDual']:
         test_scat_coeffs = compute_scattering_coeffs(test_images)
         if classifier in ['ScatterNet', 'ScatterResNet']:
             test_dataset = TensorDataset(mock_tensor, test_scat_coeffs, test_labels)
-        elif classifier in ['ScatterSqueezeNet', 'ScatterSqueezeNet2']:
+        elif classifier == 'ScatterDual':
             test_dataset = TensorDataset(test_images, test_scat_coeffs, test_labels)
     else: 
         test_dataset = TensorDataset(test_images, mock_tensor, test_labels) 
@@ -592,15 +549,10 @@ for gen_model_name in gen_model_names:
                 generated_by_class[cls] = generated_images.cpu()
 
                 # Append the filtered images and labels to your training data:
-                if SHOWIMGS and lambda_generate not in [0, 8]:
+                if SHOWIMGS and lambda_generate not in [0, 8]:                 
                     pristine_train_images = train_images
-                    pristine_train_labels = train_labels
-                    
-            # Check the tensor for generated images
-            for cls in galaxy_classes:
-                cls_mask = (train_labels == cls)
-                cls_images = train_images[cls_mask]
-                check_tensor(f"Generated images for class {cls} with model {gen_model_name}", cls_images)
+        
+        
         train_labels = train_labels - train_labels.min()
         
         unique_labels, counts = torch.unique(train_labels, return_counts=True)
@@ -614,7 +566,7 @@ for gen_model_name in gen_model_names:
                 idx = cls - offset
                 imgs = train_images[train_labels == idx]
                 lbls = train_labels[train_labels == idx]
-                if  cls == 10:
+                if   cls == 10:
                     imgs, lbls = imgs[:389], lbls[:389]
                 elif cls == 11:
                     imgs, lbls = imgs[:816], lbls[:816]
@@ -638,7 +590,7 @@ for gen_model_name in gen_model_names:
             
         unique_labels, counts = torch.unique(train_labels, return_counts=True)
         print("Train labels distribution (raw) after possible filtering and augmentation:", dict(zip(unique_labels.tolist(), counts.tolist())))
-
+                
         if dataset_sizes == {}:
             dataset_sizes[fold] = [int(len(train_images) * p) for p in dataset_portions]
 
@@ -647,99 +599,42 @@ for gen_model_name in gen_model_names:
         ############ NORMALISE AND PACKAGE THE INPUT #############
         ##########################################################
 
-        if classifier in ['Rustige', 'CNNSqueezeNet', 'SCNN', 'ScatterSqueezeNet', 'ScatterSqueezeNet2', 'Binary']:
+        if classifier in ['ProjectModel', 'Rustige', 'ScatterDual', 'Binary']:
             if lambda_generate not in [0, 8]:
-                # 1. concatenate images
-                img_splits = [
+                splits = [
                     pristine_train_images.to(DEVICE),
                     generated_images.to(DEVICE),
                     valid_images.to(DEVICE)
                 ]
-                img_lengths = [len(t) for t in img_splits]
-                all_images = torch.cat(img_splits, dim=0)
-
-                # 2. concatenate labels in the same order
-                lbl_splits = [
-                    pristine_train_labels.to(DEVICE),
-                    generated_labels.to(DEVICE),
-                    valid_labels.to(DEVICE)
-                ]
-                all_labels = torch.cat(lbl_splits, dim=0)
-
-                # 3. compute split boundaries once
-                boundaries = [0] + list(torch.cumsum(torch.tensor(img_lengths), dim=0).numpy())
-
-                # 4. slice images back into (pristine, generated, valid)
-                chunked_imgs = [
-                    all_images[boundaries[i]:boundaries[i+1]]
-                    for i in range(len(img_lengths))
-                ]
-                # 5. slice labels back in exactly the same way
-                chunked_lbls = [
-                    all_labels[boundaries[i]:boundaries[i+1]]
-                    for i in range(len(img_lengths))
-                ]
-
-                # 6. reassign train/valid splits
-                pristine_train_images, generated_images, valid_images = chunked_imgs
-                pristine_train_labels, generated_labels, valid_labels = chunked_lbls
-
-                # 7. rebuild train_images and train_labels without pulling validation back in
-                train_images = torch.cat([pristine_train_images, generated_images], dim=0)
-                train_labels = torch.cat([pristine_train_labels, generated_labels], dim=0)
-
+                lengths = [len(s) for s in splits]
+                all_images = torch.cat(splits, dim=0)
             else:
-                # same idea if lambda_generate == 0 (i.e. only real train+valid)
-                img_splits = [
+                splits = [
                     train_images.to(DEVICE),
                     valid_images.to(DEVICE)
                 ]
-                img_lengths = [len(t) for t in img_splits]
-                all_images = torch.cat(img_splits, dim=0)
+                lengths = [len(s) for s in splits]
+                all_images = torch.cat(splits, dim=0)
+            if NORMALISEIMGS or NORMALISEIMGSTOPM:
+                out_min, out_max = (-1, 1) if NORMALISEIMGSTOPM else (0, 1)
+                all_images = normalise_images(all_images, out_min, out_max)
 
-                lbl_splits = [
-                    train_labels.to(DEVICE),
-                    valid_labels.to(DEVICE)
-                ]
-                all_labels = torch.cat(lbl_splits, dim=0)
+            # Split back into the original groups
+            boundaries = [0] + list(torch.cumsum(torch.tensor(lengths), dim=0).numpy())
+            chunked = [
+                all_images[boundaries[i]:boundaries[i+1]]
+                for i in range(len(lengths))
+            ]
 
-                boundaries = [0] + list(torch.cumsum(torch.tensor(img_lengths), dim=0).numpy())
-                chunked_imgs = [
-                    all_images[boundaries[i]:boundaries[i+1]]
-                    for i in range(len(img_lengths))
-                ]
-                chunked_lbls = [
-                    all_labels[boundaries[i]:boundaries[i+1]]
-                    for i in range(len(img_lengths))
-                ]
-
-                train_images, valid_images = chunked_imgs
-                train_labels, valid_labels = chunked_lbls
-                        
-        print("Length of train_images before packaging: ", len(train_images))
-        print("Length of train labels before packaging: ", len(train_labels))
-        
-        if STRETCH:
-            check_tensor("Train images before stretch", train_images)
-            #train_images = torch.log1p(train_images) /math.log(2)  # Log stretch to [0, 1]
-            #train_images = torch.sqrt(train_images)
-            #train_images = train_images.pow(1/3)
-            train_images = torch.asinh(asinhalpha* train_images) / math.asinh(asinhalpha)
-            check_tensor("Train images after stretch", train_images)
-        
-        
-        # Normalise images if requested
-        if NORMALISEIMGS or NORMALISEIMGSTOPM:
-            check_tensor("Train images before normalisation", train_images)
-            if NORMALISEIMGSTOPM:
-                train_images = normalise_images(train_images, -1, 1)
+            if lambda_generate not in [0, 8]:
+                pristine_train_images, generated_images, valid_images = chunked
+                train_images = torch.cat([pristine_train_images, generated_images], dim=0)
             else:
-                train_images = normalise_images(train_images, 0, 1)
-            check_tensor("Train images after normalisation", train_images)
-            
-        
+                train_images, valid_images = chunked
+
+                        
         # ── SANITY-CHECK PLOTS ON FIRST FOLD ONLY ──
-        if fold == folds[0] and SHOWIMGS and downsample_size == (1, 128, 128):
+        if fold == folds[0] and SHOWIMGS and downsample_size != (1024, 1024):
             
             if len(galaxy_classes) == 2:
                 # Plot histograms for the two classes
@@ -762,58 +657,56 @@ for gen_model_name in gen_model_names:
                     title2=f"Class {galaxy_classes[1]}",
                     save_path=f"./classifier/{classifier}_{gen_model_name}_{galaxy_classes[0]}_{galaxy_classes[1]}_f{fold}_histogram.png"
                 )
-
                 plot_background_histogram(
-                    train_images_cls1.cpu(),        # shape (936, 1, 128, 128)
-                    train_images_cls2.cpu(),        # shape (720, 1, 128, 128)
-                    img_shape=(1, 128, 128),
+                    train_images_cls1.cpu(),
+                    train_images_cls2.cpu(),
                     title="Background histograms",
-                    save_path=f"./classifier/{classifier}_{gen_model_name}_{galaxy_classes[0]}_{galaxy_classes[1]}_f{fold}_background_hist.png"
+                    save_path=(
+                        f"./classifier/"
+                        f"{classifier}_{gen_model_name}_"
+                        f"{galaxy_classes[0]}_{galaxy_classes[1]}_"
+                        f"f{fold}_background_hist.png"
+                    )
+                )
+            
+            for cls in galaxy_classes:
+                orig_imgs = train_images[train_labels == (cls - min(galaxy_classes))][:36]
+                test_imgs = test_images[test_labels == (cls - min(galaxy_classes))][:36]
+                                
+                plot_image_grid(
+                    orig_imgs.cpu(),
+                    num_images=36,
+                    save_path=f"./classifier/{classifier}_{gen_model_name}_{cls}_f{fold}_real_grid.png"
+                )
+                plot_image_grid(
+                    test_imgs.cpu(),
+                    num_images=36,
+                    save_path=f"./classifier/{classifier}_{gen_model_name}_{cls}_f{fold}_test_grid.png"
                 )
 
-                for cls in galaxy_classes:
-                    orig_imgs = train_images[train_labels == (cls - min(galaxy_classes))][:36]
-                    test_imgs = test_images[test_labels == (cls - min(galaxy_classes))][:36]
-                                    
+                if lambda_generate not in [0, 8]:
+                    gen_imgs = generated_by_class[cls][:36]
+
                     plot_image_grid(
+                        gen_imgs,
+                        num_images=36,
+                        save_path=f"./classifier/{classifier}_{gen_model_name}_{cls}_f{fold}_generated_grid.png"
+                    )
+                    plot_histograms(
+                        gen_imgs,
                         orig_imgs.cpu(),
-                        num_images=36,
-                        save_path=f"./classifier/{classifier}_{gen_model_name}_{cls}_f{fold}_real_grid.png"
+                        title1="Generated Images",
+                        title2="Train Images",
+                        save_path=f"./classifier/{classifier}_{gen_model_name}_{cls}_f{fold}_histogram.png"
                     )
-                    plot_image_grid(
-                        test_imgs.cpu(),
-                        num_images=36,
-                        save_path=f"./classifier/{classifier}_{gen_model_name}_{cls}_f{fold}_test_grid.png"
-                    )
-
-                    if lambda_generate not in [0, 8]:
-                        gen_imgs = generated_by_class[cls][:36]
-
-                        plot_image_grid(
-                            gen_imgs,
-                            num_images=36,
-                            save_path=f"./classifier/{classifier}_{gen_model_name}_{cls}_f{fold}_generated_grid.png"
-                        )
-                        plot_histograms(
-                            gen_imgs,
-                            orig_imgs.cpu(),
-                            title1="Generated Images",
-                            title2="Train Images",
-                            save_path=f"./classifier/{classifier}_{gen_model_name}_{cls}_f{fold}_histogram.png"
-                        )
-                        plot_background_histogram(
-                            orig_imgs,
-                            gen_imgs,
-                            img_shape=(1, 128, 128),
-                            title="Background histograms",
-                            save_path=f"./classifier/{classifier}_{gen_model_name}_{cls}_f{fold}_background_hist.png")
+    
+                    plot_background_histogram(orig_imgs, gen_imgs, "Background histograms", f"./classifier/{classifier}_{gen_model_name}_{cls}_f{fold}_background_hist.png")
         
         if USE_CLASS_WEIGHTS:
             unique, counts = np.unique(train_labels.cpu().numpy(), return_counts=True)
             class_counts = dict(zip(map(int, unique), map(int, counts)))
             total_count = sum(counts)
             class_weights = {int(cls): float(total_count / count) for cls, count in class_counts.items()}
-            print("All available class_weights: ", class_weights)
             weights = torch.tensor([ class_weights[i] for i in range(num_classes) ],
                        dtype=torch.float, device=DEVICE)
             missing_classes = [cls for cls in unique if cls not in class_weights]
@@ -833,15 +726,15 @@ for gen_model_name in gen_model_names:
             imgs = train_images.detach().cpu().numpy()
             lbls = (train_labels + min(galaxy_classes)).detach().cpu().numpy()
             print("Random train labels: ", train_labels[:10]) 
-            plot_images_by_class(imgs, labels=lbls, num_images=5, save_path=f"./classifier/{classifier}_{gen_model_name}_{galaxy_classes}_example_train_data.pdf")
+            plot_images_by_class(imgs, labels=lbls, num_images=5, save_path=f"./classifier/{classifier}_{gen_model_name}_{galaxy_classes}_example_originals.pdf")
         
         # Prepare input data
         mock_tensor = torch.zeros_like(train_images)
         valid_mock_tensor = torch.zeros_like(valid_images)
-        if classifier in ['ScatterNet', 'ScatterResNet', 'ScatterSqueezeNet', 'ScatterSqueezeNet2']:
+        if classifier in ['ScatterNet', 'ScatterResNet', 'ScatterDual']:
             # Define cache paths (you can adjust these names as needed)
-            train_cache_path = f"./.cache/train_scat_{galaxy_classes}_{fold}_{lambda_generate}_{dataset_portions[0]}_{FILTERED}_{TRAINONGENERATED}.npy"
-            valid_cache_path = f"./.cache/valid_scat_{galaxy_classes}_{fold}_{lambda_generate}_{dataset_portions[0]}_{FILTERED}_{TRAINONGENERATED}.npy"
+            train_cache_path = f"./.cache/train_scat_{galaxy_classes}_{fold}_{lambda_generate}_{dataset_portions[0]}_{FILTERED}.npy"
+            valid_cache_path = f"./.cache/valid_scat_{galaxy_classes}_{fold}_{lambda_generate}_{dataset_portions[0]}_{FILTERED}.npy"
             
             if USE_MEMMAP:
                 # Use memmap-based caching (from script 1)
@@ -854,9 +747,8 @@ for gen_model_name in gen_model_names:
             else:
                 train_cache = f"./.cache/train_scat_{galaxy_classes}_{fold}_{lambda_generate}_{dataset_portions[0]}_{FILTERED}.pt"
                 valid_cache = f"./.cache/valid_scat_{galaxy_classes}_{fold}_{lambda_generate}_{dataset_portions[0]}_{FILTERED}.pt"
-                train_scat_coeffs = compute_scattering_coeffs(train_images, scattering, batch_size=128, device="cpu")
-                valid_scat_coeffs = compute_scattering_coeffs(valid_images, scattering, batch_size=128, device="cpu")
-                scatdim = train_scat_coeffs[0].shape
+                train_scat_coeffs = cache_scattering(train_images, scattering, train_cache, batch_size=128, device="cpu")
+                valid_scat_coeffs = cache_scattering(valid_images, scattering, valid_cache, batch_size=128, device="cpu")
                 all_scat = torch.cat([train_scat_coeffs, valid_scat_coeffs], dim=0)
                 if NORMALISESCS or NORMALISESCSTOPM:
                     if NORMALISESCSTOPM:
@@ -865,10 +757,11 @@ for gen_model_name in gen_model_names:
                         all_scat = normalise_images(all_scat, 0, 1)
                 train_scat_coeffs, valid_scat_coeffs = all_scat[:len(train_scat_coeffs)], all_scat[len(train_scat_coeffs):]
                 
+                scatdim = train_scat_coeffs[0].shape
                 if classifier in ['ScatterNet', 'ScatterResNet']:
                     train_dataset = TensorDataset(mock_tensor, train_scat_coeffs, train_labels)
                     valid_dataset = TensorDataset(valid_mock_tensor, valid_scat_coeffs, valid_labels)
-                else:  # ScatterSqueezeNet
+                else: # classifier == "ScatterDual"
                     train_dataset = TensorDataset(train_images, train_scat_coeffs, train_labels)
                     valid_dataset = TensorDataset(valid_images, valid_scat_coeffs, valid_labels)
         else:
@@ -885,40 +778,28 @@ for gen_model_name in gen_model_names:
         print(f"Train dataset size: {len(train_dataset)}, Validation dataset size: {len(valid_dataset)}")
 
         if SHOWIMGS and lambda_generate not in [0, 8]: 
-            if classifier in ['TinyCNN', 'SCNN', 'CNNSqueezeNet', 'Rustige', 'ScatterSqueezeNet', 'ScatterSqueezeNet2', 'Binary']:
+            if classifier in ['ProjectModel', 'Rustige', 'ScatterDual', 'Binary']:
                 #save_images_tensorboard(generated_images[:36], save_path=f"./classifier/{gen_model_name}_{galaxy_classes}_generated.png", nrow=6)
                 plot_histograms(pristine_train_images, valid_images, title1="Train images", title2="Valid images", imgs3=generated_images, imgs4=test_images, title3='Generated images', title4='Test images', save_path=f"./classifier/{classifier}_{gen_model_name}_{galaxy_classes}_histograms.png")
 
         
+                
         ###############################################
         ############# DEFINE MODEL ####################
         ###############################################
-        
+
         if classifier == "Rustige":
-            models = {"RustigeClassifier": {"model": RustigeClassifier(n_output_nodes=num_classes).to(DEVICE)}} 
-        elif classifier == "SCNN":
-            models = {"SCNN": {"model": SCNN(input_shape=tuple(valid_images.shape[1:]), num_classes=num_classes).to(DEVICE)}}
-        elif classifier == "CNNSqueezeNet":
-            models = {"CNNSqueezeNet": {"model": CNNSqueezeNet(input_shape=tuple(valid_images.shape[1:]), num_classes=num_classes).to(DEVICE)}}
-        elif classifier == "DualCNNSqueezeNet":
-            models = {"DualCNNSqueezeNet": {"model": DualCNNSqueezeNet(input_shape=tuple(valid_images.shape[1:]), num_classes=num_classes).to(DEVICE)}}
-        elif classifier == "TinyCNN":
-            models = {"TinyCNN": {"model": TinyCNN(input_shape=tuple(valid_images.shape[1:]), num_classes=num_classes).to(DEVICE)}} 
-        elif classifier == 'CloudNet':
-            cloud_model = CloudNet()  
-            cloud_model.load_weights(os.path.join(sys.path[0],
-                'Cloud-Net_trained_on_38-Cloud_training_patches.h5'))
-            cloud_model.trainable = True   # now you can fine-tune it on your radio maps
+            models = {"RustigeClassifier": {"model": RustigeClassifier(input_shape=tuple(valid_images.shape[1:]), num_classes=num_classes).to(DEVICE)}} 
+        elif classifier == "ProjectModel":
+            models = {"ProjectModel": {"model": ProjectModel(input_shape=tuple(valid_images.shape[1:]), num_classes=num_classes).to(DEVICE)}} 
         elif classifier == "DANN":
             models = {"DANN": {"model": DANNClassifier(input_shape=tuple(valid_images.shape[1:]), num_classes=num_classes).to(DEVICE)}}
         elif classifier == "ScatterNet":
             models = {"ScatterNet": {"model": MLPClassifier(input_dim=int(np.prod(scatdim)), num_classes=num_classes).to(DEVICE)}}
         elif classifier == "ScatterResNet":
             models = {"ScatterResNet": {"model": ScatterResNet(scat_shape=scatdim, num_classes=num_classes).to(DEVICE)}}
-        elif classifier == "ScatterSqueezeNet":
-            models = {"ScatterSqueezeNet": {"model": ScatterSqueezeNet(img_shape=tuple(valid_images.shape[1:]), scat_shape=scatdim, num_classes=num_classes).to(DEVICE)}}
-        elif classifier == "ScatterSqueezeNet2":
-            models = {"ScatterSqueezeNet2": {"model": ScatterSqueezeNet2(img_shape=tuple(valid_images.shape[1:]), scat_shape=scatdim, num_classes=num_classes).to(DEVICE)}}
+        elif classifier == "ScatterDual":
+            models = {"ScatterDual": {"model": ScatterSqueezeNet(img_shape=tuple(valid_images.shape[1:]), scat_shape=scatdim, num_classes=num_classes).to(DEVICE)}}
         elif classifier == 'Binary':
             models = {"BinaryClassifier": {"model": BinaryClassifier(input_shape=tuple(valid_images.shape[1:])).to(DEVICE)}}
         else:
@@ -931,9 +812,7 @@ for gen_model_name in gen_model_names:
                     summary(model_details["model"], input_size=(int(np.prod(scatdim)),), device=DEVICE)
                 elif classifier == "ScatterResNet":
                     summary(model_details["model"], input_size=scatdim, device=DEVICE)
-                elif classifier == "ScatterSqueezeNet":
-                    summary(model_details["model"], input_size=[valid_images.shape[1:], scatdim])
-                elif classifier == "ScatterSqueezeNet2":
+                elif classifier == "ScatterDual":
                     summary(model_details["model"], input_size=[valid_images.shape[1:], scatdim])
                 else:
                     summary(model_details["model"], input_size=img_shape, device=DEVICE)
@@ -961,7 +840,6 @@ for gen_model_name in gen_model_names:
             scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=10*lr, 
                                     steps_per_epoch=len(train_loader), epochs=num_epochs)
 
-        print("Testing to see it it prints this")
         for classifier_name, model_details in models.items():
             print(f"Training {classifier_name} model...")
             model = model_details["model"].to(DEVICE)
@@ -1024,7 +902,7 @@ for gen_model_name in gen_model_names:
                             else:
                                 if classifier in ["ScatterNet", "ScatterResNet"]:
                                     outputs = model(scat)
-                                elif classifier in ["ScatterSqueezeNet", "ScatterSqueezeNet2"]:
+                                elif classifier == "ScatterDual":
                                     outputs = model(images, scat)
                                 else:
                                     outputs = model(images)
@@ -1054,7 +932,7 @@ for gen_model_name in gen_model_names:
                                 else: 
                                     if classifier in ["ScatterNet", "ScatterResNet"]:
                                         outputs = model(scat)
-                                    elif classifier in ["ScatterSqueezeNet", "ScatterSqueezeNet2"]:
+                                    elif classifier == "ScatterDual":
                                         outputs = model(images, scat)
                                     else:
                                         outputs = model(images)
@@ -1087,8 +965,8 @@ for gen_model_name in gen_model_names:
                                 if classifier in ["ScatterNet", "ScatterResNet"]:
                                     pred_probs = model(scat).cpu().detach().numpy()
 
-                                elif classifier in ["ScatterSqueezeNet", "ScatterSqueezeNet2"]:
-                                    pred_probs = torch.softmax(model(images, scat), dim=1).cpu().detach().numpy()
+                                elif classifier == "ScatterDual":
+                                    pred_probs = model(images, scat).cpu().detach().numpy()
                                 else:
                                     pred_probs = model(images).cpu().detach().numpy()
                             true_labels = labels.cpu().numpy()
@@ -1121,7 +999,7 @@ for gen_model_name in gen_model_names:
                         outputs = class_logits.cpu().detach().numpy()
                     elif classifier in ["ScatterNet", "ScatterResNet"]:
                         outputs = model(scat).cpu().detach().numpy()
-                    elif classifier in ["ScatterSqueezeNet", "ScatterSqueezeNet2"]:
+                    elif classifier == "ScatterDual":
                         outputs = model(images, scat).cpu().detach().numpy()
                     else:
                         outputs = model(images).cpu().detach().numpy()
@@ -1156,4 +1034,4 @@ for gen_model_name in gen_model_names:
                         "training_times": training_times,
                         "all_pred_probs": all_pred_probs
                     }, f)
-                print(f"Metrics and related data saved to {metrics_save_path}") 
+                print(f"Metrics and related data saved to {metrics_save_path}")

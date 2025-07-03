@@ -11,11 +11,11 @@ import pandas as pd
 FITS_ROOT       = "/users/mbredber/scratch/data/PSZ2/fits"
 CROP_ROOT       = "/users/mbredber/scratch/data/PSZ2/crops"
 META_FITS       = "/users/mbredber/scratch/data/PSZ2/planck_dr2_metadata.fits"
-CROP_SIZE       = (128, 128)  # Set to None to use full size
+CROP_SIZE       = None  # Set to None to use full size
 
-FILENAME_SUFFIXES = ["T100kpcSUB"] # List of suffixes to use
+FILENAME_SUFFIXES = ["ALL"] # List of suffixes to use
 # or to grab _all_ .fits variants in the first cluster folder:
-if FILENAME_SUFFIXES == 'ALL':
+if FILENAME_SUFFIXES == ["ALL"]:
     import glob
     suffixes = set()
     for slug in os.listdir(FITS_ROOT):
@@ -54,7 +54,8 @@ meta = meta.set_index('slug')
 rows = []
 
 for suffix in FILENAME_SUFFIXES:
-    OUT_BASE = os.path.join("data/PSZ2/classified", suffix)
+    suffix_dir = suffix or "RAW"
+    OUT_BASE    = os.path.join("data/PSZ2/classified", suffix_dir)
     os.makedirs(OUT_BASE, exist_ok=True)
     for dirs in BUCKETS.values():
         for d in dirs:
@@ -77,7 +78,10 @@ for suffix in FILENAME_SUFFIXES:
         try:
             hdu = fits.open(fits_path)[0]
             data = hdu.data
-            data = data[0,0,:,:]
+            #data = data[0,0,:,:]
+            data = data.squeeze()
+            if data.ndim != 2:
+                raise ValueError(f"Expected a 2D image but got {data.ndim}D")
             
             plt.imshow(data, origin='lower', cmap='afmhot')
             plt.axis('off')
@@ -87,8 +91,11 @@ for suffix in FILENAME_SUFFIXES:
             # Crop the image if needed
             if CROP_SIZE is not None:
                 center = np.array(data.shape) // 2
-                half_size = CROP_SIZE // 2
-                data = data[center[0]-half_size:center[0]+half_size, center[1]-half_size:center[1]+half_size]
+                #half_size = CROP_SIZE // 2
+                #half_size = np.array(CROP_SIZE) // 2
+                half_x, half_y = CROP_SIZE[0] // 2, CROP_SIZE[1] // 2
+                #data = data[center[0]-half_size:center[0]+half_size, center[1]-half_size:center[1]+half_size]
+                data = data[center[0]-half_x:center[0]+half_x, center[1]-half_y:center[1]+half_y]
                 
             out_png = os.path.join(CROP_ROOT, f"{slug}.png")
             plt.imshow(data, origin='lower', cmap='afmhot')
@@ -125,7 +132,9 @@ for suffix in FILENAME_SUFFIXES:
         except Exception as e:
             print(f"⚠️ Error processing {slug}: {e}")
 
-# ─── WRITE CSV SUMMARY ─────────────────────────────────────────────────────
-df = pd.DataFrame(rows)
-df.to_csv(os.path.join(OUT_BASE, "train_labels.csv"), index=False)
-print(f"📄 Written {len(df)} entries to train_labels.csv")
+    # ─── WRITE CSV SUMMARY ─────────────────────────────────────────────────
+    df = pd.DataFrame(rows)
+    suffix_csv = os.path.join(OUT_BASE, f"train_labels_{suffix_dir}.csv")
+    df.to_csv(suffix_csv, index=False)
+    print(f"📄 Written {len(df)} entries to {suffix_csv}")
+

@@ -1,31 +1,37 @@
-
 import numpy as np
 import h5py
 import torch
+import torch.nn.functional as F
 from torchvision import transforms, datasets
-from sklearn.model_selection import StratifiedKFold, train_test_split
-from scipy.ndimage import label
-import skimage
 from torch.utils.data import DataLoader
 from utils.GAN_models import load_gan_generator
 from utils.calc_tools import get_model_name, normalise_images, generate_from_noise, load_model
+from firstgalaxydata import FIRSTGalaxyData
+from sklearn.model_selection import StratifiedKFold, train_test_split
+from scipy.ndimage import label
+import skimage
 import cv2
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import collections
 from collections import Counter
-import os
 from PIL import Image
 import random
 import hashlib
 import glob
+import os
+
+# For reproducibility
+SEED = 42 
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
 
 ######################################################################################################
 ################################### CONFIGURATION ####################################################
 ######################################################################################################
 
 root_path =  '/users/mbredber/scratch/data/' #'/home/sysadmin/Scripts/data/'  #
-SEED = 42 
 
 ######################################################################################################
 ################################### GENERAL STUFF ####################################################
@@ -34,10 +40,10 @@ SEED = 42
 import sys
 sys.path.append(root_path)
 #from MiraBest.MiraBest_F import MBFRConfident, MBFRUncertain, MBFRFull, MBRandom
-from firstgalaxydata import FIRSTGalaxyData
 
-np.random.seed(SEED)
-torch.manual_seed(SEED)
+
+
+
 
 def get_classes():
     return [
@@ -153,7 +159,7 @@ def get_synthetic(
         generated_images_list.append(ddpm_data)
         generated_labels_list.append(torch.ones(n_here, dtype=torch.long) * (cls - min(galaxy_classes)))
         
-    elif gen_model_name in ['ST', 'wGAN']
+    elif gen_model_name in ['ST', 'wGAN', 'WGAN']:
         if gen_model_name == 'ST':
             #pattern = f"/users/mbredber/scratch/ST_generation/*100_{cls}.npy"
             pattern = f"/users/mbredber/scratch/ST_generation/1to1_*_{cls}.npy"
@@ -163,11 +169,14 @@ def get_synthetic(
         if len(candidates) == 0:
             raise FileNotFoundError(f"No ST file found matching pattern {pattern}")
         st_path = candidates[0]
-        print(f"Loading ST data for class {cls} from {st_path}")
+        print(f"Loading data for class {cls} from {st_path}")
         st_data = np.load(st_path)  # shape assumed (N, 128, 128)
         st_data = torch.from_numpy(st_data).unsqueeze(1).float()  # (N, 1, 128, 128)
         n_here = min(st_data.shape[0], num_generate)  # Use as many samples as num_generate, or all if fewer exist
         st_data = st_data[:n_here]
+        if gen_model_name in ['wGAN', 'WGAN']: # Normalise from 0, 255 to [0, 1]
+            st_data = st_data / 255.0
+    
         generated_images_list.append(st_data)
         generated_labels_list.append(torch.ones(n_here, dtype=torch.long) * (cls - min(galaxy_classes)))
         
@@ -792,22 +801,62 @@ def complex_apply_transforms_with_config(image, config, img_shape=(128, 128), in
     
     return transformed_image
 
+def apply_formatting(image, crop_size=(1, 1, 128, 128), downsample_size=(1, 1, 128, 128)):
+    # If we see a 4-D cube [T, C, H, W], do a single crop+resize on the spatial dims
+    if image.ndim == 4:
+        # unpack
+        T, C, H, W = image.shape
+        crop_h, crop_w = crop_size[-2], crop_size[-1]
+        top  = (H - crop_h) // 2
+        left = (W - crop_w) // 2
+        # crop spatially
+        cropped = image[:, :, top:top+crop_h, left:left+crop_w]  # still [T, C, crop_h, crop_w]
+        # resize spatially
+        resized = F.interpolate(
+            cropped.view(-1, C, crop_h, crop_w),           # treat T as batch
+            size=(downsample_size[2], downsample_size[3]),
+            mode='bilinear',
+            align_corners=False
+        )
+        # reshape back to [T, C, H', W']
+        return resized.view(T, C, downsample_size[2], downsample_size[3])
 
-def apply_formatting(image, crop_size=(128, 128), downsample_size=(128, 128)):
+    # else fall back to your 1- or 3-channel PIL pipeline
+    to_gray = (crop_size[1] == 1) or (downsample_size[1] == 1)
+    transforms_list = [transforms.ToPILImage()]
+    if to_gray:
+        transforms_list.append(transforms.Grayscale(num_output_channels=1))
+    transforms_list += [
+        transforms.CenterCrop((crop_size[-2], crop_size[-1])),
+        transforms.Resize((downsample_size[-2], downsample_size[-1])),
+        transforms.ToTensor(),
+    ]
+    preprocess = transforms.Compose(transforms_list)
+    return preprocess(image)
+
+
+
+def apply_formatting_old(image, crop_size=(1, 128, 128), downsample_size=(1, 128, 128)): #Works only for 1-channel images
     """
-    Apply formatting to the image by cropping and resizing it to the specified dimensions.
+    Crop and resize, collapsing to 1-channel only if crop_size[-3]==1 or downsample_size[-3]==1.
     """
+    print(f"Applying formatting with crop_size: {crop_size}, downsample_size: {downsample_size}")
+    print('Shape of image before formatting:', image.shape)
+    to_gray = (crop_size[-3] == 1) or (downsample_size[-3] == 1)
+    transforms_list = [
+        transforms.ToPILImage(),
+    ]
+    print("to_gray:", to_gray)
+    if to_gray:
+        transforms_list.append(transforms.Grayscale(num_output_channels=1))
+    transforms_list += [
+        transforms.CenterCrop((crop_size[-2], crop_size[-1])),
+        transforms.Resize((downsample_size[-2], downsample_size[-1])),
+        transforms.ToTensor(),
+    ]
+    preprocess = transforms.Compose(transforms_list)
+    return preprocess(image)
 
-    preprocess = transforms.Compose([
-        transforms.CenterCrop((crop_size[0], crop_size[1])),
-        transforms.Resize((downsample_size[0], downsample_size[1])),  # Resize images to the desired size
-    ])
-
-    if image.dim() == 2:  # Ensure image is 3D
-        image = image.unsqueeze(0)
-    image = preprocess(image)
-    
-    return image
 
 
 def img_hash(img: torch.Tensor) -> str:
@@ -834,8 +883,7 @@ def load_vae_data(runname, sample_size, existing_images, existing_labels, data_t
             return None, None
 
     if isinstance(runname, list):
-        vae_images_list = []
-        vae_labels_list = []
+        vae_images_list, vae_labels_list = [], []
         for run in runname:
             vae_images, vae_labels = load_single_run(run)
             if vae_images is not None and vae_labels is not None:
@@ -914,6 +962,8 @@ def isolate_galaxy_batch(images, upper_intensity_threshold=500000, lower_intensi
 def augment_images(
     images, labels, rotations=[0, 90, 180, 270],
     flips = [(False, False), (True, False)], mem_threshold=1000,
+    #translations = [(10, 0), (-10, 0), (0, 10), (0, -10)], #[(5, 0), (-5, 0), (0, 5), (0, -5)],
+    translations = [(0, 0)], 
     ST_augmentation=False, n_gen = 1):
     """
     General function to augment images in chunks with memory optimization.
@@ -960,17 +1010,21 @@ def augment_images(
     for idx, image in enumerate(images):
         for rot in rotations:
             for flip_h, flip_v in flips:
-                # Apply augmentation transforms
-                config = {'rotation': rot, 'flip_h': flip_h, 'flip_v': flip_v}
-                augmented_image = apply_transforms_with_config(image.clone().detach(), config)
-                augmented_images.append(augmented_image)
-                augmented_labels.append(labels[idx])  # Append corresponding label
+                for translation in translations:
+                    if translation != (0, 0):
+                        image = transforms.functional.affine(
+                            image, angle=0, translate=translation, scale=1.0, shear=0, fill=0
+                        )
+                    config = {'rotation': rot, 'flip_h': flip_h, 'flip_v': flip_v}
+                    augmented_image = apply_transforms_with_config(image.clone().detach(), config)
+                    augmented_images.append(augmented_image)
+                    augmented_labels.append(labels[idx])  # Append corresponding label
 
-                # Memory check: Save and clear if too many augmentations are in memory
-                if len(augmented_images) >= mem_threshold:  # Threshold for saving (adjustable)
-                    cumulative_augmented_images.extend(augmented_images)
-                    cumulative_augmented_labels.extend(augmented_labels)
-                    augmented_images, augmented_labels = [], []  # Reset batch
+                    # Memory check: Save and clear if too many augmentations are in memory
+                    if len(augmented_images) >= mem_threshold:  # Threshold for saving (adjustable)
+                        cumulative_augmented_images.extend(augmented_images)
+                        cumulative_augmented_labels.extend(augmented_labels)
+                        augmented_images, augmented_labels = [], []  # Reset batch
 
     # Extend cumulative lists with remaining augmented images from the chunk
     cumulative_augmented_images.extend(augmented_images)
@@ -1054,9 +1108,7 @@ def load_galaxy10(path=root_path + 'Galaxy10.h5', sample_size=300, target_classe
             images = np.array(F['images'])
             labels = np.array(F['ans']).astype(int)
 
-            all_images = []
-            all_labels = []
-
+            all_images, all_labels = [], []
             for cls in target_classes:
                 class_indices = np.where(labels == cls)[0]
                 print(f"Number of images in class {cls}: {len(class_indices)}")
@@ -1065,15 +1117,13 @@ def load_galaxy10(path=root_path + 'Galaxy10.h5', sample_size=300, target_classe
                     continue
 
                 selected_images = 2 * (images[class_indices].astype(np.float32) / 255.0 - .5)
-                if crop_size[0] == 1:  
+                if crop_size[-3] == 1:  
                     selected_images = np.mean(selected_images, axis=-1, keepdims=True)
 
                 filtered_images = isolate_galaxy_batch(selected_images)
                 print(f"Number of images remaining after isolate_galaxy_batch: {len(filtered_images)} \n")
 
-                class_images = []
-                class_labels = []
-
+                class_images, class_labels = [], []
                 selected_images = np.moveaxis(selected_images, -1, 1)
 
                 for image in filtered_images:
@@ -1290,7 +1340,7 @@ def load_Mirabest(target_classes=[16], crop_size=(1, 150, 150), downsample_size=
                   train=False, island=False, REMOVEOUTLIERS=True, AUGMENT=False):
     print("Loading MiraBest data...")
 
-    # Select the dataset class based on `target_classes`
+    # Select the dataset class based on target_classes
     if 16 in target_classes or 17 in target_classes:
         DatasetClass = MBFRFull
     elif 14 in target_classes or 15 in target_classes:
@@ -1698,6 +1748,30 @@ def load_RGZ10k(path=root_path + "RGZ_10k", fold=5, target_classes=None, crop_si
 def load_PSZ2(path=root_path + "PSZ2/classified/T100kpcSUB", fold=5, AUGMENT=False, sample_size=300, target_classes=[53], crop_size=(1, 256, 256), downsample_size=(1, 256, 256), island=True, REMOVEOUTLIERS=True, train=False):
     print("Loading PSZ2 data...")
     # To fix: fold and sample size
+    # 
+    #CUBE = True if len(downsample_size)==4 else False # If True, load images as a cube of channels (versions)CUBE = True
+    #print("Len(downsample_size):", len(downsample_size), "CUBE:", CUBE)
+
+    # if you passed a 4‐tuple, use its first entry as the number of versions to load
+    if len(crop_size) == 4:
+        num_versions = crop_size[1]
+        # strip out that 2nd entry so crop_size becomes (1, H, W)
+        _, ch, h_c, w_c = crop_size
+        crop_size = (ch, h_c, w_c)
+    elif len(downsample_size) == 4:
+        num_versions, ch, h_d, w_d = downsample_size
+        downsample_size = (ch, h_d, w_d)
+    else:
+        num_versions = None
+
+    CUBE = True if num_versions is not None else False
+
+    version_folders = [
+        "T15arcsec","T15SUBarcsec","T25kpc","T25kpcSUB",
+        "T30arcsec","T30SUBarcsec","T50kpc","T50kpcSUB",
+        "T100kpc","T100kpcSUB","XMM","CHANDRA","R-1.25",
+        "compact-model",""   # the version-free name
+    ]
 
     images = []
     labels = []
@@ -1706,22 +1780,57 @@ def load_PSZ2(path=root_path + "PSZ2/classified/T100kpcSUB", fold=5, AUGMENT=Fal
         class_folder = next(c["description"] for c in get_classes() if c["tag"] == cls)
         subfolders = [class_folder]
         label = cls
+        
+        print("In the psz2 crop_size", crop_size)
+        if CUBE:
+            print("Cube mode enabled. Loading images as a cube of channels.")
+            # only keep as many version_folders as the user asked for:
+            vf_list = version_folders[:num_versions] if num_versions else version_folders
+            for subfolder in subfolders:
+                first_path = os.path.join(root_path, "PSZ2/classified", vf_list[0], subfolder)
+                base_names = { os.path.splitext(f)[0]
+                            for f in os.listdir(first_path)
+                            if f.lower().endswith(".png") }
 
-        for subfolder in subfolders:
-            folder_path = os.path.join(path, subfolder)
-            if not os.path.isdir(folder_path):
-                print(f"Warning: Folder {folder_path} not found. Skipping.")
-                continue
-            for file_name in os.listdir(folder_path):
-                if file_name.lower().endswith((".jpg", ".jpeg", ".png")):
-                    file_path = os.path.join(folder_path, file_name)
-                    with Image.open(file_path) as img:
-                        # immediately format to the final shape+tensor
-                        pil_gray = img.convert("L")
-                        tensor = transforms.ToTensor()(pil_gray)
-                        tensor = apply_formatting(tensor, crop_size, downsample_size)
-                    images.append(tensor)
+                for base in base_names:
+                    channels = []
+                    for vf in version_folders:
+                        img_path = os.path.join(root_path, "PSZ2/classified", vf, subfolder, f"{base}.png")
+                        if not os.path.isfile(img_path):
+                            continue
+                        with Image.open(img_path) as img:
+                            # This gives you a [C, H, W] tensor (e.g. C=1)
+                            t = transforms.ToTensor()(img.convert("L"))
+                        channels.append(t)
+                    if not channels:
+                        continue
+
+                    # stack into [T, C, H, W]
+                    cube = torch.stack(channels, dim=0)   # T = len(channels)
+                    # now crop & resize spatial dims only
+                    cube = apply_formatting(cube, crop_size, downsample_size)
+                    print("Shape of cube:", cube.shape)  # → [T, C, H, W]
+                    images.append(cube)
                     labels.append(label)
+
+                    print("Shape of images after adding cube:", len(images), images[-1].shape)
+        else:
+            for subfolder in subfolders:
+                folder_path = os.path.join(path, subfolder)
+                if not os.path.isdir(folder_path):
+                    print(f"Warning: Folder {folder_path} not found. Skipping.")
+                    continue
+                for file_name in os.listdir(folder_path):
+                    if file_name.lower().endswith((".jpg", ".jpeg", ".png")):
+                        file_path = os.path.join(folder_path, file_name)
+                        with Image.open(file_path) as img:
+                            # 1) convert PIL→Tensor (and to grayscale if you like)
+                            t = transforms.ToTensor()(img.convert("L"))
+                            # 2) then format
+                            tensor = apply_formatting(t, crop_size, downsample_size)
+                            print("Shape of tensor after formatting:", tensor.shape)
+                        images.append(tensor)
+                        labels.append(label)
 
 
     if len(images) == 0:
@@ -1747,6 +1856,8 @@ def load_PSZ2(path=root_path + "PSZ2/classified/T100kpcSUB", fold=5, AUGMENT=Fal
     train_labels = [labels[i] for i in train_idx]
     eval_images  = [images[i] for i in test_idx]
     eval_labels  = [labels[i] for i in test_idx]
+    
+    print("Shape of train_images before redistribution:", len(train_images), train_images[0].shape)
     
     # Check for overlap between train and test sets
     train_hashes = {img_hash(img) for img in train_images}
@@ -1780,6 +1891,8 @@ def load_PSZ2(path=root_path + "PSZ2/classified/T100kpcSUB", fold=5, AUGMENT=Fal
         train_labels = torch.tensor(train_labels, dtype=torch.long)
         eval_images  = torch.stack(eval_images)
         eval_labels  = torch.tensor(eval_labels,  dtype=torch.long)
+        
+    print("Shape of train_images returned from PSZ2:", train_images.shape)
     
 
     return train_images, train_labels, eval_images, eval_labels

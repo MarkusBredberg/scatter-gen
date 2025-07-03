@@ -32,7 +32,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 galaxy_class = 11
 num_display, num_generate = 5, 1000 # Plotted images per model, generated images for statistics
-gen_model_names = ['GAN', 'DDPM'] # Model names to be used for evaluation
+gen_model_names = ['GAN', 'WGAN', 'DDPM'] # Model names to be used for evaluation
 
 classes = get_classes()
 galaxy_classes = [10, 11, 12, 13]
@@ -106,6 +106,7 @@ colors = {
     'VAE-Dual':      '#009E73',  # bluish green
     'VAE-CNN':       "#73C1EE",  # sky blue
     'GAN':       '#FF0000',   # bright red
+    'WGAN':      "#00D500",  # bright green
     'DDPM':      "#D65D00",  # dark orange
     'ST':        '#000000'   # black
 }
@@ -234,6 +235,21 @@ if 'ST' in gen_model_names:
     )
     images['ST'] = st_imgs
     labels['ST'] = st_lbls
+    
+# 6) Wasserstein GAN images
+if 'WGAN' in gen_model_names:
+    wgan_imgs, wgan_lbls = get_synthetic(
+        num_generate=num_generate,
+        gen_model_name='WGAN',
+        cls=galaxy_class,
+        galaxy_classes=galaxy_classes,
+        img_shape=img_shape,
+        FILTERGEN=False,
+        fold=fold,
+        device=device
+    )
+    images['WGAN'] = wgan_imgs
+    labels['WGAN'] = wgan_lbls
     
 #model_names = ['Real'] + [m for m in gen_model_names if m in images and m != 'Real']
 model_names = [m for m in gen_model_names if m in images]
