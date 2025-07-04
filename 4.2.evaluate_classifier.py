@@ -37,10 +37,10 @@ galaxy_classes = [50, 51] # e.g., [10, 11, 12, 13] for FRI, FRII, Compact, Bent
 learning_rates = [1e-3]
 regularization_params = [1e-3]
 lambda_values = [0]
-num_experiments = 5
+num_experiments = 10
 folds = [5] # Number of folds for cross-validation
 generators = ['DDPM']
-classifier = ["TinyCNN", "Rustige", "SCNN", "CNNSqueezeNet", "DualCNNSqueezeNet", "CloudNet", "DANN", "ScatterNet", "ScatterDual", "ScatterSqueezeNet2", "Binary", "ScatterResNet"][-3]
+classifier = ["TinyCNN", "Rustige", "SCNN", "CNNSqueezeNet", "DualCNNSqueezeNet", "CloudNet", "DANN", "ScatterNet", "ScatterDual", "ScatterSqueezeNet", "Binary", "ScatterResNet"][-3]
 print("Classifier:", classifier)
 
 # -------------------------- NEW GAN CONFIGURATION --------------------------

@@ -10,6 +10,18 @@ import os
 ########## SIMPLE PLOTS OF IMAGES #############
 ###############################################
 
+def first_channel(arr):
+    # take Tensor or ndarray → numpy array
+    a = arr.cpu().detach().numpy() if isinstance(arr, torch.Tensor) else arr
+
+    # If three channels plot the average map of them. Otherwise only plot the first channel.
+    if a.ndim == 3:
+        if a.shape[0] == 3:
+            return np.mean(a, axis=0)
+        else:
+            return a[0]
+    return a.squeeze()
+
 def save_images_tensorboard(images, file_path, nrow=4):
     grid = make_grid(images, nrow=nrow, normalize=True, value_range=(-1, 1))
     save_image(grid, file_path)
@@ -32,7 +44,7 @@ def show_image(x, idx, save=True, title=None, save_path=None):
     print("shape of image: ", image.shape)
     # Create figure and axes
     plt.figure(figsize=(6, 6))
-    plt.imshow(image, cmap='viridis')
+    plt.imshow(first_channel(image), cmap='viridis')
     plt.title(title)
     plt.axis('off')
     if not save:
@@ -91,9 +103,7 @@ def plot_image_grid(images, num_images=36, save_path="grid.png"):
         # select the cube
         img = images[idx].cpu().numpy()
         # if it’s C×H×W, average down to H×W for display
-        if img.ndim == 3:
-            img = img.mean(axis=0)
-        ax.imshow(img, cmap='gray')
+        ax.imshow(first_channel(images[idx]), cmap='gray')
         ax.axis('off')
 
 
@@ -131,10 +141,20 @@ def plot_images_by_class(images, labels, num_images=5, save_path="./classifier/u
 
         for j in range(num_images):
             ax = axes[i, j]
-            ax.imshow(label_images[j].squeeze(), cmap="gray")
-            # always clear ticks
+            arr = label_images[j]
+            # move tensor to numpy if needed
+            if isinstance(arr, torch.Tensor):
+                arr = arr.cpu().detach().numpy()
+            # collapse channels: average if >1, otherwise just drop the channel dim
+            if arr.ndim == 3:
+                img2d = arr.mean(axis=0) if arr.shape[0] > 1 else arr[0]
+            else:
+                img2d = arr
+            # remove any singleton dims to ensure shape is (H, W)
+            img2d = img2d.squeeze()
+            ax.imshow(img2d, cmap="gray")
+
             ax.set_xticks([]); ax.set_yticks([])
-            # only fully turn off the non‐first columns
             if j > 0:
                 ax.axis("off")
 
@@ -161,7 +181,7 @@ def plot_original_images(data_loader, image_size, grid_size, save_path=None, sav
     
     # Plot the grid of images
     plt.figure(figsize=(10, 10))
-    plt.imshow(container, cmap='viridis')
+    plt.imshow(first_channel(container), cmap='viridis')
     plt.axis('off')
     
     if save:
@@ -213,7 +233,7 @@ def new_images_epoch(src_imgs, supertitle, generated_images, num_galaxies,
             ax = fig.add_subplot(gs[0, i])
             if i < len(src_imgs):
                 original_img = np.moveaxis(src_imgs[i], 0, -1)  # Adjust channel dimension for plotting
-                ax.imshow(original_img)
+                ax.imshow(first_channel(original_img))
                 ax.set_title(f"Input Image {i+1}")
             ax.axis('off')
 
@@ -223,7 +243,7 @@ def new_images_epoch(src_imgs, supertitle, generated_images, num_galaxies,
                 ax = fig.add_subplot(gs[row, col])
                 if row-1 < generated_images.shape[0]:  # Ensure there are enough generated images for the row
                     generated_img = np.moveaxis(generated_images[row-1, col], 0, -1)
-                    ax.imshow(generated_img)
+                    ax.imshow(first_channel(generated_img))
                     ax.set_title(f"Epoch {epoch + 1} - Image {row}")
                 ax.axis('off')
 
@@ -231,7 +251,7 @@ def new_images_epoch(src_imgs, supertitle, generated_images, num_galaxies,
         # Plotting the single original image
         ax = fig.add_subplot(gs[0, 0])
         original_img = np.moveaxis(src_imgs[0], 0, -1)
-        ax.imshow(original_img)
+        ax.imshow(first_channel(original_img))
         ax.set_title("Original Image")
         ax.axis('off')
 
@@ -239,7 +259,7 @@ def new_images_epoch(src_imgs, supertitle, generated_images, num_galaxies,
         for i, epoch in enumerate(epochs_to_plot):
             ax = fig.add_subplot(gs[0, i + 1])
             generated_img = np.moveaxis(generated_images[i], 0, -1)
-            ax.imshow(generated_img)
+            ax.imshow(first_channel(generated_img))
             ax.set_title(f"Epoch {epoch + 1}")
             ax.axis('off')
 
@@ -268,9 +288,7 @@ def plot_background_histogram(orig_imgs, gen_imgs, img_shape=(1, 128, 128), titl
     def total_background(images):
         sums = []
         for im in images.cpu().numpy():
-            print("shape of image in total_background: ", im.shape)
             im = im.reshape(h, w)       # enforce 2D (H, W)
-            print("shape of image after reshape: ", im.shape)
             if im.ndim == 3:
                 # stack the 2D mask into a (C, H, W) boolean array
                 mask3d = np.stack([bkg_mask] * im.shape[0], axis=0)
@@ -380,9 +398,9 @@ def show_two_rows(src_images, gen_images, title, savepath=None):
     plt.suptitle(title)
 
     for i in range(num_images):
-        axs[0, i].imshow(src_images[i].squeeze(), cmap='viridis')
+        axs[0, i].imshow(first_channel(src_images[i].squeeze()), cmap='viridis')
         axs[0, i].axis('off')
-        axs[1, i].imshow(gen_images[i].squeeze(), cmap='viridis')
+        axs[1, i].imshow(first_channel(gen_images[i].squeeze()), cmap='viridis')
         axs[1, i].axis('off')
 
     # Set titles to the left of each row
@@ -447,11 +465,11 @@ def plot_reconstructions(test_loader, test_labels, batch_size, model, runname, D
             # Plot the images in two rows
             fig, axs = plt.subplots(2, num_images, figsize=(num_images * 5, 10))  # 2 rows, num_images columns
             for i in range(num_images):
-                axs[0, i].imshow(original_images[i].squeeze().numpy(), cmap=cmap, vmin=0, vmax=1)
+                axs[0, i].imshow(first_channel(original_images[i].squeeze().numpy()), cmap=cmap, vmin=0, vmax=1)
                 axs[0, i].set_title(f'Original Image {i+1}')
                 axs[0, i].axis('off')
                 
-                axs[1, i].imshow(reconstructed_images[i].squeeze().numpy(), cmap=cmap, vmin=0, vmax=1)
+                axs[1, i].imshow(first_channel(reconstructed_images[i].squeeze().numpy()), cmap=cmap, vmin=0, vmax=1)
                 axs[1, i].set_title(f'Reconstructed Image {i+1}')
                 axs[1, i].axis('off')
             
@@ -489,7 +507,7 @@ def plot_weight_and_loss_maps(weight_map, loss_map, x, xhat, savepath=None):
 
     # Plot the weight map
     plt.subplot(2, 2, 1)
-    plt.imshow(weight_map[0].squeeze(), cmap='magma')  # Remove the first dimension
+    plt.imshow(first_channel(weight_map[0].squeeze()), cmap='magma')  # Remove the first dimension
     plt.colorbar(label='Weight')
     plt.title('Weight Map')
     plt.xlabel('Pixel X')
@@ -497,7 +515,7 @@ def plot_weight_and_loss_maps(weight_map, loss_map, x, xhat, savepath=None):
 
     # Plot the loss map
     plt.subplot(2, 2, 2)
-    plt.imshow(loss_map[0].squeeze(), cmap='inferno')  # Remove the first dimension
+    plt.imshow(first_channel(loss_map[0].squeeze()), cmap='inferno')  # Remove the first dimension
     plt.colorbar(label='Loss')
     plt.title('Loss Map')
     plt.xlabel('Pixel X')
@@ -505,7 +523,7 @@ def plot_weight_and_loss_maps(weight_map, loss_map, x, xhat, savepath=None):
 
     # Plot the original image
     plt.subplot(2, 2, 3)
-    plt.imshow(x[0].squeeze(), cmap='viridis')
+    plt.imshow(first_channel(x[0].squeeze()), cmap='viridis')
     plt.colorbar(label='Intensity')
     plt.title('Original Image')
     plt.xlabel('Pixel X')
@@ -513,7 +531,7 @@ def plot_weight_and_loss_maps(weight_map, loss_map, x, xhat, savepath=None):
     
     # Plot the reconstructed image
     plt.subplot(2, 2, 4)
-    plt.imshow(xhat[0].squeeze(), cmap='viridis')
+    plt.imshow(first_channel(xhat[0].squeeze()), cmap='viridis')
     plt.colorbar(label='Intensity')
     plt.title('Reconstructed Image')
     plt.xlabel('Pixel X')
@@ -565,9 +583,9 @@ def vae_plot_comparison(old_images, generated_images, supertitle, num_images=5, 
 
     # Display images
     for i in range(num_images):
-        axs[0, i].imshow(old_images[i], cmap='viridis')
+        axs[0, i].imshow(first_channel(old_images[i]), cmap='viridis')
         axs[0, i].axis('off')
-        axs[1, i].imshow(generated_images[i], cmap='viridis')
+        axs[1, i].imshow(first_channel(generated_images[i]), cmap='viridis')
         axs[1, i].axis('off')
 
     axs[0, 0].text(-0.1, 0.5, "Original images", va='center', ha='center', fontsize=12, rotation=90, transform=axs[0, 0].transAxes)
@@ -634,7 +652,7 @@ def vae_multmod(old_images, generated_images, model_names, save=False, save_path
             old_images = old_images.squeeze(1)  # Squeeze the channel dimension if it exists
         for i in range(num_images):
             img = old_images[i].cpu().numpy().squeeze()  # Move to CPU and convert to numpy
-            axs[0, i].imshow(img, cmap='RdYlBu_r', norm=norm)
+            axs[0, i].imshow(first_channel(img), cmap='RdYlBu_r', norm=norm)
             axs[0, i].axis('off')
         axs[0, 0].text(-0.1, 0.5, "Original", va='center', ha='center', fontsize=12, rotation=90, transform=axs[0, 0].transAxes)
 
@@ -645,10 +663,10 @@ def vae_multmod(old_images, generated_images, model_names, save=False, save_path
         for i in range(num_images):
             img = gen_images[i].cpu().numpy().squeeze()  # Move to CPU and convert to numpy
             if show_originals and old_images is not None:
-                axs[j + 1, i].imshow(img, cmap='RdYlBu_r', norm=norm)
+                axs[j + 1, i].imshow(first_channel(img), cmap='RdYlBu_r', norm=norm)
                 axs[j + 1, i].axis('off')
             else:
-                axs[j, i].imshow(img, cmap='RdYlBu_r', norm=norm)
+                axs[j, i].imshow(first_channel(img), cmap='RdYlBu_r', norm=norm)
                 axs[j, i].axis('off')
         if show_originals and old_images is not None:
             axs[j + 1, 0].text(-0.1, 0.5, model_name, va='center', ha='center', fontsize=12, rotation=90, transform=axs[j + 1, 0].transAxes)

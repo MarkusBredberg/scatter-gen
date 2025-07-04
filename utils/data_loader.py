@@ -802,27 +802,7 @@ def complex_apply_transforms_with_config(image, config, img_shape=(128, 128), in
     return transformed_image
 
 def apply_formatting(image, crop_size=(1, 1, 128, 128), downsample_size=(1, 1, 128, 128)):
-    # If we see a 4-D cube [T, C, H, W], do a single crop+resize on the spatial dims
-    if image.ndim == 4:
-        # unpack
-        T, C, H, W = image.shape
-        crop_h, crop_w = crop_size[-2], crop_size[-1]
-        top  = (H - crop_h) // 2
-        left = (W - crop_w) // 2
-        # crop spatially
-        cropped = image[:, :, top:top+crop_h, left:left+crop_w]  # still [T, C, crop_h, crop_w]
-        # resize spatially
-        resized = F.interpolate(
-            cropped.view(-1, C, crop_h, crop_w),           # treat T as batch
-            size=(downsample_size[2], downsample_size[3]),
-            mode='bilinear',
-            align_corners=False
-        )
-        # reshape back to [T, C, H', W']
-        return resized.view(T, C, downsample_size[2], downsample_size[3])
-
-    # else fall back to your 1- or 3-channel PIL pipeline
-    to_gray = (crop_size[1] == 1) or (downsample_size[1] == 1)
+    to_gray = (crop_size[-3] == 1) or (downsample_size[-3] == 1)
     transforms_list = [transforms.ToPILImage()]
     if to_gray:
         transforms_list.append(transforms.Grayscale(num_output_channels=1))
@@ -1747,22 +1727,30 @@ def load_RGZ10k(path=root_path + "RGZ_10k", fold=5, target_classes=None, crop_si
 
 def load_PSZ2(path=root_path + "PSZ2/classified/T100kpcSUB", fold=5, AUGMENT=False, sample_size=300, target_classes=[53], crop_size=(1, 256, 256), downsample_size=(1, 256, 256), island=True, REMOVEOUTLIERS=True, train=False):
     print("Loading PSZ2 data...")
-    # To fix: fold and sample size
-    # 
-    #CUBE = True if len(downsample_size)==4 else False # If True, load images as a cube of channels (versions)CUBE = True
-    #print("Len(downsample_size):", len(downsample_size), "CUBE:", CUBE)
 
     # if you passed a 4‐tuple, use its first entry as the number of versions to load
     if len(crop_size) == 4:
-        num_versions = crop_size[1]
-        # strip out that 2nd entry so crop_size becomes (1, H, W)
-        _, ch, h_c, w_c = crop_size
-        crop_size = (ch, h_c, w_c)
-    elif len(downsample_size) == 4:
-        num_versions, ch, h_d, w_d = downsample_size
-        downsample_size = (ch, h_d, w_d)
-    else:
+        num_versions, ch_c, h_c, w_c = crop_size
+        crop_size = (ch_c, h_c, w_c)
+    elif len(crop_size) == 3:
         num_versions = None
+        ch_c, h_c, w_c = crop_size
+    elif len(crop_size) == 2:
+        num_versions = None
+        ch_c, h_c, w_c = 1, crop_size[0], crop_size[1]
+    else:
+        raise ValueError("crop_size must be a 2, 3, or 4-tuple (num_versions, channels, height, width)")
+    if len(downsample_size) == 4:
+        num_versions, ch_d, h_d, w_d = downsample_size
+        downsample_size = (ch_d, h_d, w_d)
+    elif len(downsample_size) == 3:
+        num_versions = None
+        ch_d, h_d, w_d = downsample_size
+    elif len(downsample_size) == 2:
+        num_versions = None
+        ch_d, h_d, w_d = 1, downsample_size[0], downsample_size[1] 
+    else:
+        raise ValueError("downsample_size must be a 2, 3, or 4-tuple (num_versions, channels, height, width)")
 
     CUBE = True if num_versions is not None else False
 
@@ -1781,39 +1769,73 @@ def load_PSZ2(path=root_path + "PSZ2/classified/T100kpcSUB", fold=5, AUGMENT=Fal
         subfolders = [class_folder]
         label = cls
         
-        print("In the psz2 crop_size", crop_size)
         if CUBE:
             print("Cube mode enabled. Loading images as a cube of channels.")
             # only keep as many version_folders as the user asked for:
             vf_list = version_folders[:num_versions] if num_versions else version_folders
             for subfolder in subfolders:
-                first_path = os.path.join(root_path, "PSZ2/classified", vf_list[0], subfolder)
-                base_names = { os.path.splitext(f)[0]
-                            for f in os.listdir(first_path)
-                            if f.lower().endswith(".png") }
-
+                base_names = set()
+                for vf in vf_list:
+                    folder = os.path.join(root_path, "PSZ2/classified", vf, subfolder)
+                    if os.path.isdir(folder):
+                        base_names.update(
+                            os.path.splitext(f)[0]
+                            for f in os.listdir(folder)
+                            if f.lower().endswith(".png")
+                        )
+                bad_bases = []
                 for base in base_names:
-                    channels = []
-                    for vf in version_folders:
+                    versions = []
+                    for vf in vf_list:
                         img_path = os.path.join(root_path, "PSZ2/classified", vf, subfolder, f"{base}.png")
-                        if not os.path.isfile(img_path):
-                            continue
-                        with Image.open(img_path) as img:
-                            # This gives you a [C, H, W] tensor (e.g. C=1)
-                            t = transforms.ToTensor()(img.convert("L"))
-                        channels.append(t)
-                    if not channels:
-                        continue
+                        if os.path.isfile(img_path):
+                            with Image.open(img_path) as img:
+                                frame = transforms.ToTensor()(img)
 
-                    # stack into [T, C, H, W]
-                    cube = torch.stack(channels, dim=0)   # T = len(channels)
-                    # now crop & resize spatial dims only
-                    cube = apply_formatting(cube, crop_size, downsample_size)
-                    print("Shape of cube:", cube.shape)  # → [T, C, H, W]
+                            # drop only on HxW mismatch
+                            # if a version frame has the wrong size, zero‐pad it instead of dropping the whole source
+                            if frame.shape[-2:] != (369, 369):
+                                print(f"Zero‐padding base={base}, version={vf}: got HxW={frame.shape[-2:]}, expected {(369, 369)}")
+                                frame = torch.zeros(ch_c, h_c, w_c)
+
+                            # HOPEFUL WAY - FILL AND CUT TO RESIZE AND USE
+                            ## ensure frame is exactly (h_c, w_c) by center‐cropping or zero‐padding
+                            #actual_h, actual_w = frame.shape[-2], frame.shape[-1]
+    #
+                            ## if too large, crop centrally
+                            #if actual_h > h_c or actual_w > w_c:
+                            #    top = (actual_h - h_c) // 2
+                            #    left = (actual_w - w_c) // 2
+                            #    frame = frame[..., top:top+h_c, left:left+w_c]
+    #
+                            ## if too small, pad equally on all sides
+                            #elif actual_h < h_c or actual_w < w_c:
+                            #    pad_h = h_c - actual_h
+                            #    pad_w = w_c - actual_w
+                            #    pad_top = pad_h // 2
+                            #    pad_bottom = pad_h - pad_top
+                            #    pad_left = pad_w // 2
+                            #    pad_right = pad_w - pad_left
+                            #    frame = F.pad(frame, (pad_left, pad_right, pad_top, pad_bottom), mode='constant', value=0)
+
+                            # **convert to your single‐channel + resize here!**
+                            if ch_c != 4 or ch_d != 4 or h_c != 369 or h_d != 369 or w_c != 369 or w_d != 369:
+                                frame = apply_formatting(frame, crop_size, downsample_size)
+                        else:
+                            frame = torch.zeros(ch_d, h_d, w_d)  # zero‐pad if no image found
+
+                        # now every frame is the same (C,H,W), so this will work
+                        versions.append(frame)
+
+                    if len(versions) != len(vf_list):
+                        print(f"⚠️  base={base} only has {len(versions)} / {len(vf_list)} versions!")
+
+                    cube = torch.stack(versions, dim=0)  # [T, C, H, W]
                     images.append(cube)
                     labels.append(label)
 
-                    print("Shape of images after adding cube:", len(images), images[-1].shape)
+                    print("Number of cubes added:", len(images), "each of shape", images[0].shape)
+
         else:
             for subfolder in subfolders:
                 folder_path = os.path.join(path, subfolder)
@@ -1824,11 +1846,9 @@ def load_PSZ2(path=root_path + "PSZ2/classified/T100kpcSUB", fold=5, AUGMENT=Fal
                     if file_name.lower().endswith((".jpg", ".jpeg", ".png")):
                         file_path = os.path.join(folder_path, file_name)
                         with Image.open(file_path) as img:
-                            # 1) convert PIL→Tensor (and to grayscale if you like)
-                            t = transforms.ToTensor()(img.convert("L"))
-                            # 2) then format
-                            tensor = apply_formatting(t, crop_size, downsample_size)
-                            print("Shape of tensor after formatting:", tensor.shape)
+                            t = transforms.ToTensor()(img)
+                            if ch_c != 4 or ch_d != 4 or h_c != 369 or h_d != 369 or w_c != 369 or w_d != 369:
+                                tensor = apply_formatting(t, crop_size, downsample_size)
                         images.append(tensor)
                         labels.append(label)
 
@@ -1883,7 +1903,9 @@ def load_PSZ2(path=root_path + "PSZ2/classified/T100kpcSUB", fold=5, AUGMENT=Fal
 
 
     # Format and optionally augment
+    print("Shape of train_images before augmentation:", len(train_images), "x", train_images[0].shape if train_images else "N/A")
     if AUGMENT:
+        print("Augmenting PSZ2 images...")
         train_images, train_labels = augment_images(train_images, train_labels, ST_augmentation=False)
         eval_images, eval_labels = augment_images(eval_images, eval_labels, ST_augmentation=False)
     else:

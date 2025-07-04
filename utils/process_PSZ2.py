@@ -13,7 +13,7 @@ CROP_ROOT       = "/users/mbredber/scratch/data/PSZ2/crops"
 META_FITS       = "/users/mbredber/scratch/data/PSZ2/planck_dr2_metadata.fits"
 CROP_SIZE       = None  # Set to None to use full size
 
-FILENAME_SUFFIXES = ["ALL"] # List of suffixes to use
+FILENAME_SUFFIXES = ["T15arcsec"] # List of suffixes to use
 # or to grab _all_ .fits variants in the first cluster folder:
 if FILENAME_SUFFIXES == ["ALL"]:
     import glob

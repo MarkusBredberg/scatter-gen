@@ -59,14 +59,14 @@ classifier = ["TinyCNN", # Very Simple CNN
               "CloudNet", # From https://github.com/SorourMo/Cloud-Net-A-semantic-segmentation-CNN-for-cloud-detection/tree/master
               "DANN", # Domain-Adversarial Neural Network
               "ScatterNet", "ScatterSqueezeNet", "ScatterSqueezeNet2",
-              "Binary", "ScatterResNet"][-3]
+              "Binary", "ScatterResNet"][-4]
 gen_model_names = ['DDPM'] #['ST', 'DDPM', 'wGAN', 'GAN', 'Dual', 'CNN', 'STMLP', 'lavgSTMLP', 'ldiffSTMLP'] # Specify the generative model_name
 num_epochs_cuda = 200
 num_epochs_cpu = 100
 learning_rates = [1e-3]  # Learning rates
 regularization_params = [1e-3]  # Regularisation parameters
 label_smoothing = 0.2  # Label smoothing for the classifier
-num_experiments = 5
+num_experiments = 10
 folds = [5] # 0-4 for 5-fold cross validation, 5 for only one training
 lambda_values = [0]  # Ratio between generated images and original images per class. 8 is reserfved for TRAINONGENERATED
 
@@ -116,8 +116,8 @@ elif galaxy_classes == [40, 41]:
     downsample_size = (128, 128)  # Downsample size for the images
     batch_size = 16
 elif galaxy_classes == [50, 51]:
-    crop_size = (15, 4, 369, 369)  # Crop size for the images
-    downsample_size = (15, 4, 369, 369)  # Downsample size for the images
+    crop_size = (1, 128, 128)  # Crop size for the images
+    downsample_size = (1, 128, 128)  # Downsample size for the images
     batch_size = 16 
 
 img_shape = downsample_size
@@ -208,6 +208,7 @@ dataset_sizes = {}
 ##############################################
 ############## FUNCTIONS #####################
 ##############################################
+
 
 scattering = Scattering2D(J=J, L=L, shape=img_shape[-2:], max_order=order)       
 def compute_scattering_coeffs(images, scattering=scattering, batch_size=128, device="cpu"):
@@ -340,6 +341,17 @@ def filter_generated_images(generated_images_list, generated_labels_list):
 
     return filtered_images_list, filtered_labels_list
 
+def fold_T_axis(imgs: torch.Tensor) -> torch.Tensor:
+    """
+    If imgs is 5-D (N, T, C, H, W), reshape to (N, T*C, H, W);
+    otherwise return unchanged.
+    """
+    if imgs.dim() == 5:
+        N, T, C, H, W = imgs.shape
+        return imgs.view(N, T * C, H, W)
+    return imgs
+
+
 def check_tensor(name, tensor):
         # skip completely empty tensors
         if tensor.numel() == 0:
@@ -453,13 +465,14 @@ for gen_model_name in gen_model_names:
     # It should have the same size as the test images
     mock_tensor = torch.zeros_like(test_images)
     if classifier in ['ScatterNet', 'ScatterResNet', 'ScatterSqueezeNet', 'ScatterSqueezeNet2']:
+        test_images = fold_T_axis(test_images)
         test_scat_coeffs = compute_scattering_coeffs(test_images)
         if classifier in ['ScatterNet', 'ScatterResNet']:
-            test_dataset = TensorDataset(mock_tensor, test_scat_coeffs, test_labels)
+            test_dataset = TensorDataset(test_images, mock_tensor, test_labels)
         elif classifier in ['ScatterSqueezeNet', 'ScatterSqueezeNet2']:
             test_dataset = TensorDataset(test_images, test_scat_coeffs, test_labels)
     else: 
-        test_dataset = TensorDataset(test_images, mock_tensor, test_labels) 
+        test_dataset = TensorDataset(test_images, mock_tensor, test_labels)
                             
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=custom_collate, drop_last=False)
 
@@ -809,11 +822,11 @@ for gen_model_name in gen_model_names:
         
         if USE_CLASS_WEIGHTS:
             unique, counts = np.unique(train_labels.cpu().numpy(), return_counts=True)
-            class_counts = dict(zip(map(int, unique), map(int, counts)))
             total_count = sum(counts)
-            class_weights = {int(cls): float(total_count / count) for cls, count in class_counts.items()}
-            weights = torch.tensor([ class_weights[i] for i in range(num_classes) ],
-                       dtype=torch.float, device=DEVICE)
+            class_weights = {i: total_count / count for i, count in zip(unique, counts)}
+            print("Class weights (after label shift):", class_weights)
+            weights = torch.tensor([class_weights.get(i, 1.0) for i in range(num_classes)],
+                                dtype=torch.float, device=DEVICE)
             missing_classes = [cls for cls in unique if cls not in class_weights]
             if missing_classes:
                 print(f"Warning: Missing classes in dataset: {missing_classes}")
@@ -862,16 +875,23 @@ for gen_model_name in gen_model_names:
                     else:
                         all_scat = normalise_images(all_scat, 0, 1)
                 train_scat_coeffs, valid_scat_coeffs = all_scat[:len(train_scat_coeffs)], all_scat[len(train_scat_coeffs):]
-                
+
+                # fold T into channels on both real & scattering inputs
+                train_imgs_f = fold_T_axis(train_images)
+                valid_imgs_f = fold_T_axis(valid_images)
+                mock_train = torch.zeros_like(train_imgs_f)
+                mock_valid = torch.zeros_like(valid_imgs_f)
+
                 if classifier in ['ScatterNet', 'ScatterResNet']:
-                    train_dataset = TensorDataset(mock_tensor, train_scat_coeffs, train_labels)
-                    valid_dataset = TensorDataset(valid_mock_tensor, valid_scat_coeffs, valid_labels)
-                else:  # ScatterSqueezeNet
-                    train_dataset = TensorDataset(train_images, train_scat_coeffs, train_labels)
-                    valid_dataset = TensorDataset(valid_images, valid_scat_coeffs, valid_labels)
+                    train_dataset = TensorDataset(mock_train, train_scat_coeffs, train_labels)
+                    valid_dataset = TensorDataset(mock_valid, valid_scat_coeffs, valid_labels)
+                else: # if classifier in ['ScatterSqueezeNet', 'ScatterSqueezeNet2']:
+                    train_dataset = TensorDataset(train_imgs_f, train_scat_coeffs, train_labels)
+                    valid_dataset = TensorDataset(valid_imgs_f, valid_scat_coeffs, valid_labels)
         else:
-            train_dataset = TensorDataset(train_images, mock_tensor, train_labels) 
-            valid_dataset = TensorDataset(valid_images, valid_mock_tensor, valid_labels)
+            train_dataset = TensorDataset(train_imgs_f, mock_train, train_labels)
+            valid_dataset = TensorDataset(valid_imgs_f, mock_valid, valid_labels)
+
 
 
         print("Length of validation images: ", len(valid_images))
