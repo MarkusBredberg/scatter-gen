@@ -152,7 +152,7 @@ def plot_images_by_class(images, labels, num_images=5, save_path="./classifier/u
                 img2d = arr
             # remove any singleton dims to ensure shape is (H, W)
             img2d = img2d.squeeze()
-            ax.imshow(img2d, cmap="gray")
+            ax.imshow(first_channel(img2d), cmap="gray")
 
             ax.set_xticks([]); ax.set_yticks([])
             if j > 0:

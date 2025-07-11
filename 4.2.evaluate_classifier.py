@@ -93,7 +93,10 @@ elif galaxy_classes == [50, 51]:
         dataset_sizes = [[1600, 8000, 16000], [1600, 8000, 16000], [1600, 8000, 16000], [1600, 8000, 16000], [1600, 8000, 16000],  [1600, 8000, 16000]]
     else:
         #dataset_sizes = [[121, 608, 1216], [121, 608, 1216], [121, 608, 1216], [121, 608, 1216], [121, 608, 1216], [121, 608, 1216]]
-        dataset_sizes = [[121, 1216], [121, 1216], [121, 1216], [121, 1216], [121, 1216], [121, 1216]]
+        #dataset_sizes = [[121, 1216], [121, 1216], [121, 1216], [121, 1216], [121, 1216], [121, 1216]]
+        dataset_sizes = [[123, 1232], [123, 1232], [123, 1232], [123, 1232], [123, 1232], [123, 1232]] # New data_loader
+        #dataset_sizes = [[142, 1424], [142, 1424], [142, 1424], [142, 1424], [142, 1424], [142, 1424]] # For multiple versions of each source
+        #dataset_sizes = [[80, 800], [80, 800], [80, 800], [80, 800], [80, 800], [80, 800]] 
 elif galaxy_classes == [11, 12]:
     dataset_sizes = [[885, 4428, 8856], [885, 4428, 8856], [885, 4428, 8856], [885, 4428, 8856], [885, 4428, 8856], [885, 4428, 8856]]
 elif galaxy_classes == [10, 11, 12, 13]:
@@ -1330,10 +1333,10 @@ if any(lam > 0 for lam in lambda_values):
 
         plot_overlap_image_grids(model, real_loader, gen_loader, device=device)
 #
-#plot_loss(generators, history=history)
+plot_loss(generators, history=history)
 ##plot_roc_curves(metrics, generators)
-#plot_avg_roc_curves(metrics, generators, merge_map=merge_map)
-#plot_all_metrics_vs_dataset_size(metrics, generators, merge_map=merge_map)
+plot_avg_roc_curves(metrics, generators, merge_map=merge_map)
+plot_all_metrics_vs_dataset_size(metrics, generators, merge_map=merge_map)
 #plot_accuracy_vs_lambda(lambda_values, metrics, generators)
 ##plot_confusion_matrix(metrics, generators)
 plot_avg_std_confusion_matrix(metrics, generators, metric_stats=metrics_last, merge_map=merge_map)

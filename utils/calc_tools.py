@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+from torch.utils.data import Dataset
 import random
 from lpips import LPIPS
 import numpy as np
@@ -10,6 +11,7 @@ from utils.VAE_models import get_VAE_model
 from sklearn.metrics import mean_squared_error
 from torchvision.models import inception_v3, Inception_V3_Weights
 from scipy import linalg
+from kymatio.torch import Scattering2D
 
 
 #################################
@@ -153,6 +155,26 @@ def cluster_metrics(features, n_clusters=13):
 ###### IMAGE PROCESSING FUNCTIONS #############
 ###############################################
 
+def check_tensor(name, tensor):
+    if isinstance(tensor, list):
+        tensor = torch.stack(tensor)
+    if tensor.numel() == 0:
+        print(f"Warning: {name} is empty, skipping stats.")
+        return  # skip completely empty tensors
+    if torch.isnan(tensor).any():
+        print(f"Warning: {name} contains NaNs")
+    if torch.isinf(tensor).any():
+        print(f"Warning: {name} contains Infs")
+    if tensor.is_floating_point():
+        print(f"{name} stats: min={tensor.min().item():.3f}, "
+              f"max={tensor.max().item():.3f}, "
+              f"mean={tensor.mean().item():.3f}, "
+              f"std={tensor.std().item():.3f}")
+    else:
+        vals, counts = torch.unique(tensor, return_counts=True)
+        print(f"{name} unique values: {vals.tolist()}, counts: {counts.tolist()}")
+
+
 def normalise_images(images, out_min=-1, out_max=1):
     global_min = images.min()
     global_max = images.max()
@@ -274,10 +296,172 @@ def get_main_and_secondary_peaks_with_locations(images, threshold=0.1):
     return peak_info_all
 
 
+
+def compute_scattering_coeffs(images, scattering=Scattering2D(J=3, L=8, shape=(128, 128), max_order=2), batch_size=128, device="cpu"):
+    scat_coeffs_list = []
+    with torch.no_grad():
+        for i in range(0, len(images), batch_size):
+            batch = images[i:i + batch_size].to(device)
+            if batch.ndim == 4 and batch.size(1) == 1:
+                batch_scat = scattering(batch).detach()
+            else:
+                #scat_channels = [scattering(batch[:, i:i+1, :, :]).detach() for i in range(batch.shape[1])]
+                # ensure the whole batch is contiguous
+                batch = batch.contiguous()
+                # and each channel‐slice, too
+                scat_channels = [
+                    scattering(batch[:, i:i+1, :, :].contiguous()).detach()
+                    for i in range(batch.shape[1])
+                ]
+
+                batch_scat = torch.cat(scat_channels, dim=1)
+
+            # Squeeze out the singleton dimension at index 1 if present.
+            if batch_scat.shape[1] == 1:
+                batch_scat = batch_scat.squeeze(1)  # becomes [B, C, H, W]
+            scat_coeffs_list.append(batch_scat.cpu())
+        scat_coeffs = torch.cat(scat_coeffs_list, dim=0)
+    return scat_coeffs
+
+def filter_generated_images(generated_images_list, generated_labels_list):
+    # Pairwise comparison of generated images
+    filtered_images_list, filtered_labels_list = [], []
+    for i, img1 in enumerate(generated_images_list):
+        is_unique = True
+        for j, img2 in enumerate(generated_images_list):
+            if i == j:
+                continue
+            if torch.allclose(img1, img2, atol=1e-3):
+                is_unique = False
+                break
+        if is_unique:
+            filtered_images_list.append(img1)
+            filtered_labels_list.append(generated_labels_list[i])
+            
+    # Plot some example of images next to their similar images
+    if SHOWIMGS:
+        for i in range(min(18, len(filtered_images_list))):
+            save_images_tensorboard(torch.cat([filtered_images_list[i], generated_images_list[i]], dim=0), save_path=f"./classifier/{gen_model_name}_{galaxy_classes}_filtered_grid.png", nrow=6)
+
+    return filtered_images_list, filtered_labels_list
+
+def fold_T_axis(imgs: torch.Tensor) -> torch.Tensor:
+    """
+    If imgs is 5-D (N, T, C, H, W), reshape to (N, T*C, H, W);
+    otherwise return unchanged.
+    """
+    if imgs.dim() == 5:
+        N, T, C, H, W = imgs.shape
+        return imgs.view(N, T * C, H, W)
+    return imgs
+
 #################################################
 ##### MODEL AND DATA LOADING FUNCTIONS ##########
 #################################################
 
+
+def cache_scattering(images, scattering, cache_path, batch_size=128, device='cpu'):
+    if os.path.exists(cache_path):
+        print("Loading cached scattering coefficients from", cache_path)
+        scat_coeffs = torch.load(cache_path)
+    else:
+        print("Computing scattering coefficients and caching to", cache_path)
+        scat_coeffs_list = []
+        with torch.no_grad():
+            for i in range(0, len(images), batch_size):
+                batch = images[i:i + batch_size].to(device)
+                batch_scat = scattering(batch).detach()
+                if batch_scat.shape[1] == 1:
+                    batch_scat = batch_scat.squeeze(1)
+                scat_coeffs_list.append(batch_scat.cpu())
+        scat_coeffs = torch.cat(scat_coeffs_list, dim=0)
+        torch.save(scat_coeffs, cache_path)
+    return scat_coeffs
+
+
+# First, when you compute and save the scattering coefficients,
+# write them to a memmap file instead of saving a full tensor.
+def cache_scattering_memmap(images, scattering, cache_path, batch_size=128, device="cpu"):
+    num_images = len(images)
+    # Determine the shape for one sample
+    with torch.no_grad():
+        sample = scattering(images[:batch_size].to(device)).detach()
+        if sample.shape[1] == 1:
+            sample = sample.squeeze(1)
+        sample_shape = sample.shape[1:]  # e.g., (C, H, W)
+    full_shape = (num_images,) + sample_shape
+    
+    if not os.path.exists(cache_path):
+        print("Computing and writing scattering coefficients to memmap at", cache_path)
+        # Create a memmap array in write mode
+        memmap_array = np.memmap(cache_path, dtype=np.float32, mode='w+', shape=full_shape)
+        with torch.no_grad():
+            for i in range(0, num_images, batch_size):
+                batch = images[i:i+batch_size].to(device)
+                batch_scat = scattering(batch).detach()
+                if batch_scat.shape[1] == 1:
+                    batch_scat = batch_scat.squeeze(1)
+                memmap_array[i:i+batch_size] = batch_scat.cpu().numpy()
+        # Flush changes to disk
+        memmap_array.flush()
+    else:
+        print("Memmap cache found at", cache_path)
+    return cache_path, full_shape
+
+# Then, create a custom dataset that loads scattering coefficients from the memmap file.
+class CachedScatterDataset(Dataset):
+    def __init__(self, images, labels, cache_file, scatter_shape):
+        self.images = images  # still in memory
+        self.labels = labels
+        self.cache_file = cache_file
+        self.scatter_shape = scatter_shape
+        # Open the memmap in read mode; this does not load everything into RAM.
+        self.scat_memmap = np.memmap(cache_file, dtype=np.float32, mode='r', shape=scatter_shape)
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        image = self.images[idx]
+        label = self.labels[idx]
+        # Only load the scattering coefficient for the current index.
+        scat = torch.tensor(self.scat_memmap[idx]).float()
+        if NORMALISESCS:
+            scat = normalise_images(scat, 0, 1) 
+        if NORMALISESCSTOPM:
+            scat = normalise_images(scat, -1, 1)
+
+        return image, scat, label
+
+def custom_collate(batch):
+    if not batch:
+        return None
+    first = batch[0]
+    # 3-tuple: (img, scat, label)
+    if isinstance(first, (tuple, list)) and len(first) == 3:
+        imgs, scats, labels = zip(*batch)
+        return (
+            torch.utils.data.dataloader.default_collate(imgs),
+            torch.utils.data.dataloader.default_collate(scats),
+            torch.utils.data.dataloader.default_collate(labels),
+        )
+    # 4-tuple: (img, scat, meta, label)
+    elif isinstance(first, (tuple, list)) and len(first) == 4:
+        imgs, scats, metas, labels = zip(*batch)
+        return (
+            torch.utils.data.dataloader.default_collate(imgs),
+            torch.utils.data.dataloader.default_collate(scats),
+            torch.utils.data.dataloader.default_collate(metas),
+            torch.utils.data.dataloader.default_collate(labels),
+        )
+    # fallback
+    return torch.utils.data.dataloader.default_collate(batch)
+
+
+def save_images_tensorboard(images, save_path, nrow=4):
+    grid = make_grid(images, nrow=nrow, normalize=True, value_range=(-1, 1))
+    save_image(grid, save_path)
+    
 
 def get_model_name(galaxy_classes, num_galaxies, encoder, fold):
     if isinstance(galaxy_classes, int):

@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from torchvision import transforms, datasets
 from torch.utils.data import DataLoader
 from utils.GAN_models import load_gan_generator
-from utils.calc_tools import get_model_name, normalise_images, generate_from_noise, load_model
+from utils.calc_tools import normalise_images, generate_from_noise, load_model
 from firstgalaxydata import FIRSTGalaxyData
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from scipy.ndimage import label
@@ -14,9 +14,12 @@ import cv2
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import collections
-from collections import Counter
+from collections import Counter, defaultdict
+import pandas as pd
 from PIL import Image
+from astropy.io import fits
 import random
+import math
 import hashlib
 import glob
 import os
@@ -306,6 +309,43 @@ def get_synthetic(
 ######################################################################################################
 ################################### DATA SELECTION FUNCTIONS #########################################
 ######################################################################################################
+
+def percentile_stretch(x, lo=2, hi=98):
+    """
+    x: Tensor of shape (B, C, H, W) with values in [0,1]
+    Returns: same shape, linearly rescaled so that the lo-th percentile → 0 and hi-th → 1
+    """
+    B, C, H, W = x.shape
+    flat = x.view(B, C, -1)
+    p_low  = flat.quantile(lo/100, dim=2, keepdim=True).unsqueeze(-1)
+    p_high = flat.quantile(hi/100, dim=2, keepdim=True).unsqueeze(-1)
+    y = (x - p_low) / (p_high - p_low + 1e-6)
+    return y.clamp(0,1)
+
+
+def asinh_stretch(x, alpha=10):
+    return torch.asinh(alpha * x) / math.asinh(alpha)
+
+def log_stretch(x, alpha=10):
+    return torch.log1p(alpha * x) / math.log1p(alpha)
+    
+def add_highpass(x, alpha=100):
+    # asinh stretch
+    y = torch.asinh(alpha * x) / math.asinh(alpha)
+    # low-pass + subtract
+    lp = torch.nn.functional.avg_pool2d(y, kernel_size=15, stride=1, padding=7)
+    hp = torch.clamp(y - lp, min=0.)
+    # normalize hp
+    mn = hp.amin(dim=(2,3), keepdim=True)
+    mx = hp.amax(dim=(2,3), keepdim=True)
+    hp = (hp - mn) / (mx - mn + 1e-6)
+    # stack channels
+
+    return torch.cat([y, hp], dim=1)
+
+def gamma_stretch(x, γ=0.5): # x in [0,1]
+    return x.pow(γ)
+
 
 def scale_weaker_region(image, adjustment, initial_threshold=0.9, step=0.01):
     """
@@ -764,6 +804,30 @@ def remove_outliers(images, labels, threshold=0.1, peak_threshold=0.6, intensity
     
     return final_filtered_images, final_filtered_labels
 
+#######################################################################################################
+################################### DATA AUGMENTATION FUNCTIONS #######################################
+#######################################################################################################
+
+
+def balance_classes(images, labels):
+    """
+    Randomly down‐sample each class so they all have the same number of samples
+    equal to the size of the smallest class.
+    """
+    # collect indices per class
+    class_idxs = defaultdict(list)
+    for i, lbl in enumerate(labels):
+        class_idxs[lbl].append(i)
+    # find smallest class size
+    min_n = min(len(idxs) for idxs in class_idxs.values())
+    # sample
+    selected = []
+    for idxs in class_idxs.values():
+        selected.extend(random.sample(idxs, min_n))
+    random.shuffle(selected)
+    # return balanced lists
+    return [images[i] for i in selected], [labels[i] for i in selected]
+
 
 # Using systematic transformations instead of random choices in augmentation
 def apply_transforms_with_config(image, config):
@@ -801,7 +865,53 @@ def complex_apply_transforms_with_config(image, config, img_shape=(128, 128), in
     
     return transformed_image
 
-def apply_formatting(image, crop_size=(1, 1, 128, 128), downsample_size=(1, 1, 128, 128)):
+
+def apply_formatting(image: torch.Tensor,
+                     crop_size: tuple = (1, 1, 128, 128),
+                     downsample_size: tuple = (1, 1, 128, 128)
+                    ) -> torch.Tensor:
+    """
+    Center-crop and resize a single-channel tensor without PIL.
+
+    Args:
+      image: Tensor of shape [C, H0, W0] or [1, H0, W0].
+      crop_size:  (C, Hc, Wc) crop dimensions.
+      downsample_size:  (C, Ho, Wo) output dimensions.
+
+    Returns:
+      Tensor of shape [C, Ho, Wo].
+    """
+    # ensure shape [1, H0, W0]
+    if image.dim() == 3:
+        C, H0, W0 = image.shape
+        img = image
+    elif image.dim() == 2:
+        H0, W0 = image.shape
+        img = image.unsqueeze(0)
+        C = 1
+    else:
+        raise ValueError(f"Unexpected image dims: {image.shape}")
+
+    # unpack sizes
+    _, Hc, Wc = crop_size
+    _, Ho, Wo = downsample_size
+
+    # compute crop coords (centered)
+    y0, x0 = H0 // 2, W0 // 2
+    y1, y2 = y0 - Hc//2, y0 + Hc//2
+    x1, x2 = x0 - Wc//2, x0 + Wc//2
+
+    # clamp in case input smaller than crop
+    y1, y2 = max(0, y1), min(H0, y2)
+    x1, x2 = max(0, x1), min(W0, x2)
+
+    crop = img[:, y1:y2, x1:x2].unsqueeze(0)       # [1,C,Hc,Wc]
+    resized = F.interpolate(crop, size=(Ho, Wo),   # [1,C,Ho,Wo]
+                             mode='bilinear',
+                             align_corners=False)
+    return resized.squeeze(0)                      # [C,Ho,Wo]
+
+def apply_formatting_old(image, crop_size=(1, 1, 128, 128), downsample_size=(1, 1, 128, 128)):
     to_gray = (crop_size[-3] == 1) or (downsample_size[-3] == 1)
     transforms_list = [transforms.ToPILImage()]
     if to_gray:
@@ -815,34 +925,12 @@ def apply_formatting(image, crop_size=(1, 1, 128, 128), downsample_size=(1, 1, 1
     return preprocess(image)
 
 
-
-def apply_formatting_old(image, crop_size=(1, 128, 128), downsample_size=(1, 128, 128)): #Works only for 1-channel images
-    """
-    Crop and resize, collapsing to 1-channel only if crop_size[-3]==1 or downsample_size[-3]==1.
-    """
-    print(f"Applying formatting with crop_size: {crop_size}, downsample_size: {downsample_size}")
-    print('Shape of image before formatting:', image.shape)
-    to_gray = (crop_size[-3] == 1) or (downsample_size[-3] == 1)
-    transforms_list = [
-        transforms.ToPILImage(),
-    ]
-    print("to_gray:", to_gray)
-    if to_gray:
-        transforms_list.append(transforms.Grayscale(num_output_channels=1))
-    transforms_list += [
-        transforms.CenterCrop((crop_size[-2], crop_size[-1])),
-        transforms.Resize((downsample_size[-2], downsample_size[-1])),
-        transforms.ToTensor(),
-    ]
-    preprocess = transforms.Compose(transforms_list)
-    return preprocess(image)
-
-
-
 def img_hash(img: torch.Tensor) -> str:
+    #print("Shape of image before hashing:", img.shape)
     arr = img.cpu().contiguous().numpy()
-    return hashlib.sha1(arr.tobytes()).hexdigest()
-
+    returnval = hashlib.sha1(arr.tobytes()).hexdigest()
+    #print("Shape of image after hashing:", arr.shape)
+    return returnval
 
 ######################################################################################################
 ################################### DATA LOADING FUNCTION ############################################
@@ -1080,7 +1168,7 @@ def redistribute_excess(train_images, train_labels, eval_images, eval_labels, ta
 
 
 def load_galaxy10(path=root_path + 'Galaxy10.h5', sample_size=300, target_classes=[4], 
-                  crop_size=(3, 256, 256), downsample_size=(3, 256, 256), fold=None, island=True, REMOVEOUTLIERS=True, AUGMENT=False, train=False):
+                  crop_size=(3, 256, 256), downsample_size=(3, 256, 256), fold=None, island=True, REMOVEOUTLIERS=True, BALANCE=False, AUGMENT=False, train=False):
     print("Loading Galaxy10 data...")
 
     try:
@@ -1158,6 +1246,9 @@ def load_galaxy10(path=root_path + 'Galaxy10.h5', sample_size=300, target_classe
 
     except OSError as e:
         print(f"Failed to open the file: {e}")
+
+    if BALANCE:
+        train_images, train_labels = balance_classes(train_images, train_labels)
         
     train_images_augmented = None
     train_labels_augmented = None
@@ -1217,7 +1308,7 @@ def load_galaxy10(path=root_path + 'Galaxy10.h5', sample_size=300, target_classe
 
 
 def load_FIRST(path=None, fold=0, target_classes=None, crop_size=(1, 300, 300), downsample_size=(300, 300), sample_size=300,
-               island=False, REMOVEOUTLIERS=True, AUGMENT=False, train=True):
+               island=False, REMOVEOUTLIERS=True, BALANCE=False, AUGMENT=False, train=True):
     print("Loading FIRST data...")
     
     class_mapping = {10: 'FRI', 11: 'FRII', 12: 'Compact', 13: 'Bent'}
@@ -1295,13 +1386,14 @@ def load_FIRST(path=None, fold=0, target_classes=None, crop_size=(1, 300, 300), 
         #            images_cls = [img for img, lbl in zip(train_images, train_labels) if lbl == cls]
         #            print("Length of", kind, "images for class", cls, ":", len(images_cls))
         #            np.save(f"/users/mbredber/data/FIRST/FIRST_{kind}_{cls}_f{fold}_{len(images_cls)}.npy", images_cls)
+
+        if BALANCE:
+            train_images, train_labels = balance_classes(train_images, train_labels)
                 
         # Augment train images (converts to tensors)
         if AUGMENT:
-            train_images, train_labels = augment_images(
-                train_images, train_labels)
-            eval_images, eval_labels = augment_images(
-                eval_images, eval_labels)
+            train_images, train_labels = augment_images(train_images, train_labels)
+            eval_images, eval_labels = augment_images(eval_images, eval_labels)
         else:
             # Convert from list to tensor
             train_images = torch.stack(train_images)
@@ -1317,7 +1409,7 @@ def load_FIRST(path=None, fold=0, target_classes=None, crop_size=(1, 300, 300), 
 
 
 def load_Mirabest(target_classes=[16], crop_size=(1, 150, 150), downsample_size=(1, 150, 150), sample_size=397,
-                  train=False, island=False, REMOVEOUTLIERS=True, AUGMENT=False):
+                  train=False, island=False, REMOVEOUTLIERS=True, BALANCE=False, AUGMENT=False):
     print("Loading MiraBest data...")
 
     # Select the dataset class based on target_classes
@@ -1432,7 +1524,7 @@ def load_Mirabest(target_classes=[16], crop_size=(1, 150, 150), downsample_size=
     
 
 def load_MNIST(target_classes=[19], fold=0, crop_size=(1, 28, 28), downsample_size=(1, 28, 28), sample_size=60000,
-               train=False, island=False, AUGMENT=False, batch_size=32):
+               train=False, island=False, BALANCE=False, AUGMENT=False, batch_size=32):
     print("Loading MNIST data...")
     train_data = datasets.MNIST(root=root_path, train=True, download=True, transform=transforms.ToTensor())
     train_loader = DataLoader(train_data, REMOVEOUTLIERS=True, batch_size=batch_size, shuffle=True)
@@ -1500,7 +1592,7 @@ def load_MNIST(target_classes=[19], fold=0, crop_size=(1, 28, 28), downsample_si
     
     
 def load_RGZ10k(path=root_path + "RGZ_10k", fold=5, target_classes=None, crop_size=(1, 132, 132), sample_size=300,
-                island=False, AUGMENT=False, REMOVEOUTLIERS=True, train=True, random_state=SEED):
+                island=False, BALANCE=False, AUGMENT=False, REMOVEOUTLIERS=True, train=True, random_state=SEED):
     print("Loading rgz10k data...")
     """
     Returns splits from the RGZ10k dataset.
@@ -1683,7 +1775,7 @@ def load_RGZ10k(path=root_path + "RGZ_10k", fold=5, target_classes=None, crop_si
         images.append(img_data)
     train_images = np.stack(images, axis=0)
     
-    # Do the same for eval_images.
+    # Do the same for eval_images
     images = []
     for img_path in eval_images:
         img_data = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
@@ -1702,6 +1794,8 @@ def load_RGZ10k(path=root_path + "RGZ_10k", fold=5, target_classes=None, crop_si
     label_mapping = {label: idx for idx, label in enumerate(target_allowed_labels)}
     train_labels = [label_mapping[lbl] for lbl in train_labels]
     eval_labels = [label_mapping[lbl] for lbl in eval_labels]
+    
+    # REST CAN BE MOVED TO A COMMON FUNCTION
         
     # ------------------------------------------------------------
     # Step 7. Remove outliers and reduce dataset size per class.
@@ -1725,7 +1819,7 @@ def load_RGZ10k(path=root_path + "RGZ_10k", fold=5, target_classes=None, crop_si
     return train_images, train_labels, eval_images, eval_labels
 
 
-def load_PSZ2(path=root_path + "PSZ2/classified/T100kpcSUB", fold=5, AUGMENT=False, sample_size=300, target_classes=[53], crop_size=(1, 256, 256), downsample_size=(1, 256, 256), island=True, REMOVEOUTLIERS=True, train=False):
+def load_PSZ2(path=root_path + "PSZ2/classified/", fold=5, BALANCE=False, AUGMENT=False, sample_size=300, target_classes=[53], crop_size=(1, 256, 256), downsample_size=(1, 256, 256), island=True, REMOVEOUTLIERS=True, train=False, SAVE_IMAGES=False, EXTRADATA=False, STRETCH=True):
     print("Loading PSZ2 data...")
 
     # if you passed a 4‐tuple, use its first entry as the number of versions to load
@@ -1751,18 +1845,23 @@ def load_PSZ2(path=root_path + "PSZ2/classified/T100kpcSUB", fold=5, AUGMENT=Fal
         ch_d, h_d, w_d = 1, downsample_size[0], downsample_size[1] 
     else:
         raise ValueError("downsample_size must be a 2, 3, or 4-tuple (num_versions, channels, height, width)")
-
+    
     CUBE = True if num_versions is not None else False
 
-    version_folders = [
-        "T15arcsec","T15SUBarcsec","T25kpc","T25kpcSUB",
-        "T30arcsec","T30SUBarcsec","T50kpc","T50kpcSUB",
-        "T100kpc","T100kpcSUB","XMM","CHANDRA","R-1.25",
-        "compact-model",""   # the version-free name
-    ]
+    
+    version = 'T100kpcSUB' # if not CUBE
+    version_folders = ['T50kpcSUB', 'T100kpcSUB']
+
+    #version_folders = [
+    #    "T15arcsec","T15SUBarcsec","T25kpc","T25kpcSUB",
+    #    "T30arcsec","T30SUBarcsec","T50kpc","T50kpcSUB",
+    #    "T100kpc","T100kpcSUB","XMM","CHANDRA","R-1.25",
+    #    "compact-model",""   # the version-free name
+    #]
 
     images = []
     labels = []
+    filenames = []
 
     for cls in target_classes:
         class_folder = next(c["description"] for c in get_classes() if c["tag"] == cls)
@@ -1770,20 +1869,26 @@ def load_PSZ2(path=root_path + "PSZ2/classified/T100kpcSUB", fold=5, AUGMENT=Fal
         label = cls
         
         if CUBE:
+            version = 'CUBE'
             print("Cube mode enabled. Loading images as a cube of channels.")
             # only keep as many version_folders as the user asked for:
             vf_list = version_folders[:num_versions] if num_versions else version_folders
             for subfolder in subfolders:
                 base_names = set()
                 for vf in vf_list:
-                    folder = os.path.join(root_path, "PSZ2/classified", vf, subfolder)
-                    if os.path.isdir(folder):
-                        base_names.update(
-                            os.path.splitext(f)[0]
-                            for f in os.listdir(folder)
-                            if f.lower().endswith(".png")
-                        )
-                bad_bases = []
+                    # load only .npy files
+                    npy_path = os.path.join(root_path, "PSZ2/classified", vf, subfolder, f"{base}.npy")
+                    if not os.path.isfile(npy_path):
+                        # fallback to zeros if missing
+                        frame = torch.zeros(ch_c, h_c, w_c)
+                    else:
+                        arr = np.load(npy_path).astype(float)
+                        # percentile stretch to [0,1]
+                        p2, p98 = np.percentile(arr, (2,98))
+                        stretched = np.clip((arr - p2)/(p98 - p2 + 1e-12), 0, 1)
+                        # convert to tensor (1, H, W)
+                        frame = transforms.ToTensor()(stretched)
+                    versions.append(frame)
                 for base in base_names:
                     versions = []
                     for vf in vf_list:
@@ -1798,7 +1903,7 @@ def load_PSZ2(path=root_path + "PSZ2/classified/T100kpcSUB", fold=5, AUGMENT=Fal
                                 print(f"Zero‐padding base={base}, version={vf}: got HxW={frame.shape[-2:]}, expected {(369, 369)}")
                                 frame = torch.zeros(ch_c, h_c, w_c)
 
-                            # HOPEFUL WAY - FILL AND CUT TO RESIZE AND USE
+                            # HOPEFUL WAY - FILL AND CUT TO RESIZE AND USE (Not tried yet)
                             ## ensure frame is exactly (h_c, w_c) by center‐cropping or zero‐padding
                             #actual_h, actual_w = frame.shape[-2], frame.shape[-1]
     #
@@ -1833,81 +1938,160 @@ def load_PSZ2(path=root_path + "PSZ2/classified/T100kpcSUB", fold=5, AUGMENT=Fal
                     cube = torch.stack(versions, dim=0)  # [T, C, H, W]
                     images.append(cube)
                     labels.append(label)
+                    filenames.append(base)           # ←—— add this
 
-                    print("Number of cubes added:", len(images), "each of shape", images[0].shape)
+                print("Number of cubes added:", len(images), "each of shape", cube.shape)
+
 
         else:
+            # --- only load .npy files, stretch to [0,1], save as PNG and collect tensors ---
             for subfolder in subfolders:
-                folder_path = os.path.join(path, subfolder)
+                folder_path = os.path.join(path, version, subfolder)
                 if not os.path.isdir(folder_path):
-                    print(f"Warning: Folder {folder_path} not found. Skipping.")
+                    print(f"Warning: {folder_path} not found, skipping.")
                     continue
-                for file_name in os.listdir(folder_path):
-                    if file_name.lower().endswith((".jpg", ".jpeg", ".png")):
-                        file_path = os.path.join(folder_path, file_name)
-                        with Image.open(file_path) as img:
-                            t = transforms.ToTensor()(img)
-                            if ch_c != 4 or ch_d != 4 or h_c != 369 or h_d != 369 or w_c != 369 or w_d != 369:
-                                tensor = apply_formatting(t, crop_size, downsample_size)
-                        images.append(tensor)
-                        labels.append(label)
+                for fname in os.listdir(folder_path):
+                    if not fname.lower().endswith('.npy'):
+                        continue
+                    npy_path = os.path.join(folder_path, fname)
+                    arr = np.load(npy_path).astype(float)
 
+                    # collapse singleton dims, then if you still have a 3D stack, average into one 2D frame
+                    arr2 = np.squeeze(arr)
+                    if arr2.ndim == 3:
+                        arr2 = np.mean(arr2, axis=0)
+                    elif arr2.ndim != 2:
+                        raise ValueError(f"Expected 2-D array or 3-D stack, got shape {arr2.shape!r}")
+
+                    raw = torch.from_numpy(arr2).unsqueeze(0).float() 
+                    tensor = apply_formatting(raw,
+                        crop_size=crop_size,
+                        downsample_size=downsample_size,
+                    ) 
+                    images.append(tensor) # shape [1, C, H, W]
+                    labels.append(label) # Set label to the same for all images in this subfolder
+                    filenames.append(fname[:-4])  # remove the .npy extension
+        
 
     if len(images) == 0:
         raise ValueError("No images loaded. Check the path and file extensions.")
     
-    # Group indices by label
-    label_to_indices = collections.defaultdict(list)
-    for i, lbl in enumerate(labels):
-        label_to_indices[lbl].append(i)
+    assert len(images) == len(labels) == len(filenames), \
+       f"mismatch: {len(images)} imgs, {len(labels)} labels, {len(filenames)} files"
 
-    # Manually sample test indices (e.g., 20% from each class)
-    test_idx = []
-    train_idx = []
-    for lbl, idxs in label_to_indices.items():
-        random.Random(SEED).shuffle(idxs)
-        split = int(0.2 * len(idxs))
-        test_idx.extend(idxs[:split])
-        train_idx.extend(idxs[split:])
-        overlap = set(train_idx).intersection(test_idx)
-        assert not overlap, f"Overlap between train and eval indices: {overlap}"
-        
+    # --- dedupe block, pulling in filenames too ---
+    seen = {}                # hash -> first‐seen filename
+    unique_images, unique_labels, unique_filenames = [], [], []
+    duplicates = defaultdict(list)
+
+    for img, lbl, fname in zip(images, labels, filenames):
+        # make sure we hash the exact same raw array you later feed into the network
+        arr = img.squeeze().numpy()  
+        h = hashlib.sha1(arr.tobytes()).hexdigest()
+        if h in seen:
+            # record the duplicate filename
+            duplicates[h].append(fname)
+            continue
+        # first time we see this hash
+        seen[h] = fname
+        unique_images.append(img)
+        unique_labels.append(lbl)
+        unique_filenames.append(fname)
+
+    # report
+    if duplicates:
+        print("Found duplicate images (by hash):")
+        for h, dups in duplicates.items():
+            original = seen[h]
+            print(f"  hash {h}:")
+            print(f"    original: {original}")
+            for dup in dups:
+                print(f"    duplicate: {dup}")
+    else:
+        print("No exact‐byte duplicates found.")
+
+    # overwrite
+    images, labels, filenames = unique_images, unique_labels, unique_filenames
+
+    # now do your split
+    all_idx = list(range(len(images)))
+    train_idx, test_idx = train_test_split(
+        all_idx,
+        test_size=0.2,
+        stratify=labels,
+        random_state=SEED
+    )
+    print("train_idx", "test_idx lengths:", len(train_idx), len(test_idx))
     train_images = [images[i] for i in train_idx]
     train_labels = [labels[i] for i in train_idx]
     eval_images  = [images[i] for i in test_idx]
     eval_labels  = [labels[i] for i in test_idx]
-    
+
     print("Shape of train_images before redistribution:", len(train_images), train_images[0].shape)
+
     
+    # REST CAN BE MOVED TO A COMMON FUNCTION
+
     # Check for overlap between train and test sets
     train_hashes = {img_hash(img) for img in train_images}
-    test_hashes   = {img_hash(img) for img in eval_images}
-    common = train_hashes & test_hashes
-    assert not common, f"Overlap detected: {len(common)} images appear in both train and test sets before redistribution!"
+    eval_hashes = {img_hash(img) for img in eval_images}
+    if len(eval_images) != 0:
+        common = train_hashes & eval_hashes
+        if common:
+            overlap_hash = next(iter(common))
+            train_idxs = [i for i,img in enumerate(train_images) if img_hash(img) == overlap_hash]
+            test_idxs  = [i for i,img in enumerate(eval_images) if img_hash(img) == overlap_hash]
+            print(f"🔍 Overlap hash {overlap_hash!r} found at train indices {train_idxs} and test indices {test_idxs}")
+            assert False, f"Overlap detected: {len(common)} images appear in both train and test validation!"
+    
+    if STRETCH:
+        # percentile stretch
+        p2, p98 = np.percentile(images, (2, 98))
+        stretched = np.clip((images - p2) / (p98 - p2 + 1e-12), 0, 1)
+
+        # Arcsin stretch (convert to Tensor with batch & channel dims)
+        st_tensor = torch.from_numpy(stretched).unsqueeze(0).unsqueeze(0).float()   # shape [1,1,H,W]---
+        tensor = torch.from_numpy(stretched).unsqueeze(0).float()
+        print("Shape of stretched array :", stretched.shape)
+        
 
     train_images, train_labels, eval_images, eval_labels = redistribute_excess(
         train_images, train_labels, eval_images, eval_labels, target_classes)
     
-    
-    # Save the evaluation images as a npy file
-    #for kind in ['train', 'eval']:
-    #    for cls in target_classes:
-    #        if kind == 'train':
-    #            train_images_cls = [img for img, lbl in zip(train_images, train_labels) if lbl == cls]
-    #            print("Length of train images for class", cls, ":", len(train_images_cls))
-    #            np.save(f"/users/mbredber/scratch/data/PSZ2/classified/T100kpcSUB/DE/PSZ2_train_{cls}_{len(train_images_cls)}.npy", train_images_cls)
-    #        else:
-    #            eval_images_cls = [img for img, lbl in zip(eval_images, eval_labels) if lbl == cls]
-    #            print("Length of eval images for class", cls, ":", len(eval_images_cls))
-    #            np.save(f"/users/mbredber/scratch/data/PSZ2/classified/T100kpcSUB/DE/PSZ2_eval_{cls}_{len(eval_images_cls)}.npy", eval_images_cls)
-
+    if SAVE_IMAGES:
+        for kind, imgs, lbls in (
+            ('train', train_images, train_labels),
+            ('eval',  eval_images,  eval_labels),
+        ):
+            for cls in target_classes:
+                cls_imgs = [img for img, lbl in zip(imgs, lbls) if lbl == cls]
+                print(f"Length of {kind} images for class {cls}: {len(cls_imgs)}")
+                np.save(f"{path}_{kind}_{cls}_{len(cls_imgs)}.npy", cls_imgs)
 
     # Format and optionally augment
-    print("Shape of train_images before augmentation:", len(train_images), "x", train_images[0].shape if train_images else "N/A")
+    if BALANCE:
+        print("Counts per class before balancing:", collections.Counter(train_labels))
+        train_images, train_labels = balance_classes(train_images, train_labels)
+        print("Counts per class after balancing:", collections.Counter(train_labels))
+        
+    if EXTRADATA:
+        meta_df = pd.read_csv(os.path.join(root_path, "PSZ2/cluster_source_data.csv"))
+        print("PSZ2 metadata columns:", meta_df.columns.tolist())
+        meta_df.rename(columns={"slug": "base"}, inplace=True)
+        meta_df.set_index("base", inplace=True)
+
+        # build a list of metadata rows in the same order as your `filenames` list:
+        all_data = [meta_df.loc[base].values for base in filenames]
+        train_data = [ all_data[i] for i in train_idx ]
+        eval_data  = [ all_data[i] for i in test_idx  ]
+
     if AUGMENT:
-        print("Augmenting PSZ2 images...")
         train_images, train_labels = augment_images(train_images, train_labels, ST_augmentation=False)
         eval_images, eval_labels = augment_images(eval_images, eval_labels, ST_augmentation=False)
+        if EXTRADATA:
+            n_aug = 8  # default is 4*2 = 8
+            train_data = [row for row in train_data for _ in range(n_aug)]
+            eval_data  = [row for row in eval_data  for _ in range(n_aug)]
     else:
         train_images = torch.stack(train_images)
         train_labels = torch.tensor(train_labels, dtype=torch.long)
@@ -1916,7 +2100,13 @@ def load_PSZ2(path=root_path + "PSZ2/classified/T100kpcSUB", fold=5, AUGMENT=Fal
         
     print("Shape of train_images returned from PSZ2:", train_images.shape)
     
+    if EXTRADATA:
+        # (optional) convert to a tensor if you want a single numeric array
+        train_data = torch.tensor(np.stack(train_data), dtype=torch.float32)
+        eval_data  = torch.tensor(np.stack(eval_data),  dtype=torch.float32)
 
+        # Return images, labels, AND metadata arrays instead of just IDs
+        return train_images, train_labels, eval_images, eval_labels, train_data, eval_data
     return train_images, train_labels, eval_images, eval_labels
 
 
@@ -1928,7 +2118,7 @@ def load_MGCLS(path='/users/mbredber/data/MGCLS/classified_crops_1600/',  # Path
                sample_size=300,
                island=True,
                REMOVEOUTLIERS=True,
-               AUGMENT=False,
+               BALANCE=False, AUGMENT=False,
                train=False):
 
 
@@ -1990,6 +2180,9 @@ def load_MGCLS(path='/users/mbredber/data/MGCLS/classified_crops_1600/',  # Path
     eval_images  = [images[i] for i in test_idx]
     eval_labels  = [labels[i] for i in test_idx]
     
+    
+    ## REST CAN BE MOVED TO A COMMON FUNCTION
+    
     # Rebalance any leftover via your redistribute_excess
     train_images, train_labels, eval_images, eval_labels = redistribute_excess(
         train_images, train_labels, eval_images, eval_labels, target_classes)
@@ -1997,6 +2190,10 @@ def load_MGCLS(path='/users/mbredber/data/MGCLS/classified_crops_1600/',  # Path
     print("MGCLS images shape before augmentation:", len(train_images), "x", train_images[0].shape if train_images else "N/A")
 
     # stack into tensors (and optionally augment)
+        # enforce equal class sizes before augmentation
+    if BALANCE:
+        train_images, train_labels = balance_classes(train_images, train_labels)
+
     if AUGMENT:
         train_images, train_labels = augment_images(train_images, train_labels, ST_augmentation=False)
         eval_images, eval_labels = augment_images(eval_images, eval_labels, ST_augmentation=False)
@@ -2009,7 +2206,7 @@ def load_MGCLS(path='/users/mbredber/data/MGCLS/classified_crops_1600/',  # Path
     return train_images, train_labels, eval_images, eval_labels
 
 
-def load_galaxies(galaxy_class, path=None, fold=None, island=None, crop_size=None, downsample_size=None, sample_size=None, REMOVEOUTLIERS=True, AUGMENT=False, train=None):
+def load_galaxies(galaxy_class, path=None, fold=None, island=None, crop_size=None, downsample_size=None, sample_size=None, REMOVEOUTLIERS=True, BALANCE=False, AUGMENT=False, STRETCH=False, train=None):
     """
     Master loader that delegates to specific dataset loaders and returns zero-based labels.
     """
@@ -2020,7 +2217,7 @@ def load_galaxies(galaxy_class, path=None, fold=None, island=None, crop_size=Non
 
     # Clean up kwargs to remove None values
     kwargs = {'path': path, 'sample_size': sample_size, 'fold':fold, 'train': train,
-              'island': island, 'REMOVEOUTLIERS': REMOVEOUTLIERS, 'AUGMENT': AUGMENT,
+              'island': island, 'REMOVEOUTLIERS': REMOVEOUTLIERS, 'BALANCE': BALANCE, 'AUGMENT': AUGMENT,
               'crop_size': crop_size, 'downsample_size': downsample_size}
     clean_kwargs = {k: v for k, v in kwargs.items() if v is not None}
 
@@ -2057,16 +2254,17 @@ def load_galaxies(galaxy_class, path=None, fold=None, island=None, crop_size=Non
         raise ValueError("Invalid galaxy class provided.")
 
     # Check for overlap between train and test sets
+    print("Data loaded:", len(data[0]), "train images,", len(data[2]) if len(data) > 2 else 0, "eval images.")
     train_hashes = {img_hash(img) for img in data[0]}
     eval_images = data[2] if len(data) > 2 else []
     if len(eval_images) != 0:
         test_hashes = {img_hash(img) for img in eval_images}
         common = train_hashes & test_hashes
-        assert not common, f"Overlap detected: {len(common)} images appear in both train and test validation!"
+        if common:
+            overlap_hash = next(iter(common))
+            train_idxs = [i for i,img in enumerate(data[0]) if img_hash(img) == overlap_hash]
+            test_idxs  = [i for i,img in enumerate(data[2]) if img_hash(img) == overlap_hash]
+            print(f"🔍 Overlap hash {overlap_hash!r} found at train indices {train_idxs} and test indices {test_idxs}")
+            assert False, f"Overlap detected: {len(common)} images appear in both train and test validation!"
 
-    # Zero-base labels for classifier compatibility
-    train_images, train_labels, eval_images, eval_labels = data
-    min_lbl = train_labels.min()
-    train_labels = train_labels - min_lbl
-    eval_labels = eval_labels - min_lbl
-    return train_images, train_labels, eval_images, eval_labels
+    return data
