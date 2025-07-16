@@ -142,17 +142,28 @@ def plot_images_by_class(images, labels, num_images=5, save_path="./classifier/u
         for j in range(num_images):
             ax = axes[i, j]
             arr = label_images[j]
-            # move tensor to numpy if needed
             if isinstance(arr, torch.Tensor):
                 arr = arr.cpu().detach().numpy()
-            # collapse channels: average if >1, otherwise just drop the channel dim
-            if arr.ndim == 3:
+
+            # If shape is [T, C, H, W], average channels and show each T slice
+            if arr.ndim == 4:
+                for t in range(arr.shape[0]):
+                    t_img = arr[t].mean(axis=0)  # average over channels
+                    if j + t * num_images >= axes.shape[1]:
+                        continue  # skip overflow
+                    ax = axes[i, j + t * num_images // arr.shape[0]]
+                    ax.imshow(t_img, cmap="gray")
+                    ax.set_xticks([]); ax.set_yticks([])
+                    if j > 0:
+                        ax.axis("off")
+
+            elif arr.ndim == 3:
                 img2d = arr.mean(axis=0) if arr.shape[0] > 1 else arr[0]
-            else:
-                img2d = arr
-            # remove any singleton dims to ensure shape is (H, W)
-            img2d = img2d.squeeze()
-            ax.imshow(first_channel(img2d), cmap="gray")
+                img2d = img2d.squeeze()
+                ax.imshow(img2d, cmap="gray")
+                ax.set_xticks([]); ax.set_yticks([])
+                if j > 0:
+                    ax.axis("off")
 
             ax.set_xticks([]); ax.set_yticks([])
             if j > 0:

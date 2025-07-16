@@ -4,14 +4,15 @@ import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader, Subset, Dataset
 from torchsummary import summary
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score 
-from utils.data_loader import load_galaxies, get_classes,  get_synthetic, augment_images, img_hash, apply_formatting
+from utils.data_loader import load_galaxies, get_classes,  get_synthetic, augment_images
 from utils.classifiers import RustigeClassifier, TinyCNN, MLPClassifier, SCNN, CNNSqueezeNet, ScatterResNet, DANNClassifier, BinaryClassifier, ScatterSqueezeNet, ScatterSqueezeNet2, DualCNNSqueezeNet
 #from utils.Cloud_Net import CloudNet
 from utils.training_tools import EarlyStopping, reset_weights
-from utils.calc_tools import cluster_metrics, normalise_images
+from utils.calc_tools import cluster_metrics, normalise_images, check_tensor, fold_T_axis, compute_scattering_coeffs, custom_collate
 from utils.plotting import plot_histograms, plot_images_by_class, plot_image_grid, plot_background_histogram
 from torchvision.utils import make_grid, save_image
 from kymatio.torch import Scattering2D
+import pandas as pd
 import pickle
 from tqdm import tqdm
 from torch.optim import AdamW
@@ -59,20 +60,20 @@ classifier = ["TinyCNN", # Very Simple CNN
               "CloudNet", # From https://github.com/SorourMo/Cloud-Net-A-semantic-segmentation-CNN-for-cloud-detection/tree/master
               "DANN", # Domain-Adversarial Neural Network
               "ScatterNet", "ScatterSqueezeNet", "ScatterSqueezeNet2",
-              "Binary", "ScatterResNet"][4]
+              "Binary", "ScatterResNet"][-4]
 gen_model_names = ['DDPM'] #['ST', 'DDPM', 'wGAN', 'GAN', 'Dual', 'CNN', 'STMLP', 'lavgSTMLP', 'ldiffSTMLP'] # Specify the generative model_name
 num_epochs_cuda = 200
 num_epochs_cpu = 100
 learning_rates = [1e-3]  # Learning rates
 regularization_params = [1e-3]  # Regularisation parameters
 label_smoothing = 0  # Label smoothing for the classifier
-num_experiments = 3
+num_experiments = 10
 folds = [5] # 0-4 for 5-fold cross validation, 5 for only one training
 lambda_values = [0]  # Ratio between generated images and original images per class. 8 is reserfved for TRAINONGENERATED
 
 STRETCH = True  # Stretch the images with mathematical morphology
 ES, patience = True, 10  # Use early stopping
-SCHEDULER = True  # Use a learning rate scheduler
+SCHEDULER = False  # Use a learning rate scheduler
 SHOWIMGS = True  # Show some generated images for each class (Tool for control)
 
 NORMALISEIMGS = False  # Normalise images to [0, 1]
@@ -115,13 +116,13 @@ if any (cls in galaxy_classes for cls in [10, 11, 12, 13]):
     crop_size = (128, 128)  # Crop size for the images
     downsample_size = (128, 128)  # Downsample size for the images
     batch_size = 128
-elif galaxy_classes == [40, 41]:
+elif galaxy_classes[0] in list(range(40, 49)):
     crop_size = (1600, 1600)  # Crop size for the images
     downsample_size = (128, 128)  # Downsample size for the images
     batch_size = 16
 elif galaxy_classes[0] in list(range(50, 60)):
-    crop_size = (1, 128, 128)  # Crop size for the images
-    downsample_size = (1, 128, 128)  # Downsample size for the images
+    crop_size = (1, 2000, 2000)  # Crop size for the images
+    downsample_size = (1, 2000, 2000)  # Downsample size for the images
     batch_size = 16 
 
 img_shape = downsample_size
@@ -211,217 +212,107 @@ all_pred_probs = {}
 history = {} 
 dataset_sizes = {}
 
-##############################################
-############## FUNCTIONS #####################
-##############################################
-
-
-scattering = Scattering2D(J=J, L=L, shape=img_shape[-2:], max_order=order)       
-def compute_scattering_coeffs(images, scattering=scattering, batch_size=128, device="cpu"):
-    scat_coeffs_list = []
-    with torch.no_grad():
-        for i in range(0, len(images), batch_size):
-            batch = images[i:i + batch_size].to(device)
-            if img_shape[0] == 1:  # If images are grayscale, add a channel dimension
-                batch_scat = scattering(batch).detach()  # e.g. shape [B, 1, C, H, W]
-            else:
-                #scat_channels = [scattering(batch[:, i:i+1, :, :]).detach() for i in range(batch.shape[1])]
-                # ensure the whole batch is contiguous
-                batch = batch.contiguous()
-                # and each channel‐slice, too
-                scat_channels = [
-                    scattering(batch[:, i:i+1, :, :].contiguous()).detach()
-                    for i in range(batch.shape[1])
-                ]
-
-                batch_scat = torch.cat(scat_channels, dim=1)
-
-            # Squeeze out the singleton dimension at index 1 if present.
-            if batch_scat.shape[1] == 1:
-                batch_scat = batch_scat.squeeze(1)  # becomes [B, C, H, W]
-            scat_coeffs_list.append(batch_scat.cpu())
-        scat_coeffs = torch.cat(scat_coeffs_list, dim=0)
-    return scat_coeffs
-
-
-def cache_scattering(images, scattering, cache_path, batch_size=128, device='cpu'):
-    if os.path.exists(cache_path):
-        print("Loading cached scattering coefficients from", cache_path)
-        scat_coeffs = torch.load(cache_path)
-    else:
-        print("Computing scattering coefficients and caching to", cache_path)
-        scat_coeffs_list = []
-        with torch.no_grad():
-            for i in range(0, len(images), batch_size):
-                batch = images[i:i + batch_size].to(device)
-                batch_scat = scattering(batch).detach()
-                if batch_scat.shape[1] == 1:
-                    batch_scat = batch_scat.squeeze(1)
-                scat_coeffs_list.append(batch_scat.cpu())
-        scat_coeffs = torch.cat(scat_coeffs_list, dim=0)
-        torch.save(scat_coeffs, cache_path)
-    return scat_coeffs
-
-
-# First, when you compute and save the scattering coefficients,
-# write them to a memmap file instead of saving a full tensor.
-def cache_scattering_memmap(images, scattering, cache_path, batch_size=128, device="cpu"):
-    num_images = len(images)
-    # Determine the shape for one sample
-    with torch.no_grad():
-        sample = scattering(images[:batch_size].to(device)).detach()
-        if sample.shape[1] == 1:
-            sample = sample.squeeze(1)
-        sample_shape = sample.shape[1:]  # e.g., (C, H, W)
-    full_shape = (num_images,) + sample_shape
-    
-    if not os.path.exists(cache_path):
-        print("Computing and writing scattering coefficients to memmap at", cache_path)
-        # Create a memmap array in write mode
-        memmap_array = np.memmap(cache_path, dtype=np.float32, mode='w+', shape=full_shape)
-        with torch.no_grad():
-            for i in range(0, num_images, batch_size):
-                batch = images[i:i+batch_size].to(device)
-                batch_scat = scattering(batch).detach()
-                if batch_scat.shape[1] == 1:
-                    batch_scat = batch_scat.squeeze(1)
-                memmap_array[i:i+batch_size] = batch_scat.cpu().numpy()
-        # Flush changes to disk
-        memmap_array.flush()
-    else:
-        print("Memmap cache found at", cache_path)
-    return cache_path, full_shape
-
-# Then, create a custom dataset that loads scattering coefficients from the memmap file.
-class CachedScatterDataset(Dataset):
-    def __init__(self, images, labels, cache_file, scatter_shape):
-        self.images = images  # still in memory
-        self.labels = labels
-        self.cache_file = cache_file
-        self.scatter_shape = scatter_shape
-        # Open the memmap in read mode; this does not load everything into RAM.
-        self.scat_memmap = np.memmap(cache_file, dtype=np.float32, mode='r', shape=scatter_shape)
-
-    def __len__(self):
-        return len(self.labels)
-
-    def __getitem__(self, idx):
-        image = self.images[idx]
-        label = self.labels[idx]
-        # Only load the scattering coefficient for the current index.
-        scat = torch.tensor(self.scat_memmap[idx]).float()
-        if NORMALISESCS:
-            scat = normalise_images(scat, 0, 1) 
-        if NORMALISESCSTOPM:
-            scat = normalise_images(scat, -1, 1)
-
-        return image, scat, label
-def custom_collate(batch):
-    if len(batch) < 3:  # Drop the batch if it contains fewer than 3 images
-        return None
-    return torch.utils.data.dataloader.default_collate(batch)
-
-def save_images_tensorboard(images, save_path, nrow=4):
-    grid = make_grid(images, nrow=nrow, normalize=True, value_range=(-1, 1))
-    save_image(grid, save_path)
-    
-def filter_generated_images(generated_images_list, generated_labels_list):
-    # Pairwise comparison of generated images
-    filtered_images_list, filtered_labels_list = [], []
-    for i, img1 in enumerate(generated_images_list):
-        is_unique = True
-        for j, img2 in enumerate(generated_images_list):
-            if i == j:
-                continue
-            if torch.allclose(img1, img2, atol=1e-3):
-                is_unique = False
-                break
-        if is_unique:
-            filtered_images_list.append(img1)
-            filtered_labels_list.append(generated_labels_list[i])
-            
-    # Plot some example of images next to their similar images
-    if SHOWIMGS:
-        for i in range(min(18, len(filtered_images_list))):
-            save_images_tensorboard(torch.cat([filtered_images_list[i], generated_images_list[i]], dim=0), save_path=f"./classifier/{gen_model_name}_{galaxy_classes}_filtered_grid.png", nrow=6)
-
-    return filtered_images_list, filtered_labels_list
-
-def fold_T_axis(imgs: torch.Tensor) -> torch.Tensor:
-    """
-    If imgs is 5-D (N, T, C, H, W), reshape to (N, T*C, H, W);
-    otherwise return unchanged.
-    """
-    if imgs.dim() == 5:
-        N, T, C, H, W = imgs.shape
-        return imgs.view(N, T * C, H, W)
-    return imgs
-
-
-def check_tensor(name, tensor):
-        # skip completely empty tensors
-        if tensor.numel() == 0:
-            print(f"Warning: {name} is empty, skipping stats.")
-            return
-
-        if torch.isnan(tensor).any():
-            print(f"Warning: {name} contains NaNs")
-        if torch.isinf(tensor).any():
-            print(f"Warning: {name} contains Infs")
-        if tensor.is_floating_point():
-            print(f"{name} stats: min={tensor.min().item():.3f}, "
-                f"max={tensor.max().item():.3f}, "
-                f"mean={tensor.mean().item():.3f}, "
-                f"std={tensor.std().item():.3f}")
-        else:
-            vals, counts = torch.unique(tensor, return_counts=True)
-            print(f"{name} unique values: {vals.tolist()}, counts: {counts.tolist()}")
-
 
 ###############################################
 ########### READ IN TEST DATA #################
 ######## Needs only be done once ##############
 ###############################################
 
-
+scattering = Scattering2D(J=J, L=L, shape=img_shape[-2:], max_order=order)      
 for gen_model_name in gen_model_names:
 
     with torch.no_grad():
         dummy = torch.zeros((1, *img_shape)).cpu()
         scat_dummy = scattering(dummy)
-        if scat_dummy.shape[1] == 1:
-            scat_dummy = scat_dummy.squeeze(1)
-    scatshape = tuple(scat_dummy.shape[1:])
+        if scat_dummy.dim()==5:
+            # fold T into channels
+            scat_dummy = scat_dummy.flatten(1,2)
+        # now scat_dummy.shape == [1, C, H, W]
+        scatshape = tuple(scat_dummy.shape[1:])   # (C, H, W)
     hidden_dim1 = 256
     hidden_dim2 = 128
     vae_latent_dim = 64
     
     print("crop_size: ", crop_size)
-    train_imgs, train_lbls, test_images, test_labels = load_galaxies(galaxy_class=galaxy_classes, 
+    _out  = load_galaxies(galaxy_class=galaxy_classes, 
                 fold=max(folds), #Any fold other than 5 gives me the test data for the five fold cross validation
                 crop_size=crop_size,
                 downsample_size=downsample_size,
                 sample_size=max_num_galaxies, 
                 REMOVEOUTLIERS=FILTERED,
                 BALANCE=BALANCE,           # Reduce the larger classes to the size of the smallest class
+                STRETCH=STRETCH,
                 AUGMENT=True,
                 train=False)
     
+
+    if len(_out) == 4:
+        train_images, train_labels, test_images, test_labels = _out
+        train_data = test_data = None
+    elif len(_out) == 6:
+        print("Received 6 outputs from load_galaxies, including extra features.")
+        train_images, train_labels, test_images, test_labels, train_data, test_data = _out
+
+        EXTRAVARS = True  # Use extra features (redshift, mass, size) for the classifier
+
+        class MetaWrapper(nn.Module):
+            def __init__(self, base_model: nn.Module, meta_dim: int, hidden: int = 64, num_classes: int = 2):
+                super().__init__()
+                self.base = base_model
+                # assume `base_model` ends by outputting a feature vector of size `feat_dim`
+                # you may need to probe this or hard‐code it based on model summaries
+                feat_dim = self._find_feat_dim(meta_dim, num_classes)
+                self.meta_fc = nn.Sequential(
+                    nn.Linear(meta_dim, hidden),
+                    nn.ReLU(),
+                )
+                self.classifier = nn.Linear(feat_dim + hidden, num_classes)
+
+            def _find_feat_dim(self, meta_dim, num_classes):
+                # dummy pass to get the feature‐vector size
+                self.base.eval()
+                with torch.no_grad():
+                    # pass a single dummy through the “body” of base_model up to before its classifier
+                    # here we assume you can do `base_model.feature_extractor(...)`
+                    # if you don’t have such a method, you’ll need to monkey‐patch your models or
+                    # rework this; for now we’ll hard‐code:
+                    return 128
+
+            def forward(self, img, scat, meta):
+                # route through whatever your base expects
+                if hasattr(self.base, "forward_scatter"):
+                    img_feat = self.base.forward_scatter(scat)
+                elif hasattr(self.base, "forward_both"):
+                    img_feat = self.base.forward_both(img, scat)
+                else:
+                    img_feat = self.base(img)
+                meta_feat = self.meta_fc(meta)
+                return self.classifier(torch.cat([img_feat, meta_feat], dim=1))
+
+    else:
+        raise ValueError(f"load_galaxies returned {len(_out)} values, expected 4 or 6")
+    
     # ——— Data sanity checks ———
     print("Shape of test_images: ", np.shape(test_images))
-    print("Type of test_images: ", type(test_images))
             
-    check_tensor("Train images", train_imgs)
     check_tensor("Test images", test_images)
+    check_tensor("Train images", train_images)
     
     # Check the tensor for each class
-    for cls in range(num_classes):
-        cls_mask = (train_lbls == cls)
-        cls_images = train_imgs[cls_mask]
+    for cls in galaxy_classes:
+        cls_mask = (train_labels == cls)
+        cls_images = train_images[cls_mask]
         check_tensor(f"Train images for class {cls}", cls_images)
 
+    import hashlib
+
+    def img_hash(img: torch.Tensor) -> str:
+        # ensure CPU & contiguous
+        arr = img.cpu().contiguous().numpy()
+        return hashlib.sha1(arr.tobytes()).hexdigest()
+
     # after loading train_images, test_images:
-    train_hss = {img_hash(img) for img in train_imgs}
+    train_hss = {img_hash(img) for img in train_images}
     test_hashes   = {img_hash(img) for img in test_images}
 
     common = train_hss & test_hashes
@@ -432,88 +323,13 @@ for gen_model_name in gen_model_names:
     perm = torch.randperm(test_images.size(0))
     test_images = test_images[perm]
     test_labels = test_labels[perm]
+    if EXTRAVARS:
+        test_data = test_data[perm]
 
 
     # Print the distribution of raw test labels
     unique_labels, counts = torch.unique(test_labels, return_counts=True)
     print("Test labels distribution (raw):", dict(zip(unique_labels.tolist(), counts.tolist())))
-    
-    if STRETCH:
-        check_tensor("Test images before stretch", test_images)
-        #test_images = torch.log1p(test_images) /math.log(2)  # Log stretch to [0, 1]
-        #test_images = torch.sqrt(test_images) 
-        #test_images = test_images.pow(1/3)
-        
-        def asinh_stretch(x, alpha=10):
-            return torch.asinh(alpha * x) / math.asinh(alpha)
-            
-        def add_highpass(x, alpha=100):
-            # asinh stretch
-            y = torch.asinh(alpha * x) / math.asinh(alpha)
-            # low-pass + subtract
-            lp = torch.nn.functional.avg_pool2d(y, kernel_size=15, stride=1, padding=7)
-            hp = torch.clamp(y - lp, min=0.)
-            # normalize hp
-            mn = hp.amin(dim=(2,3), keepdim=True)
-            mx = hp.amax(dim=(2,3), keepdim=True)
-            hp = (hp - mn) / (mx - mn + 1e-6)
-            # stack channels
-
-            return torch.cat([y, hp], dim=1)
-
-        def percentile_stretch(x, lo=2, hi=98):
-            """
-            x: Tensor of shape (B, C, H, W), values in [0,1]
-            returns: same shape, linearly rescaled so that the lo-th percentile
-                    → 0 and the hi-th percentile → 1 (per–image, per–channel).
-            """
-            B, C, H, W = x.shape
-            # flatten the spatial dims into one (B,C,H*W)
-            flat = x.view(B, C, -1)
-
-            # get the lo/hi percentiles along that last axis
-            p_low  = flat.quantile(lo/100.0, dim=2, keepdim=True)   # shape (B, C, 1)
-            p_high = flat.quantile(hi/100.0, dim=2, keepdim=True)   # shape (B, C, 1)
-
-            # reshape back to (B,C,1,1) so we can broadcast against x
-            p_low  = p_low.unsqueeze(-1)    # (B,C,1,1)
-            p_high = p_high.unsqueeze(-1)   # (B,C,1,1)
-
-            # linear stretch and clip
-            y = (x - p_low) / (p_high - p_low + 1e-6)
-            return y.clamp(0,1)
-
-
-        def gamma_stretch(x, γ=0.5):
-            # x in [0,1]
-            return x.pow(γ)
-
-        import skimage.exposure as exposure
-
-        def clahe_tensor(x, clip_limit=0.01, tile_size=(32,32)):
-            # x: torch.Tensor B×1×H×W → numpy, apply CLAHE per‐image, back to torch
-            out = []
-            for img in x.cpu().numpy():
-                img_eq = exposure.equalize_adapthist(img[0], clip_limit=clip_limit,
-                                                    kernel_size=tile_size)
-                out.append(img_eq[None])
-            return torch.tensor(np.stack(out), device=x.device).float()
-
-        from astropy.visualization import ZScaleInterval
-
-
-        zs = ZScaleInterval(contrast=0.25)   # try contrast ∈ [0.1…0.5]
-        def zscale_tensor(x):
-            out = []
-            for img in x.cpu().numpy():
-                vmin, vmax = zs.get_limits(img[0])
-                y = (img - vmin) / (vmax - vmin + 1e-6)
-                out.append(np.clip(y,0,1)[None])
-            return torch.tensor(np.stack(out), device=x.device).float()
-
-
-        test_images  = asinh_stretch(test_images, alpha=10)
-        check_tensor("Test images after stretch+highpass", test_images)
     
     if NORMALISEIMGS or NORMALISEIMGSTOPM:
         if NORMALISEIMGSTOPM:
@@ -521,30 +337,26 @@ for gen_model_name in gen_model_names:
         else:
             test_images = normalise_images(test_images, 0, 1)
 
-    # Handle scattering coefficients normalization in a similar way
-    if classifier in ['ScatterNet', 'ScatterSqueezeNet', 'ScatterSqueezeNet2']:
+    # Prepare input data
+    # Produce an empty tensor to occupy the not used component of the datasets. 
+    if classifier in ['ScatterNet', 'ScatterResNet', 'ScatterSqueezeNet', 'ScatterSqueezeNet2']:
+        test_images = fold_T_axis(test_images)
+        test_scat_coeffs = compute_scattering_coeffs(test_images, scattering, batch_size=128, device='cpu')
+        if test_scat_coeffs.dim() == 5:
+            # [B, C_in, C_scat, H, W] → [B, C_in*C_scat, H, W]
+            test_scat_coeffs = test_scat_coeffs.flatten(start_dim=1, end_dim=2)
+                        
         if NORMALISESCS or NORMALISESCSTOPM:
             if NORMALISESCSTOPM:
                 test_scat_coeffs = normalise_images(test_scat_coeffs, -1, 1)
             else:
                 test_scat_coeffs = normalise_images(test_scat_coeffs, 0, 1)
-                
-    # Prepare input data
-    # Produce an empty tensor to occupy the not used component of the datasets. 
-    # It should have the same size as the test images
-    mock_tensor = torch.zeros_like(test_images)
-    if classifier in ['ScatterNet', 'ScatterResNet', 'ScatterSqueezeNet', 'ScatterSqueezeNet2']:
-        test_images = fold_T_axis(test_images)
-        test_scat_coeffs = compute_scattering_coeffs(test_images)
-        # collapse the two “channel” dims into one
-        if test_scat_coeffs.dim() == 5:
-            test_scat_coeffs = test_scat_coeffs.flatten(start_dim=1, end_dim=2)
-
-        if classifier in ['ScatterNet', 'ScatterResNet']:
-            test_dataset = TensorDataset(test_images, mock_tensor, test_labels)
+        if EXTRAVARS:
+            test_dataset = TensorDataset(test_images, test_scat_coeffs, test_data, test_labels)
         else:
             test_dataset = TensorDataset(test_images, test_scat_coeffs, test_labels)
     else: 
+        mock_tensor = torch.zeros_like(test_images)
         test_dataset = TensorDataset(test_images, mock_tensor, test_labels)
                             
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=custom_collate, drop_last=False)
@@ -570,38 +382,61 @@ for gen_model_name in gen_model_names:
             # only synthetic for training; reserve real for validation
             train_images = torch.empty((0, *img_shape), device=DEVICE)
             train_labels = torch.empty((0,), dtype=torch.long, device=DEVICE)
-            _, _, valid_images, valid_labels = load_galaxies(
+            _out = load_galaxies(
                 galaxy_class=galaxy_classes,
                 fold=fold,
                 crop_size=crop_size,
                 downsample_size=downsample_size,
                 sample_size=max_num_galaxies,
                 REMOVEOUTLIERS=FILTERED,
-                BALANCE=BALANCE,         
-                AUGMENT=False,   # no augmentation on hold-out real val set
+                BALANCE=BALANCE,           # Reduce the larger classes to the size of the smallest class
+                AUGMENT=False,   
                 train=True
             )
+            
+            if len(_out) == 4:
+                _, _, valid_images, valid_labels = _out
+                valid_data = None
+            elif len(_out) == 6:
+                _, _, valid_images, valid_labels, _, valid_data = _out
+
             valid_labels = valid_labels - valid_labels.min()
             perm = torch.randperm(valid_images.size(0))
             valid_images, valid_labels = valid_images[perm], valid_labels[perm]
+            if EXTRAVARS:
+                valid_data = valid_data[perm]
         else:
             # real train + valid
-            train_images, train_labels, valid_images, valid_labels = load_galaxies(
+            _out = load_galaxies(
                 galaxy_class=galaxy_classes,
                 fold=fold,
                 crop_size=crop_size,
                 downsample_size=downsample_size,
                 sample_size=max_num_galaxies,
                 REMOVEOUTLIERS=FILTERED,
-                BALANCE=BALANCE,         
+                BALANCE=BALANCE,           # Reduce the larger classes to the size of the smallest class
+                STRETCH=STRETCH,
                 AUGMENT=True,
                 train=True
             )
+
+            if len(_out) == 4:
+                train_images, train_labels, valid_images, valid_labels = _out
+                train_data = test_data = None
+            elif len(_out) == 6:
+                train_images, train_labels, valid_images, valid_labels, train_data, valid_data = _out
+
+            assert train_images.size(0) == train_labels.size(0), \
+                f"train_images ({len(train_images)}) and train_labels ({len(train_labels)}) must match!"
+
             valid_labels = valid_labels - valid_labels.min()
             perm = torch.randperm(train_images.size(0))
             train_images, train_labels = train_images[perm], train_labels[perm]
             perm = torch.randperm(valid_images.size(0))
             valid_images, valid_labels = valid_images[perm], valid_labels[perm]
+            if EXTRAVARS:
+                train_data = train_data[perm]
+                valid_data = valid_data[perm]
             dataset_sizes[fold] = [int(len(train_images) * p) for p in dataset_portions]
             
             
@@ -694,6 +529,9 @@ for gen_model_name in gen_model_names:
         print("Train labels distribution (raw):", dict(zip(unique_labels.tolist(), counts.tolist())))
         
         if TRAINONGENERATED:
+            if EXTRAVARS:
+                print("Cannot use extra features with TRAINONGENERATED, setting EXTRAVARS to False")
+                EXTRAVARS = False
             # For each class, select the correct slice of (images, labels), then concatenate all.
             class_imgs, class_lbls = [], []
             offset = min(galaxy_classes)
@@ -718,10 +556,11 @@ for gen_model_name in gen_model_names:
             train_images, train_labels = augment_images(train_images, train_labels)
             USE_CLASS_WEIGHTS = True
             
-        # Shuffle the training data
-        perm = torch.randperm(train_images.size(0))
-        train_images = train_images[perm]
-        train_labels = train_labels[perm]
+            # Shuffle the training data
+            perm = torch.randperm(train_images.size(0))
+            train_images = train_images[perm]
+            train_labels = train_labels[perm]
+
             
         unique_labels, counts = torch.unique(train_labels, return_counts=True)
         print("Train labels distribution (raw) after possible filtering and augmentation:", dict(zip(unique_labels.tolist(), counts.tolist())))
@@ -803,18 +642,6 @@ for gen_model_name in gen_model_names:
                 train_images, valid_images = chunked_imgs
                 train_labels, valid_labels = chunked_lbls
                         
-        print("Length of train_images before packaging: ", len(train_images))
-        print("Length of train labels before packaging: ", len(train_labels))
-        
-        if STRETCH:
-            check_tensor("Train images before stretch", train_images)
-            #train_images = torch.log1p(train_images) /math.log(2)  # Log stretch to [0, 1]
-            #train_images = torch.sqrt(train_images)
-            #train_images = train_images.pow(1/3)
-
-            train_images = asinh_stretch(train_images, alpha=10)
-            valid_images = asinh_stretch(valid_images, alpha=10)
-            check_tensor("Train images after stretch", train_images)
         
         
         # Normalise images if requested
@@ -828,7 +655,6 @@ for gen_model_name in gen_model_names:
             
         
         # ── SANITY-CHECK PLOTS ON FIRST FOLD ONLY ──
-        print("SHOWIMGS: ", SHOWIMGS)
         if fold == folds[0] and SHOWIMGS and downsample_size == (1, 128, 128):
             
             if len(galaxy_classes) == 2:
@@ -865,12 +691,12 @@ for gen_model_name in gen_model_names:
                     plot_image_grid(
                         orig_imgs.cpu(),
                         num_images=36,
-                        save_path=f"./classifier/{classifier}_{gen_model_name}_{cls}_f{fold}_real_grid1.png"
+                        save_path=f"./classifier/{classifier}_{gen_model_name}_{cls}_f{fold}_real_grid.png"
                     )
                     plot_image_grid(
                         test_imgs.cpu(),
                         num_images=36,
-                        save_path=f"./classifier/{classifier}_{gen_model_name}_{cls}_f{fold}_test_grid1.png"
+                        save_path=f"./classifier/{classifier}_{gen_model_name}_{cls}_f{fold}_test_grid.png"
                     )
 
                     if lambda_generate not in [0, 8]:
@@ -919,8 +745,6 @@ for gen_model_name in gen_model_names:
             plot_images_by_class(imgs, labels=lbls, num_images=5, save_path=f"./classifier/{classifier}_{gen_model_name}_{galaxy_classes}_example_train_data.pdf")
         
         # Prepare input data
-        mock_tensor = torch.zeros_like(train_images)
-        valid_mock_tensor = torch.zeros_like(valid_images)
         if classifier in ['ScatterNet', 'ScatterResNet', 'ScatterSqueezeNet', 'ScatterSqueezeNet2']:
             # Define cache paths (you can adjust these names as needed)
             train_cache_path = f"./.cache/train_scat_{galaxy_classes}_{fold}_{lambda_generate}_{dataset_portions[0]}_{FILTERED}_{TRAINONGENERATED}.npy"
@@ -937,21 +761,27 @@ for gen_model_name in gen_model_names:
             else:
 
                 # fold T into channels on both real & scattering inputs
+                print("Shape of train_images before folding T axis: ", train_images.shape)
 
                 train_images = fold_T_axis(train_images)
                 valid_images = fold_T_axis(valid_images)
                 mock_train = torch.zeros_like(train_images)
                 mock_valid = torch.zeros_like(valid_images)
 
+                print("Shape of train_images after folding T axis: ", train_images.shape)
+
                 train_cache = f"./.cache/train_scat_{galaxy_classes}_{fold}_{lambda_generate}_{dataset_portions[0]}_{FILTERED}.pt"
                 valid_cache = f"./.cache/valid_scat_{galaxy_classes}_{fold}_{lambda_generate}_{dataset_portions[0]}_{FILTERED}.pt"
                 train_scat_coeffs = compute_scattering_coeffs(train_images, scattering, batch_size=128, device="cpu")
                 valid_scat_coeffs = compute_scattering_coeffs(valid_images, scattering, batch_size=128, device="cpu")
+                print("Shape of train_scat_coeffs directly after computation: ", train_scat_coeffs.shape)
 
                 if train_scat_coeffs.dim() == 5:
                     # [B, C_in, C_scat, H, W] → [B, C_in*C_scat, H, W]
+                    print("Shape of train_scat_coeffs before flattening: ", train_scat_coeffs.shape)
                     train_scat_coeffs = train_scat_coeffs.flatten(start_dim=1, end_dim=2)
                     valid_scat_coeffs = valid_scat_coeffs.flatten(start_dim=1, end_dim=2)
+                    print("Shape of train_scat_coeffs after flattening: ", train_scat_coeffs.shape)
 
                 all_scat = torch.cat([train_scat_coeffs, valid_scat_coeffs], dim=0)
                 if NORMALISESCS or NORMALISESCSTOPM:
@@ -962,16 +792,27 @@ for gen_model_name in gen_model_names:
                 train_scat_coeffs, valid_scat_coeffs = all_scat[:len(train_scat_coeffs)], all_scat[len(train_scat_coeffs):]
 
                 scatdim = train_scat_coeffs.shape[1:]   # tuple(C, H, W)
+                print("scatdim ", scatdim)
 
                 if classifier in ['ScatterNet', 'ScatterResNet']:
                     train_dataset = TensorDataset(mock_train, train_scat_coeffs, train_labels)
                     valid_dataset = TensorDataset(mock_valid, valid_scat_coeffs, valid_labels)
                 else: # if classifier in ['ScatterSqueezeNet', 'ScatterSqueezeNet2']:
-                    train_dataset = TensorDataset(train_images, train_scat_coeffs, train_labels)
-                    valid_dataset = TensorDataset(valid_images, valid_scat_coeffs, valid_labels)
+                    if EXTRAVARS:
+                        print(train_images.shape)
+                        print(train_scat_coeffs.shape)
+                        print(train_data.shape)
+                        print(train_labels.shape)
+                        train_dataset = TensorDataset(train_images, train_scat_coeffs, train_data, train_labels)
+                        valid_dataset = TensorDataset(valid_images, valid_scat_coeffs, valid_data, valid_labels)
+                    else:
+                        train_dataset = TensorDataset(train_images, train_scat_coeffs, train_labels)
+                        valid_dataset = TensorDataset(valid_images, valid_scat_coeffs, valid_labels)
         else:
-            train_dataset = TensorDataset(train_imgs, mock_train, train_labels)
-            valid_dataset = TensorDataset(valid_imgs, mock_valid, valid_labels)
+            mock_train = torch.zeros_like(train_images)
+            mock_valid = torch.zeros_like(valid_images)
+            train_dataset = TensorDataset(train_images, mock_train, train_labels)
+            valid_dataset = TensorDataset(valid_images, mock_valid, valid_labels)
 
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=custom_collate, drop_last=False)
         valid_loader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=custom_collate, drop_last=False)
@@ -1008,18 +849,10 @@ for gen_model_name in gen_model_names:
         elif classifier == "ScatterResNet":
             models = {"ScatterResNet": {"model": ScatterResNet(scat_shape=scatdim, num_classes=num_classes).to(DEVICE)}}
         elif classifier == "ScatterSqueezeNet":
-            # after your high-pass stacking, valid_images has shape [N, 2, H, W]
-            print(">> scatdim =", scatdim, "   len(scatdim) =", len(scatdim))
-            img_ch, img_h, img_w = valid_images.shape[1], valid_images.shape[2], valid_images.shape[3]
-            models = {
-                "ScatterSqueezeNet": {
-                    "model": ScatterSqueezeNet(
-                        img_shape=(img_ch, img_h, img_w),  # now (2, 128, 128)
-                        scat_shape=scatdim,
-                        num_classes=num_classes
-                    ).to(DEVICE)
-                }
-            }
+            if EXTRAVARS:
+                models = {"ScatterSqueezeNet": {"model": MetaWrapper(ScatterSqueezeNet(img_shape=tuple(valid_images.shape[1:]), scat_shape=scatdim, num_classes=num_classes), meta_dim=test_meta.shape[1]).to(DEVICE)}}
+            else:
+                models = {"ScatterSqueezeNet": {"model": ScatterSqueezeNet(img_shape=tuple(valid_images.shape[1:]), scat_shape=scatdim, num_classes=num_classes).to(DEVICE)}}
         elif classifier == "ScatterSqueezeNet2":
             models = {"ScatterSqueezeNet2": {"model": ScatterSqueezeNet2(img_shape=tuple(valid_images.shape[1:]), scat_shape=scatdim, num_classes=num_classes).to(DEVICE)}}
         elif classifier == 'Binary':
@@ -1035,11 +868,7 @@ for gen_model_name in gen_model_names:
                 elif classifier == "ScatterResNet":
                     summary(model_details["model"], input_size=scatdim, device=DEVICE)
                 elif classifier == "ScatterSqueezeNet":
-                    summary(
-                        model_details["model"],
-                        input_size=[(img_ch, img_h, img_w), scatdim],
-                        device=DEVICE
-                    )
+                    summary(model_details["model"], input_size=[valid_images.shape[1:], scatdim])
                 elif classifier == "ScatterSqueezeNet2":
                     summary(model_details["model"], input_size=[valid_images.shape[1:], scatdim])
                 else:
@@ -1094,7 +923,6 @@ for gen_model_name in gen_model_names:
             scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=10*lr, 
                                     steps_per_epoch=len(train_loader), epochs=num_epochs)
 
-        print("Testing to see it it prints this")
         for classifier_name, model_details in models.items():
             print(f"Training {classifier_name} model...")
             model = model_details["model"].to(DEVICE)

@@ -76,8 +76,8 @@ ES, patience = True, 10  # Use early stopping
 SCHEDULER = False  # Use a learning rate scheduler
 SHOWIMGS = True  # Show some generated images for each class (Tool for control)
 
-NORMALISEIMGS = False  # Normalise images to [0, 1]
-NORMALISEIMGSTOPM = False  # Normalise images to [-1, 1] 
+NORMALISEIMGS = True  # Globally normalise images to [0, 1]
+NORMALISEIMGSTOPM = False  # Globally normalise images to [-1, 1] 
 NORMALISESCS = False  # Normalise scattering coefficients to [0, 1]
 NORMALISESCSTOPM = False  # Normalise scattering coefficients to [-1, 1]
 
@@ -116,12 +116,12 @@ if any (cls in galaxy_classes for cls in [10, 11, 12, 13]):
     crop_size = (128, 128)  # Crop size for the images
     downsample_size = (128, 128)  # Downsample size for the images
     batch_size = 128
-elif galaxy_classes == [40, 41]:
+elif galaxy_classes[0] in list(range(40, 49)):
     crop_size = (1600, 1600)  # Crop size for the images
     downsample_size = (128, 128)  # Downsample size for the images
     batch_size = 16
-elif galaxy_classes == [50, 51]:
-    crop_size = (1, 128, 128)  # Crop size for the images
+elif galaxy_classes[0] in list(range(50, 60)):
+    crop_size = (1, 256, 256)  # Crop size for the images
     downsample_size = (1, 128, 128)  # Downsample size for the images
     batch_size = 16 
 
@@ -243,6 +243,8 @@ for gen_model_name in gen_model_names:
                 BALANCE=BALANCE,           # Reduce the larger classes to the size of the smallest class
                 STRETCH=STRETCH,
                 AUGMENT=True,
+                NORMALISE=NORMALISEIMGS,
+                NORMALISETOPM=NORMALISEIMGSTOPM,
                 train=False)
     
 
@@ -330,12 +332,6 @@ for gen_model_name in gen_model_names:
     # Print the distribution of raw test labels
     unique_labels, counts = torch.unique(test_labels, return_counts=True)
     print("Test labels distribution (raw):", dict(zip(unique_labels.tolist(), counts.tolist())))
-    
-    if NORMALISEIMGS or NORMALISEIMGSTOPM:
-        if NORMALISEIMGSTOPM:
-            test_images = normalise_images(test_images, -1, 1)
-        else:
-            test_images = normalise_images(test_images, 0, 1)
 
     # Prepare input data
     # Produce an empty tensor to occupy the not used component of the datasets. 
@@ -395,8 +391,9 @@ for gen_model_name in gen_model_names:
                 REMOVEOUTLIERS=FILTERED,
                 BALANCE=BALANCE,           # Reduce the larger classes to the size of the smallest class
                 AUGMENT=False,   
-                train=True
-            )
+                NORMALISE=NORMALISEIMGS,
+                NORMALISETOPM=NORMALISEIMGSTOPM,
+                train=True)
             
             if len(_out) == 4:
                 _, _, valid_images, valid_labels = _out
@@ -421,8 +418,9 @@ for gen_model_name in gen_model_names:
                 BALANCE=BALANCE,           # Reduce the larger classes to the size of the smallest class
                 STRETCH=STRETCH,
                 AUGMENT=True,
-                train=True
-            )
+                NORMALISE=NORMALISEIMGS,
+                NORMALISETOPM=NORMALISEIMGSTOPM,
+                train=True)
 
             if len(_out) == 4:
                 train_images, train_labels, valid_images, valid_labels = _out
@@ -643,19 +641,7 @@ for gen_model_name in gen_model_names:
                 ]
 
                 train_images, valid_images = chunked_imgs
-                train_labels, valid_labels = chunked_lbls
-                        
-        
-        
-        # Normalise images if requested
-        if NORMALISEIMGS or NORMALISEIMGSTOPM:
-            check_tensor("Train images before normalisation", train_images)
-            if NORMALISEIMGSTOPM:
-                train_images = normalise_images(train_images, -1, 1)
-            else:
-                train_images = normalise_images(train_images, 0, 1)
-            check_tensor("Train images after normalisation", train_images)
-            
+                train_labels, valid_labels = chunked_lbls            
         
         # ── SANITY-CHECK PLOTS ON FIRST FOLD ONLY ──
         if fold == folds[0] and SHOWIMGS and downsample_size == (1, 128, 128):
@@ -763,17 +749,14 @@ for gen_model_name in gen_model_names:
                 train_dataset = CachedScatterDataset(train_images, train_labels, train_cache_file, train_full_shape)
                 valid_dataset = CachedScatterDataset(valid_images, valid_labels, valid_cache_file, valid_full_shape)
                 scatdim = train_full_shape[1:]  # e.g., (C, H, W)
+                
             else:
-
-                # fold T into channels on both real & scattering inputs
-                print("Shape of train_images before folding T axis: ", train_images.shape)
-
-                train_images = fold_T_axis(train_images)
+                # fold T into C on both real & scattering inputs
+                train_images = fold_T_axis(train_images) # Merges the image version into the channel dimension
                 valid_images = fold_T_axis(valid_images)
                 mock_train = torch.zeros_like(train_images)
                 mock_valid = torch.zeros_like(valid_images)
 
-                print("Shape of train_images after folding T axis: ", train_images.shape)
 
                 train_cache = f"./.cache/train_scat_{galaxy_classes}_{fold}_{lambda_generate}_{dataset_portions[0]}_{FILTERED}.pt"
                 valid_cache = f"./.cache/valid_scat_{galaxy_classes}_{fold}_{lambda_generate}_{dataset_portions[0]}_{FILTERED}.pt"
@@ -814,6 +797,8 @@ for gen_model_name in gen_model_names:
                         train_dataset = TensorDataset(train_images, train_scat_coeffs, train_labels)
                         valid_dataset = TensorDataset(valid_images, valid_scat_coeffs, valid_labels)
         else:
+            mock_train = torch.zeros_like(train_images)
+            mock_valid = torch.zeros_like(valid_images)
             train_dataset = TensorDataset(train_images, mock_train, train_labels)
             valid_dataset = TensorDataset(valid_images, mock_valid, valid_labels)
 
