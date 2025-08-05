@@ -179,7 +179,8 @@ def normalise_images(images, out_min=-1, out_max=1):
     global_min = images.min()
     global_max = images.max()
     images = (images - global_min) / (global_max - global_min)   # now in [0,1]
-    return out_min + images * (out_max - out_min)                # now in [out_min,out_max]
+    return out_min + images * (out_max - out_min)                # now in [out_min,out_max]l
+
 
 
 def change_images(images):

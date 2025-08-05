@@ -106,7 +106,7 @@ def get_classes():
         {"tag": 50, "length": 62, "description": "DE"}, # RR + RH
         {"tag": 51, "length": 114, "description": "NDE"}, # No Diffuse Emission
         {"tag": 52, "length": 53, "description": "RH"}, # Radio Halo
-        {"tag": 53, "length": 20, "description": "RR"}, # Radio Relic
+        {"tag": 53, "length": 20, "description": "RR"}, # Radio Relic (Only 8 unique sources)
         {"tag": 54, "length": 19, "description": "cRH"}, # Candidate Radio Halo
         {"tag": 55, "length": 6, "description": "cRR"}, # Candidate Radio Relic
         {"tag": 56, "length": 24, "description": "cDE"}, # candidate Diffuse Emission
@@ -317,18 +317,13 @@ def percentile_stretch(x, lo=2, hi=98):
     """
     if len(x.shape) == 2:  # If x is 2D, add a channel dimension twice
         x = x.unsqueeze(0).unsqueeze(0)
-    if len(x.shape) == 3:  # If x is 3D, add a channel dimension
+    elif len(x.shape) == 3:  # If x is 3D, add a channel dimension
         x = x.unsqueeze(0)
-    elif len(x.shape) == 5:  # If x is 5D, squeeze the channel dimension
-        x = x.squeeze(0)
-    elif len(x.shape) == 6:  # If x is 6D, squeeze the channel dimension twice
-        x = x.squeeze(0).squeeze(0)
     elif len(x.shape) != 4:  # If x is not 4D, raise an error
         raise ValueError("Input tensor x must be of shape (B, C, H, W) or (H, W). Now it is: ", x.shape)
-    if x.dim() != 4:
-        raise ValueError(f"Expected 4D tensor (B,C,H,W), got {tuple(x.shape)}")
 
-    flat_all = x.view(-1)
+    #flat_all = x.view(-1)
+    flat_all = x.reshape(-1)
     p_low  = flat_all.quantile(lo/100)
     p_high = flat_all.quantile(hi/100)
     
@@ -338,6 +333,7 @@ def percentile_stretch(x, lo=2, hi=98):
     
     y = (x - p_low) / (p_high - p_low + 1e-6)
     return y.clamp(0, 1)
+
 
 
 def old_percentile_stretch(x, lo=2, hi=98):
@@ -361,6 +357,7 @@ def old_percentile_stretch(x, lo=2, hi=98):
     p_high = flat.quantile(hi/100, dim=2, keepdim=True).unsqueeze(-1)
     y = (x - p_low) / (p_high - p_low + 1e-6)
     return y.clamp(0,1)
+
 
 def asinh_stretch(x, alpha=10):
     return torch.asinh(alpha * x) / math.asinh(alpha)
@@ -1165,8 +1162,159 @@ def reduce_by_class(images, labels, sample_size, num_classes):
     
     return reduced_images, reduced_labels
 
+import math
+import hashlib
+from collections import defaultdict
 
-def redistribute_excess(train_images, train_labels, eval_images, eval_labels, target_classes):
+def redistribute_excess(train_images, train_labels,
+                        eval_images,  eval_labels,
+                        target_classes,
+                        train_filenames=None, eval_filenames=None):
+
+    # 1) Pool everything
+    all_imgs = list(train_images) + list(eval_images)
+    all_lbls = list(train_labels) + list(eval_labels)
+    # only build filenames if provided, otherwise pad with None
+    all_fnames = (list(train_filenames) if train_filenames else []) \
+               + (list(eval_filenames)  if eval_filenames  else [])
+    if not all_fnames:
+        all_fnames = [None] * len(all_imgs)
+
+    # 2) Group by class, keeping filenames together
+    bins = defaultdict(list)
+    for img, lbl, fname in zip(all_imgs, all_lbls, all_fnames):
+        bins[int(lbl)].append((img, fname))
+        
+    # 3) Compute how many per class to put in eval:
+    total = len(all_imgs)
+    n_cls = len(target_classes)
+    per_class = math.ceil((total * 0.10) / n_cls)
+    per_class = min(per_class, min(len(bins[c]) for c in target_classes))
+    
+    # 4) Deterministically split each bin by hash, preserving both img+fname
+    new_eval_imgs, new_eval_lbls, new_eval_fnames = [], [], []
+    new_train_imgs, new_train_lbls, new_train_fnames = [], [], []
+    for cls in target_classes:
+        items = bins[cls]
+        items_sorted = sorted(items, key=lambda x: img_hash(x[0]))
+        ev = items_sorted[:per_class]
+        tr = items_sorted[per_class:]
+        new_eval_imgs   += [x[0] for x in ev]
+        new_eval_lbls   += [cls]*len(ev)
+        new_eval_fnames += [x[1] for x in ev]
+        new_train_imgs   += [x[0] for x in tr]
+        new_train_lbls   += [cls]*len(tr)
+        new_train_fnames += [x[1] for x in tr]
+        
+    
+    # 5) Convert back to original types
+    # — Images —
+    if isinstance(train_images, torch.Tensor):
+        # preserve shape if no examples
+        train_imgs2 = (torch.stack(new_train_imgs)
+                       if new_train_imgs
+                       else torch.empty((0,)+train_images.shape[1:]))
+    else:
+        train_imgs2 = new_train_imgs
+
+    if isinstance(eval_images, torch.Tensor):
+        eval_imgs2 = (torch.stack(new_eval_imgs)
+                      if new_eval_imgs
+                      else torch.empty((0,)+eval_images.shape[1:]))
+    else:
+        eval_imgs2 = new_eval_imgs
+
+    # — Labels —
+    if isinstance(train_labels, torch.Tensor):
+        train_lbls2 = torch.tensor(new_train_lbls, dtype=train_labels.dtype)
+    else:
+        train_lbls2 = new_train_lbls
+
+    if isinstance(eval_labels, torch.Tensor):
+        eval_lbls2 = torch.tensor(new_eval_lbls, dtype=eval_labels.dtype)
+    else:
+        eval_lbls2 = new_eval_lbls
+        
+    return (
+        train_imgs2, train_lbls2,
+        new_train_fnames if train_filenames else [],
+        eval_imgs2,  eval_lbls2,
+        new_eval_fnames  if eval_filenames  else [],
+    )
+
+def bitold_redistribute_excess(train_images, train_labels, eval_images, eval_labels, target_classes):
+    """
+    Deterministically re‐split pooled train+eval so that:
+      1) evaluation set is exactly balanced across target_classes
+      2) |eval| ≥ 10% of total images
+    """
+    # 1) Pool everything
+    all_imgs = list(train_images) + list(eval_images)
+    all_lbls = list(train_labels) + list(eval_labels)
+
+    # 2) Group by class
+    bins = defaultdict(list)
+    for img, lbl in zip(all_imgs, all_lbls):
+        bins[int(lbl)].append(img)
+
+    # 3) Compute how many per class to put in eval:
+    total = len(all_imgs)
+    n_cls = len(target_classes)
+    per_class = math.ceil((total * 0.10) / n_cls)
+    per_class = min(per_class, min(len(bins[c]) for c in target_classes))
+
+    # 4) Deterministically split each bin by sorting on img_hash
+    def img_hash(tensor):
+        arr = tensor.cpu().numpy().tobytes()
+        return hashlib.sha1(arr).hexdigest()
+
+    new_eval_imgs, new_eval_lbls = [], []
+    new_train_imgs, new_train_lbls = [], []
+
+    for cls in target_classes:
+        imgs = bins[cls]
+        # sort by hash so that "first" per_class is reproducible
+        imgs_sorted = sorted(imgs, key=img_hash)
+        ev = imgs_sorted[:per_class]
+        tr = imgs_sorted[per_class:]
+        new_eval_imgs += ev
+        new_eval_lbls += [cls] * len(ev)
+        new_train_imgs += tr
+        new_train_lbls += [cls] * len(tr)
+
+    # 5) Convert back to original types
+    # — Images —
+    if isinstance(train_images, torch.Tensor):
+        # preserve shape if no examples
+        train_imgs2 = (torch.stack(new_train_imgs)
+                       if new_train_imgs
+                       else torch.empty((0,)+train_images.shape[1:]))
+    else:
+        train_imgs2 = new_train_imgs
+
+    if isinstance(eval_images, torch.Tensor):
+        eval_imgs2 = (torch.stack(new_eval_imgs)
+                      if new_eval_imgs
+                      else torch.empty((0,)+eval_images.shape[1:]))
+    else:
+        eval_imgs2 = new_eval_imgs
+
+    # — Labels —
+    if isinstance(train_labels, torch.Tensor):
+        train_lbls2 = torch.tensor(new_train_lbls, dtype=train_labels.dtype)
+    else:
+        train_lbls2 = new_train_lbls
+
+    if isinstance(eval_labels, torch.Tensor):
+        eval_lbls2 = torch.tensor(new_eval_lbls, dtype=eval_labels.dtype)
+    else:
+        eval_lbls2 = new_eval_lbls
+
+    return train_imgs2, train_lbls2, eval_imgs2, eval_lbls2
+
+
+
+def old_redistribute_excess(train_images, train_labels, eval_images, eval_labels, target_classes):
     """
     Redistribute excess images from the training set to the evaluation set to balance the classes.
     """
@@ -1712,14 +1860,15 @@ def load_RGZ10k(path=root_path + "RGZ_10k", fold=5, target_classes=None, crop_si
     train_labels = [label_mapping[lbl] for lbl in train_labels]
     eval_labels = [label_mapping[lbl] for lbl in eval_labels]
     
+    
     return train_images, train_labels, eval_images, eval_labels
 
 
-def load_PSZ2(path=root_path + "PSZ2/classified/", fold=5, BALANCE=False, AUGMENT=False, sample_size=300, target_classes=[53], crop_size=(1, 256, 256), downsample_size=(1, 256, 256), train=False):
+def load_PSZ2(path=root_path + "PSZ2/classified/", fold=5, sample_size=300, target_classes=[53], crop_size=(1, 256, 256), downsample_size=(1, 256, 256), GAUSSIAN_BLURRING=False, version='T100kpcSUB', train=False):
     print("Loading PSZ2 data...")
     
     # Configuration
-    version = 'RAW' # if not CUBE
+    version = 'T50kpcSUB' # if not CUBE
     version_folders = ['T50kpcSUB', 'T100kpcSUB']
     #version_folders = [
     #    "T15arcsec","T15SUBarcsec","T25kpc","T25kpcSUB",
@@ -1758,11 +1907,15 @@ def load_PSZ2(path=root_path + "PSZ2/classified/", fold=5, BALANCE=False, AUGMEN
     images = []
     labels = []
     filenames = []
+    
+    #label_map = {cls_val: idx for idx, cls_val in enumerate(target_classes)}
+    #print("Label map:", label_map)
 
     for cls in target_classes:
         class_folder = next(c["description"] for c in get_classes() if c["tag"] == cls)
         subfolders = [class_folder]
         label = cls
+        print("Processing class:", class_folder, "with label", label)
         
         if CUBE:
             version = 'CUBE'
@@ -1808,7 +1961,7 @@ def load_PSZ2(path=root_path + "PSZ2/classified/", fold=5, BALANCE=False, AUGMEN
 
                     cube = torch.stack(versions, dim=0)  # [T, C, H, W]
                     images.append(cube)
-                    labels.append(label)
+                    labels.append(label) 
                     filenames.append(base)
 
                     # HOPEFUL WAY - FILL AND CUT TO RESIZE AND USE (Not tried yet)
@@ -1833,7 +1986,7 @@ def load_PSZ2(path=root_path + "PSZ2/classified/", fold=5, BALANCE=False, AUGMEN
 
                     # **convert to your single‐channel + resize here!**
 
-                print("Number of cubes added:", len(images), "each of shape", cube.shape)
+                #print("Number of cubes added:", len(images), "each of shape", cube.shape)
 
 
         else:
@@ -1841,7 +1994,7 @@ def load_PSZ2(path=root_path + "PSZ2/classified/", fold=5, BALANCE=False, AUGMEN
             for subfolder in subfolders:
                 folder_path = os.path.join(path, version, subfolder)
                 if not os.path.isdir(folder_path):
-                    print(f"Warning: {folder_path} not found, skipping.")
+                    #print(f"Warning: {folder_path} not found, skipping.")
                     continue
                 for fname in os.listdir(folder_path):
                     if not fname.lower().endswith('.npy'):
@@ -1856,15 +2009,14 @@ def load_PSZ2(path=root_path + "PSZ2/classified/", fold=5, BALANCE=False, AUGMEN
                     elif arr2.ndim != 2:
                         raise ValueError(f"Expected 2-D array or 3-D stack, got shape {arr2.shape!r}")
 
+                    if GAUSSIAN_BLURRING:
+                        from scipy.ndimage import gaussian_filter
+                        arr2 = gaussian_filter(arr2, sigma=1.5)  # adjust sigma for stronger tapering
                     raw = torch.from_numpy(arr2).unsqueeze(0).float() 
-                    # Self-normalize to [0, 1] range
-                    #raw = (raw - raw.min()) / (raw.max() - raw.min() + 1e-8)
-                    tensor = apply_formatting(raw,
-                        crop_size=crop_size,
-                        downsample_size=downsample_size,
-                    ) 
+                    tensor = apply_formatting(raw, crop_size=crop_size, downsample_size=downsample_size) 
+                    
                     images.append(tensor) # shape [1, C, H, W]
-                    labels.append(label) # Set label to the same for all images in this subfolder
+                    labels.append(label)
                     filenames.append(fname[:-4])  # remove the .npy extension
         
 
@@ -1874,39 +2026,72 @@ def load_PSZ2(path=root_path + "PSZ2/classified/", fold=5, BALANCE=False, AUGMEN
     assert len(images) == len(labels) == len(filenames), \
        f"mismatch: {len(images)} imgs, {len(labels)} labels, {len(filenames)} files"
 
-    # --- dedupe block, pulling in filenames too ---
-    seen = {}                # hash -> first‐seen filename
-    unique_images, unique_labels, unique_filenames = [], [], []
-    duplicates = defaultdict(list)
+    #print("Length of images before deduplication:", len(images))
+    if target_classes == [50, 51]:
+        # --- dedupe block, pulling in filenames too ---
+        seen = {}                # hash -> first‐seen filename
+        unique_images, unique_labels, unique_filenames = [], [], []
+        duplicates = defaultdict(list)
 
-    for img, lbl, fname in zip(images, labels, filenames):
-        # make sure we hash the exact same raw array you later feed into the network
-        arr = img.squeeze().numpy()  
-        h = hashlib.sha1(arr.tobytes()).hexdigest()
-        if h in seen:
-            # record the duplicate filename
-            duplicates[h].append(fname)
-            continue
-        # first time we see this hash
-        seen[h] = fname
-        unique_images.append(img)
-        unique_labels.append(lbl)
-        unique_filenames.append(fname)
+        for img, lbl, fname in zip(images, labels, filenames):
+            # make sure we hash the exact same raw array you later feed into the network
+            arr = img.squeeze().numpy()  
+            h = hashlib.sha1(arr.tobytes()).hexdigest()
+            if h in seen:
+                # record the duplicate filename
+                duplicates[h].append(fname)
+                continue
+            # first time we see this hash
+            seen[h] = fname
+            unique_images.append(img)
+            unique_labels.append(lbl)
+            unique_filenames.append(fname)
 
-    # report
-    if duplicates:
-        print("Found duplicate images (by hash):")
-        for h, dups in duplicates.items():
-            original = seen[h]
-            print(f"  hash {h}:")
-            print(f"    original: {original}")
-            for dup in dups:
-                print(f"    duplicate: {dup}")
+        # report
+        if duplicates:
+            #print("Found duplicate images (by hash):")
+            for h, dups in duplicates.items():
+                original = seen[h]
+                #print(f"  hash {h}:")
+                #print(f"    original: {original}")
+                #for dup in dups:
+                #    print(f"    duplicate: {dup}")
+        else:
+            print("No exact‐byte duplicates found.")
+
+        # overwrite
+        images, labels, filenames = unique_images, unique_labels, unique_filenames
     else:
-        print("No exact‐byte duplicates found.")
+        # Remove *all* clusters that appear more than once (i.e. double‑label cases)
+        from collections import Counter
 
-    # overwrite
-    images, labels, filenames = unique_images, unique_labels, unique_filenames
+        # compute hash for each image
+        hashes = [
+            hashlib.sha1(img.squeeze().numpy().tobytes()).hexdigest()
+            for img in images
+        ]
+        counts = Counter(hashes)
+        dup_hashes = {h for h, c in counts.items() if c > 1}
+
+        if dup_hashes:
+            print("Removing clusters found in both RH and RR (by hash):")
+            for h in dup_hashes:
+                fnames = [f for f, hh in zip(filenames, hashes) if hh == h]
+                print(f"  hash {h}: files {fnames}")
+
+        # keep only those images whose hash is unique
+        filtered = [
+            (img, lbl, fname)
+            for img, lbl, fname, hh in zip(images, labels, filenames, hashes)
+            if hh not in dup_hashes
+        ]
+        if filtered:
+            images, labels, filenames = zip(*filtered)
+            images, labels, filenames = list(images), list(labels), list(filenames)
+        else:
+            images, labels, filenames = [], [], []
+
+    print("Length of unique images:", len(images))
 
     # now do your split
     all_idx = list(range(len(images)))
@@ -1932,8 +2117,6 @@ def load_MGCLS(path='/users/mbredber/data/MGCLS/classified_crops_1600/',  # Path
                crop_size=(1600, 1600),
                downsample_size=(128, 128),
                sample_size=300,
-               island=True,
-               REMOVEOUTLIERS=True,
                BALANCE=False, AUGMENT=False,
                train=False):
 
@@ -1995,35 +2178,12 @@ def load_MGCLS(path='/users/mbredber/data/MGCLS/classified_crops_1600/',  # Path
     train_labels = [labels[i] for i in train_idx]
     eval_images  = [images[i] for i in test_idx]
     eval_labels  = [labels[i] for i in test_idx]
-    
-    
-    ## REST CAN BE MOVED TO A COMMON FUNCTION
-    
-    # Rebalance any leftover via your redistribute_excess
-    train_images, train_labels, eval_images, eval_labels = redistribute_excess(
-        train_images, train_labels, eval_images, eval_labels, target_classes)
-    
-    print("MGCLS images shape before augmentation:", len(train_images), "x", train_images[0].shape if train_images else "N/A")
-
-    # stack into tensors (and optionally augment)
-        # enforce equal class sizes before augmentation
-    if BALANCE:
-        train_images, train_labels = balance_classes(train_images, train_labels)
-
-    if AUGMENT:
-        train_images, train_labels = augment_images(train_images, train_labels, ST_augmentation=False)
-        eval_images, eval_labels = augment_images(eval_images, eval_labels, ST_augmentation=False)
-    else:
-        train_images = torch.stack(train_images)
-        train_labels = torch.tensor(train_labels, dtype=torch.long)
-        eval_images  = torch.stack(eval_images)
-        eval_labels  = torch.tensor(eval_labels,  dtype=torch.long)
 
     return train_images, train_labels, eval_images, eval_labels
 
 
 def load_galaxies(galaxy_class, path=None, fold=None, island=None, crop_size=None, downsample_size=None, sample_size=None, REMOVEOUTLIERS=True, 
-                  BALANCE=False, AUGMENT=False, STRETCH=False, EXTRADATA=False, NORMALISE=True, NORMALISETOPM=False, SAVE_IMAGES=False, train=None):
+                  BALANCE=False, AUGMENT=False, STRETCH=False, EXTRADATA=False, NORMALISE=True, NORMALISETOPM=False, SAVE_IMAGES=False, version=None, train=None):
     """
     Master loader that delegates to specific dataset loaders and returns zero-based labels.
     """
@@ -2034,7 +2194,7 @@ def load_galaxies(galaxy_class, path=None, fold=None, island=None, crop_size=Non
 
     # Clean up kwargs to remove None values
     kwargs = {'path': path, 'sample_size': sample_size, 'fold':fold, 'train': train,
-              'island': island, 'crop_size': crop_size, 'downsample_size': downsample_size}
+              'island': island, 'crop_size': crop_size, 'downsample_size': downsample_size, 'version': version}
     clean_kwargs = {k: v for k, v in kwargs.items() if v is not None}
 
     max_class = get_max_class(galaxy_class)
@@ -2071,10 +2231,26 @@ def load_galaxies(galaxy_class, path=None, fold=None, island=None, crop_size=Non
     
     if len(data) == 4:
         train_images, train_labels, eval_images, eval_labels = data
+        train_filenames = eval_filenames = None  # No filenames returned
     elif len(data) == 6:
         train_images, train_labels, eval_images, eval_labels, train_filenames, eval_filenames = data
+        # DEBUG PSZ2 split
+        #print(f"→ load_PSZ2 returned {len(data)} items")
+        
+        ## inspect a few IDs and the corresponding labels
+        #print("  train IDs:", train_filenames[:5])
+        #print("  train labels:", train_labels[:5])
+        #print("  eval IDs:", eval_filenames[:5])
+        #print("  eval labels:", eval_labels[:5])
+
+        # ensure no cluster appears in both
+        overlap = set(train_filenames) & set(eval_filenames)
+        print("  filename overlap:", overlap)
+        assert not overlap, f"PSZ2 split error — these IDs are in both sets: {overlap}"
+        
     else:
         raise ValueError("Data loader did not return the expected number of outputs.")
+    
     
     # If images are list, converge them to tensors
     #if isinstance(train_images, list):
@@ -2099,12 +2275,310 @@ def load_galaxies(galaxy_class, path=None, fold=None, island=None, crop_size=Non
         train_images = torch.stack(train_images)
     if isinstance(eval_images, list):
         eval_images  = torch.stack(eval_images)
+        
+    if galaxy_class[0] == 52 and galaxy_class[1] == 53: # Plot some train and validation images for each class
+        # Plotting the training and evaluation images for each class
+        from matplotlib import gridspec
+        
+        unique_train_labels = sorted(set(train_labels))
+        unique_eval_labels  = sorted(set(eval_labels))
+        n_train_classes = len(unique_train_labels)
+        n_eval_classes  = len(unique_eval_labels)
+        n_cols = 4  # Number of columns in the grid
+        n_rows = max(n_train_classes, n_eval_classes) // n_cols + 1
+        fig = plt.figure(figsize=(16, 4 * n_rows))
+        gs = gridspec.GridSpec(n_rows, n_cols, figure=fig)
+        # Plot 5 examples per class for train and eval, with row labels
+        n_examples = 5
+        train_classes = sorted(set(train_labels))
+        eval_classes  = sorted(set(eval_labels))
+        n_train = len(train_classes)
+        n_eval  = len(eval_classes)
+
+        fig, axes = plt.subplots(n_train + n_eval, n_examples,
+                                figsize=(n_examples * 3, (n_train + n_eval) * 2),
+                                constrained_layout=True)
+
+        # Plot train rows
+        for i, cls in enumerate(train_classes):
+            imgs = [img for img, lbl in zip(train_images, train_labels) if lbl == cls][:n_examples]
+            for j, img in enumerate(imgs):
+                ax = axes[i, j]
+                ax.imshow(img.squeeze(), cmap='gray', origin='lower')
+                ax.axis('off')
+            # Left-hand label for this row
+            axes[i, 0].text(-0.2, 0.5, f'Train\nClass {cls}',
+                            transform=axes[i, 0].transAxes,
+                            va='center', ha='right', fontsize=12)
+
+        # Plot eval rows
+        for k, cls in enumerate(eval_classes):
+            i = n_train + k
+            imgs = [img for img, lbl in zip(eval_images, eval_labels) if lbl == cls][:n_examples]
+            for j, img in enumerate(imgs):
+                ax = axes[i, j]
+                ax.imshow(img.squeeze(), cmap='gray', origin='lower')
+                ax.axis('off')
+            axes[i, 0].text(-0.2, 0.5, f'Eval\nClass {cls}',
+                            transform=axes[i, 0].transAxes,
+                            va='center', ha='right', fontsize=12)
+
+        plt.savefig(f"./classifier/{galaxy_class[0]}_{galaxy_class[1]}_5perclass_labeled.png", dpi=300)
+        plt.close(fig)
+        print(f"Saved training and evaluation images for classes {galaxy_class} to ./classifier/{'_'.join(map(str, galaxy_class))}_train_eval_images.png")
+
+    if BALANCE:
+        train_images, train_labels = balance_classes(train_images, train_labels) # Remove excess images from the largest class
+        
+        
+    if STRETCH and (len(crop_size) < 4 or len(downsample_size) < 4 or (crop_size[-4] == 1 and downsample_size[-4] == 1)):
+        train_class_ids = sorted(set(train_labels))
+        for class_id in train_class_ids:
+            train_idx   = next(i for i, lbl in enumerate(train_labels) if lbl == class_id)
+            source_name = train_filenames[train_idx]
+            cls_img     = train_images[train_idx]
+            #print(f"🔍 Using training source {source_name} for class {class_id} at index {train_idx}")
+            
+            # now load its FITS
+            fits_path = f"/users/mbredber/scratch/data/PSZ2/fits/{source_name}/{source_name}.fits"
+            fits_data = fits.getdata(fits_path).astype(float)
+            fits_img  = torch.from_numpy(fits_data)
+            
+            #### PIXEL CLIPPING
+            # 1) read header and raw data
+            #raw_hdr    = fits.getheader(fits_path)
+            #raw_arr    = fits.getdata(fits_path).astype(float)
+#
+            ## 2) convert to Jy/pixel (assumes header.FLUXCONV gives Jy per unit in raw_arr)
+            #flux_arr   = raw_arr * raw_hdr.get('FLUXCONV', 1.0)
+#
+            ## 3) turn into torch, clip, normalize to [0,1]
+            #flux_t     = torch.from_numpy(flux_arr).unsqueeze(0).float()
+            #flux_clip  = flux_t.clamp(1e-10, 1e-5)
+            #flux_norm  = (flux_clip - 1e-10) / (1e-5 - 1e-10)
+            
+            # Crop the FITS image to match the crop size
+            fits_img = apply_formatting(fits_img, crop_size=(crop_size[-3], crop_size[-2], crop_size[-1]), downsample_size=(downsample_size[-3], downsample_size[-2], downsample_size[-1]))
+            check_tensor('CUTOUT', cls_img)
+            check_tensor('FITS',   fits_img)
+
+            # 4) define your stretches and clipping ranges
+            clip_ranges = [(60,99.9), (60,99.8), (60,99.7)]
+            clip_thresholds = [0.02, 0.025, 0.03, 0.35]  # adjust or extend as you like
+            funcs = [
+                ('original', lambda x: x),
+                ('asinh',     lambda x: asinh_stretch(x, alpha=10)),
+                ('log',       lambda x: log_stretch(x, alpha=10)),
+            ]
+
+                # 5) loop over the *same* source for CUTOUT vs FITS
+            for img, suffix in [
+                (cls_img,  "CUTOUT"),
+                (fits_img, "FITS"),
+            ]:
+                # define rows and columns
+                clip_ranges_plot = [(0, 100)] + clip_ranges[:3]  # top row is no cutoff
+                funcs = [
+                    ('original', lambda x: x),
+                    ('log',      lambda x: log_stretch(x,  alpha=10)),
+                    ('asinh',    lambda x: asinh_stretch(x, alpha=10)),
+                ]
+                n_rows = len(clip_ranges_plot)
+                n_cols = len(funcs)
+
+                fig, axes = plt.subplots(
+                    n_rows, n_cols,
+                    figsize=(4 * n_cols, 4 * n_rows),
+                    gridspec_kw={ 'hspace': 0.3,  # shrink vertical gap
+                                  'wspace': 0.2 },# tighten horizontal gap
+                    constrained_layout=False
+                )
+                # make room on left for our y‑labels
+                fig.subplots_adjust(left=0.18)
+
+                # set column headers
+                for j, (name, _) in enumerate(funcs):
+                    axes[0, j].set_title(name)
+                    
+                #check_tensor(f'Properties of the {suffix} image before stretching', img)
+
+                # fill grid
+                for i, (lo, hi) in enumerate(clip_ranges_plot):
+                    for j, (_, fn) in enumerate(funcs):
+                        P   = percentile_stretch(img, lo=lo, hi=hi)
+                        out = fn(P)
+                        #check_tensor(f'Properties of the {suffix} image after stretching with {lo}-{hi} percentile, and {fn.__name__} function', out)
+                        arr = out.squeeze().cpu().numpy()
+
+                        ax = axes[i, j]
+                        im = ax.imshow(arr, cmap='viridis', origin='lower')
+                        if j == 0:
+                            ax.set_ylabel(f'pctile [{lo},{hi}]',
+                                        rotation=0, labelpad=40)
+                        # hide only ticks and spines, keep the ylabel
+                        ax.set_xticks([])  
+                        ax.set_yticks([])  
+                        for spine in ax.spines.values():  
+                            spine.set_visible(False)
+                        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+                        
+
+                fig.suptitle(source_name)
+                plt.savefig(f"./classifier/{class_id}_train_{source_name}_{suffix}_stretching.png", dpi=300)
+                plt.close(fig)
+                
+        # now do exactly the same thing for one example per class in the EVAL set
+        eval_class_ids = sorted(set(eval_labels))
+        for class_id in eval_class_ids:
+            # pick the first eval image of this class
+            eval_idx    = next(i for i, lbl in enumerate(eval_labels) if lbl == class_id)
+            source_name = eval_filenames[eval_idx]
+            cls_img     = eval_images[eval_idx]
+            #print(f"🔍 Using eval source {source_name} for class {class_id} at index {eval_idx}")
+
+            # load its FITS just like above
+            fits_path = f"/users/mbredber/scratch/data/PSZ2/fits/{source_name}/{source_name}.fits"
+            fits_data = fits.getdata(fits_path).astype(float)
+            fits_img  = torch.from_numpy(fits_data)
+            fits_img  = apply_formatting(
+                fits_img,
+                crop_size=(crop_size[-3], crop_size[-2], crop_size[-1]),
+                downsample_size=(downsample_size[-3], downsample_size[-2], downsample_size[-1])
+            )
+            check_tensor('CUTOUT_eval', cls_img)
+            check_tensor('FITS_eval',   fits_img)
+
+            # same clip‐ranges & funcs
+            clip_ranges_plot = [(0,100), (60,99.9), (70,99.8), (80,99.7)]
+            funcs = [
+                ('original', lambda x: x),
+                ('log',      lambda x: log_stretch(x,  alpha=10)),
+                ('asinh',    lambda x: asinh_stretch(x, alpha=10)),
+            ]
+            n_rows = len(clip_ranges_plot)
+            n_cols = len(funcs)
+
+            # loop over CUTOUT vs FITS just like for train
+            for img, suffix in [(cls_img, "CUTOUT"), (fits_img, "FITS")]:
+                fig, axes = plt.subplots(
+                    n_rows, n_cols,
+                    figsize=(4 * n_cols, 4 * n_rows),
+                    gridspec_kw={ 'hspace': 0.3,
+                                'wspace': 0.2 },
+                    constrained_layout=False
+                )
+                fig.subplots_adjust(left=0.18)
+
+                # set column headers
+                for j, (name, _) in enumerate(funcs):
+                    axes[0, j].set_title(name)
+
+                # fill grid
+                for i, (lo, hi) in enumerate(clip_ranges_plot):
+                    for j, (_, fn) in enumerate(funcs):
+                        P   = percentile_stretch(img, lo=lo, hi=hi)
+                        out = fn(P)
+                        arr = out.squeeze().cpu().numpy()
+
+                        ax = axes[i, j]
+                        im = ax.imshow(arr, cmap='viridis', origin='lower')
+
+                        if j == 0:
+                            ax.set_ylabel(
+                                f"pctile [{lo},{hi}]",
+                                rotation=0,
+                                va='center',
+                                ha='right',
+                                labelpad=30,
+                                fontsize=12
+                            )
+
+                        ax.set_xticks([])
+                        ax.set_yticks([])
+                        for spine in ax.spines.values():
+                            spine.set_visible(False)
+
+                        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+                # include suffix in the title & filename
+                fig.suptitle(f"eval {class_id} — {source_name} ({suffix})")
+                plt.savefig(f"./classifier/{class_id}_eval_{source_name}_{suffix}_stretching.png", dpi=300)
+                plt.close(fig)
+
+    def plot_class_images(images, labels, filenames=None, set_name='train'):
+        # ensure labels are a plain list of ints
+        if isinstance(labels, torch.Tensor):
+            labels = labels.tolist()
+
+        # if images have more than one channel (C, H, W), only use the first channel
+        if isinstance(images, torch.Tensor) and images.ndim == 4:
+            images = [img[0] for img in images]
+        
+        desc_map = {c['tag']: c['description'] for c in get_classes()}
+        
+        for cls in sorted(set(labels)):
+            # collect up to 10 examples of this class
+            idxs = [i for i,l in enumerate(labels) if l == cls][:10]
+            if not idxs:
+                continue
+            
+            fig, axes = plt.subplots(2, 5, figsize=(10, 4))
+            fig.suptitle(f"{set_name} images for class {cls} – {desc_map.get(cls, '')}", fontsize=12)
+            
+            for ax, idx in zip(axes.flat, idxs):
+                img = images[idx]
+                arr = img.squeeze().cpu().numpy() if isinstance(img, torch.Tensor) else np.squeeze(img)
+                ax.imshow(arr, cmap='viridis', origin='lower')
+                ax.axis('off')
+                if filenames and idx < len(filenames):
+                    ax.set_title(filenames[idx], fontsize=8)
+            
+            # blank out any unused subplots
+            for ax in axes.flat[len(idxs):]:
+                ax.axis('off')
+            
+            plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+            plt.savefig(f"./classifier/{cls}_{set_name}_images.png", dpi=300)
+            plt.close(fig)
+            
+    # ----------------------------------------------------------------
+    # ensure train_images / train_labels / train_filenames are aligned
+    # ----------------------------------------------------------------
+    # 1. zip them
+    train_triplets = list(zip(train_filenames, train_images, train_labels))
+
+    # 2. sort by filename (so both before- and after-normalisation will use the same order)
+    train_triplets.sort(key=lambda x: x[0])
+
+    # 3. unzip
+    train_filenames, train_images, train_labels = map(list, zip(*train_triplets))
+
+    # (do the same for your eval set if you want consistency there too:)
+    eval_triplets = list(zip(eval_filenames, eval_images, eval_labels))
+    eval_triplets.sort(key=lambda x: x[0])
+    eval_filenames, eval_images, eval_labels = map(list, zip(*eval_triplets))
+        
+    plot_class_images(train_images, train_labels, train_filenames, set_name='train_before_normalisation')
+    plot_class_images(eval_images,  eval_labels,  eval_filenames,  set_name='eval_before_normalisation')
             
     if NORMALISE:
+        if isinstance(train_images, list):
+            train_images = torch.stack(train_images)
+        if isinstance(eval_images, list):
+            eval_images = torch.stack(eval_images)
         all_images = torch.cat([train_images, eval_images], dim=0)
-        #all_images = normalise_images(all_images, out_min=0, out_max=1)
-        #all_images = percentile_stretch(all_images, lo=60, hi=99) # Percentile stretch over all images
-        all_images = torch.stack([percentile_stretch(img, lo=60, hi=99) for img in all_images]) # Individual percentile stretch
+        #all_images = normalise_images(all_images, out_min=0, out_max=1)   
+        if len(all_images.shape) == 5:  # (B, T, C, H, W)
+            #print("Applying stretch separately to each T in shape:", all_images.shape)
+            stretched = []
+            for t in range(all_images.shape[1]):
+                all_images_t = all_images[:, t]  # shape: (B, C, H, W)
+                stretched_t = percentile_stretch(all_images_t, lo=60, hi=99)
+                stretched.append(stretched_t.unsqueeze(1))  # keep T dim
+            all_images = torch.cat(stretched, dim=1)   
+        else:
+            all_images = percentile_stretch(all_images, lo=60, hi=99) # Percentile stretch over all images
+        #all_images = torch.stack([percentile_stretch(img, lo=60, hi=99) for img in all_images]) # Individual percentile stretch
         train_images = all_images[:len(train_images)]
         eval_images  = all_images[len(train_images):]
        
@@ -2115,106 +2589,17 @@ def load_galaxies(galaxy_class, path=None, fold=None, island=None, crop_size=Non
         eval_images  = all_images[len(train_images):]
     
     if STRETCH:
-        # 1) define your true source name once
-        train_idx   = 8 
-        source_name = train_filenames[train_idx]               # get its base name
-        cls_img     = train_images[train_idx]            # pick from train_images
-        print(f"🔍 Using training source {source_name} at index {train_idx}")
-
-        # now load its FITS
-        fits_path = f"/users/mbredber/scratch/data/PSZ2/fits/{source_name}/{source_name}.fits"
-        fits_data = fits.getdata(fits_path).astype(float)
-        fits_img  = torch.from_numpy(fits_data)
-        
-        # Crop the FITS image to match the crop size
-        fits_img = apply_formatting(fits_img, crop_size=crop_size, downsample_size=downsample_size)
-
-        print('Shape of cutout image:', cls_img.shape)
-        check_tensor('CUTOUT', cls_img)
-        print('Shape of FITS image:', fits_img.shape)
-        check_tensor('FITS',   fits_img)
-
-
-        # 4) define your stretches and clipping ranges
-        clip_ranges = [(1,99), (60,99), (93,99)]
-        clip_thresholds = [0.02, 0.025, 0.03, 0.35]  # adjust or extend as you like
-        funcs = [
-            ('original', lambda x: x),
-            ('asinh',     lambda x: asinh_stretch(x, alpha=10)),
-            ('log',       lambda x: log_stretch(x, alpha=10)),
-        ]
-        
-        """ Results actually better for percentile stretch, so we keep it commented out
-        for name, fn in funcs[1:]:
-                for lo, hi in clip_ranges:
-                    A = img.squeeze().cpu().numpy()
-                    p_lo, p_hi = np.percentile(A, (lo, hi))
-                    A_clip = np.clip((A - p_lo)/(p_hi - p_lo + 1e-12), 0, 1)
-                    out    = fn(torch.from_numpy(A_clip).float().unsqueeze(0).unsqueeze(0))
-                    cases.append(out.squeeze().cpu().numpy())
-                    titles.append(f"{name}, clip pct [{lo},{hi}]")"""
-
-            # 5) loop over the *same* source for CUTOUT vs FITS
-        for img, suffix in [
-            (cls_img,  "CUTOUT"),
-            (fits_img, "FITS"),
-        ]:
-            # define rows and columns
-            clip_ranges_plot = [(0, 100)] + clip_ranges[:3]  # top row is no cutoff
-            funcs = [
-                ('original', lambda x: x),
-                ('log',      lambda x: log_stretch(x,  alpha=10)),
-                ('asinh',    lambda x: asinh_stretch(x, alpha=10)),
-            ]
-            n_rows = len(clip_ranges_plot)
-            n_cols = len(funcs)
-
-            fig, axes = plt.subplots(n_rows, n_cols,
-                                    figsize=(4 * n_cols, 4 * n_rows),
-                                    constrained_layout=True)
-            fig.subplots_adjust(left=1)
-
-            # set column headers
-            for j, (name, _) in enumerate(funcs):
-                axes[0, j].set_title(name)
-                
-            check_tensor(f'Properties of the {suffix} image before stretching', img)
-
-            # fill grid
-            for i, (lo, hi) in enumerate(clip_ranges_plot):
-                for j, (_, fn) in enumerate(funcs):
-                    P   = percentile_stretch(img, lo=lo, hi=hi)
-                    out = fn(P)
-                    check_tensor(f'Properties of the {suffix} image after stretching with {lo}-{hi} percentile, and {fn.__name__} function', out)
-                    arr = out.squeeze().cpu().numpy()
-
-                    ax = axes[i, j]
-                    im = ax.imshow(arr, cmap='viridis', origin='lower')
-                    if j == 0:
-                        ax.set_ylabel(f'pctile [{lo},{hi}]',
-                                    rotation=0, labelpad=40)
-                    # hide only ticks and spines, keep the ylabel
-                    ax.set_xticks([])  
-                    ax.set_yticks([])  
-                    for spine in ax.spines.values():  
-                        spine.set_visible(False)
-                    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-                    
-
-            fig.suptitle(source_name)
-            plt.savefig(f"{source_name}_{suffix}_stretching.png", dpi=300)
-            plt.close(fig)
-
         # Asinh stretch after percentile stretch
+        all_images = torch.cat([train_images, eval_images], dim=0)
         images = np.stack([img.squeeze().numpy() for img in all_images], axis=0)
-        pct = torch.from_numpy(images).float().unsqueeze(0).unsqueeze(0)     # [1,1,H,W] per your stacking convention
-        st_tensor = asinh_stretch(pct, alpha=10)                                # apply asinh
-        tensor    = st_tensor.clone()                                           # keep same dims for downstream
-        print("After stretching type of tensor:", type(tensor), "shape:", tensor.shape)
-    
-
-    train_images, train_labels, eval_images, eval_labels = redistribute_excess(
-        train_images, train_labels, eval_images, eval_labels, target_classes)
+        pct = torch.from_numpy(images).float()     
+        images = asinh_stretch(pct, alpha=10)                                # apply asinh
+        #images = log_stretch(pct, alpha=10)                                  # apply log stretch
+        train_images = images[:len(train_images)]
+        eval_images  = images[len(train_images):]
+        
+    classes_present = torch.unique(torch.cat([torch.tensor(train_labels), torch.tensor(eval_labels)])).tolist()
+    train_images, train_labels, train_filenames, eval_images, eval_labels, eval_filenames = redistribute_excess(train_images, train_labels, eval_images, eval_labels, classes_present, train_filenames, eval_filenames)
     
     if SAVE_IMAGES:
         for kind, imgs, lbls in (
@@ -2222,16 +2607,15 @@ def load_galaxies(galaxy_class, path=None, fold=None, island=None, crop_size=Non
             ('eval',  eval_images,  eval_labels),
         ):
             for cls in target_classes:
-                cls_imgs = [img for img, lbl in zip(imgs, lbls) if lbl == cls]
+                cls_imgs = [img for img, lbl in zip(imgs, lbls) if lbl == (cls-min(target_classes))]
                 print(f"Length of {kind} images for class {cls}: {len(cls_imgs)}")
                 np.save(f"{path}_{kind}_{cls}_{len(cls_imgs)}.npy", cls_imgs)
 
+        
+    # then, right after your load_galaxies call:
+    plot_class_images(train_images, train_labels, train_filenames, set_name='train')
+    plot_class_images(eval_images,  eval_labels,  eval_filenames,  set_name='eval')
 
-    # Format and optionally augment
-    if BALANCE:
-        print("Counts per class before balancing:", collections.Counter(train_labels))
-        train_images, train_labels = balance_classes(train_images, train_labels)
-        print("Counts per class after balancing:", collections.Counter(train_labels))
         
     if EXTRADATA:
         meta_df = pd.read_csv(os.path.join(root_path, "PSZ2/cluster_source_data.csv"))
@@ -2242,7 +2626,6 @@ def load_galaxies(galaxy_class, path=None, fold=None, island=None, crop_size=Non
         # build a list of metadata rows in the same order as your `filenames` list:
         train_data = [meta_df.loc[base].values for base in train_filenames]
         eval_data  = [meta_df.loc[base].values for base in eval_filenames]
-
 
     if AUGMENT:
         train_images, train_labels = augment_images(train_images, train_labels, ST_augmentation=False)
@@ -2258,14 +2641,15 @@ def load_galaxies(galaxy_class, path=None, fold=None, island=None, crop_size=Non
         eval_labels  = torch.tensor(eval_labels,  dtype=torch.long)
         
     print("Shape of train_images returned from PSZ2:", train_images.shape)
-    print("Type of train_images:", type(train_images), "dtype:", train_images.dtype)
+    
+    print("Five random train labels:", train_labels[:5])
+    print("Five random eval labels:", eval_labels[:5])
+
     
     if EXTRADATA:
-        # (optional) convert to a tensor if you want a single numeric array
         train_data = torch.tensor(np.stack(train_data), dtype=torch.float32)
         eval_data  = torch.tensor(np.stack(eval_data),  dtype=torch.float32)
-
-        # Return images, labels, AND metadata arrays instead of just IDs
         return train_images, train_labels, eval_images, eval_labels, train_data, eval_data
-
+    
+    
     return train_images, train_labels, eval_images, eval_labels

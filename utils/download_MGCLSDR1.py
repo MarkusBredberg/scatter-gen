@@ -1,54 +1,38 @@
-#!/usr/bin/env python3
-import os
-import boto3
-from botocore import UNSIGNED
-from botocore.config import Config
-
-print("Downloading MGCLSDR1 FITS files...")
-
-# where to save
-OUT_ROOT  = "/users/mbredber/scratch/data/MGCLS"
-FITS_ROOT = os.path.join(OUT_ROOT, "fits")
-os.makedirs(FITS_ROOT, exist_ok=True)
-
 import requests
-from bs4 import BeautifulSoup
+from bs4          import BeautifulSoup
 from urllib.parse import urljoin
+import tarfile, os, csv
 
-print("Downloading MGCLSDR1 FITS files…")
-
-# where to save (unchanged)
-OUT_ROOT  = "/users/mbredber/scratch/data/MGCLS"
-FITS_ROOT = os.path.join(OUT_ROOT, "fits")
+#BASE     = "https://lofar-surveys.org"
+BASE = "https://archive-gw-1.kat.ac.za"
+#INDEX    = BASE + "/public/repository/10.48479/7epd-w356/data/basic_products/index.html"
+INDEX = "https://archive-gw-1.kat.ac.za/public/repository/10.48479/epd-w356/data/"
+OUT_ROOT = "data/MGCLS"
+FITS_ROOT= os.path.join(OUT_ROOT, "fits")
+os.makedirs(OUT_ROOT, exist_ok=True)
 os.makedirs(FITS_ROOT, exist_ok=True)
 
-# build and fetch the public HTML index
-index_url = "https://archive-gw-1.kat.ac.za/public/repository/10.48479/7epd-w356/data/basic_products/index.html"
-resp      = requests.get(index_url)
-resp.raise_for_status()
-soup      = BeautifulSoup(resp.text, 'html.parser')
+# 1) hit the S3 list‑objects API (XML) rather than the HTML
+r = requests.get(INDEX + "?list-type=2")
+r.raise_for_status()
 
-# grab all .fits.gz links
-fits_links = [
-    a['href'] for a in soup.find_all('a', href=True)
-    if a['href'].lower().endswith('.fits.gz')
-]
+# 2) parse the XML keys and pick out only the FITS (or .tar.gz) files
+soup = BeautifulSoup(r.text, "xml")
+keys = [elt.text
+        for elt in soup.find_all("Key")
+        if elt.text.startswith("public/repository/10.48479/epd-w356/data/")
+           and elt.text.lower().endswith((".fits", ".fits.gz", ".tar.gz"))]
 
-print(f"Found {len(fits_links)} FITS files.")
+# 3) build your download URLs
+file_pages = ["https://archive-gw-1.kat.ac.za/" + key for key in keys]
 
-# download each FITS via HTTP
-for href in fits_links:
-    url      = urljoin(index_url, href)
-    filename = os.path.basename(href)
-    outpath  = os.path.join(FITS_ROOT, filename)
-    if os.path.exists(outpath):
-        print(f"Skipping existing {filename}")
-        continue
-
-    print(f"Downloading {filename}…")
-    r = requests.get(url); r.raise_for_status()
-    with open(outpath, 'wb') as fd:
-        fd.write(r.content)
-
-print("All downloads complete.")
-
+# ─── then continue with your for‑loop over file_pages as before ───
+for url in file_pages:
+    filename = os.path.basename(url)
+    out_path = os.path.join(OUT_ROOT, filename)
+    print("⏬", filename)
+    resp = requests.get(url); resp.raise_for_status()
+    with open(out_path, "wb") as fd:
+        fd.write(resp.content)
+        
+    print("✅ Downloaded:", filename)

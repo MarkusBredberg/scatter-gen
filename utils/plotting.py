@@ -97,13 +97,13 @@ def plot_image_grid(images, num_images=36, save_path="grid.png"):
         if idx >= num_images or idx >= len(images):
             break
         # If images are [N, 1, H, W], call .squeeze() to remove the extra dimension
-        #ax.imshow(images[idx].squeeze(), cmap='gray')
+        #ax.imshow(images[idx].squeeze(), cmap='viridis')
         #ax.axis('off')
         
         # select the cube
         img = images[idx].cpu().numpy()
         # if it’s C×H×W, average down to H×W for display
-        ax.imshow(first_channel(images[idx]), cmap='gray')
+        ax.imshow(first_channel(images[idx]), cmap='viridis')
         ax.axis('off')
 
 
@@ -152,7 +152,7 @@ def plot_images_by_class(images, labels, num_images=5, save_path="./classifier/u
                     if j + t * num_images >= axes.shape[1]:
                         continue  # skip overflow
                     ax = axes[i, j + t * num_images // arr.shape[0]]
-                    ax.imshow(t_img, cmap="gray")
+                    ax.imshow(t_img, cmap="viridis")
                     ax.set_xticks([]); ax.set_yticks([])
                     if j > 0:
                         ax.axis("off")
@@ -160,7 +160,7 @@ def plot_images_by_class(images, labels, num_images=5, save_path="./classifier/u
             elif arr.ndim == 3:
                 img2d = arr.mean(axis=0) if arr.shape[0] > 1 else arr[0]
                 img2d = img2d.squeeze()
-                ax.imshow(img2d, cmap="gray")
+                ax.imshow(img2d, cmap="viridis")
                 ax.set_xticks([]); ax.set_yticks([])
                 if j > 0:
                     ax.axis("off")

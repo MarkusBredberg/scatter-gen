@@ -18,6 +18,10 @@ from tqdm import tqdm
 from torch.optim import AdamW
 import itertools
 import matplotlib 
+
+from sklearn.metrics import confusion_matrix
+import seaborn as sns
+import matplotlib.pyplot as plt
 import sys, os
 
 SEED = 42  # Set a seed for reproducibility
@@ -50,7 +54,7 @@ print("Running script 4.1 Latest version with seed", SEED)
 classes = get_classes()
 galaxy_classes = [50, 51]  # Classes to classify
 max_num_galaxies = 1000000  # Upper limit for the all-classes combined training data before classical augmentation
-dataset_portions = [0.1, 1]  # Portions of complete dataset for the accuracy vs dataset size
+dataset_portions = [1]  # Portions of complete dataset for the accuracy vs dataset size
 J, L, order = 2, 12, 2  # Scatter transform parameters
 classifier = ["TinyCNN", # Very Simple CNN
               "Rustige", # Simple CNN from Rustige et al. 2023, https://github.com/floriangriese/wGAN-supported-augmentation/blob/main/src/Classifiers/SimpleClassifiers/Classifiers.py
@@ -67,7 +71,7 @@ num_epochs_cpu = 100
 learning_rates = [1e-3]  # Learning rates
 regularization_params = [1e-3]  # Regularisation parameters
 label_smoothing = 0  # Label smoothing for the classifier
-num_experiments = 10
+num_experiments = 1
 folds = [5] # 0-4 for 5-fold cross validation, 5 for only one training
 lambda_values = [0]  # Ratio between generated images and original images per class. 8 is reserfved for TRAINONGENERATED
 
@@ -121,8 +125,9 @@ elif galaxy_classes[0] in list(range(40, 49)):
     downsample_size = (128, 128)  # Downsample size for the images
     batch_size = 16
 elif galaxy_classes[0] in list(range(50, 60)):
-    crop_size = (1, 256, 256)  # Crop size for the images
+    crop_size = (1, 512, 512)  # Crop size for the images
     downsample_size = (1, 128, 128)  # Downsample size for the images
+    version = 'T50kpcSUB'  # Version of the dataset
     batch_size = 16 
 
 img_shape = downsample_size
@@ -294,17 +299,15 @@ for gen_model_name in gen_model_names:
     else:
         raise ValueError(f"load_galaxies returned {len(_out)} values, expected 4 or 6")
     
-    # ——— Data sanity checks ———
-    print("Shape of test_images: ", np.shape(test_images))
-            
-    check_tensor("Test images", test_images)
-    check_tensor("Train images", train_images)
     
-    # Check the tensor for each class
+    # ——— Data sanity checks ———
     for cls in galaxy_classes:
         cls_mask = (train_labels == cls)
         cls_images = train_images[cls_mask]
         check_tensor(f"Train images for class {cls}", cls_images)
+        cls_mask = (test_labels == cls)
+        cls_images = test_images[cls_mask]
+        check_tensor(f"Test images for class {cls}", cls_images)
 
     import hashlib
 
@@ -321,19 +324,23 @@ for gen_model_name in gen_model_names:
     assert not common, f"Overlap detected: {len(common)} images appear in both train and test validation!"
     # ————————————————————————
     
+    unique_labels, counts = torch.unique(test_labels, return_counts=True)
+    print("Test labels distribution (raw):", dict(zip(unique_labels.tolist(), counts.tolist())))
     test_labels = test_labels - test_labels.min() 
+    unique_labels, counts = torch.unique(test_labels, return_counts=True)
+    print("Test labels distribution (after min subtraction):", dict(zip(unique_labels.tolist(), counts.tolist())))
     perm = torch.randperm(test_images.size(0))
     test_images = test_images[perm]
     test_labels = test_labels[perm]
     if EXTRAVARS:
         test_data = test_data[perm]
+        
+    # Plot some train images of each class using plot_images_by_class
+    if SHOWIMGS:
+        plot_images_by_class(train_images, train_labels, num_images=3, save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_read_in_example_train_data.pdf")
+        plot_images_by_class(test_images, test_labels, num_images=3, save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_read_in_example_test_data.pdf")
 
 
-    # Print the distribution of raw test labels
-    unique_labels, counts = torch.unique(test_labels, return_counts=True)
-    print("Test labels distribution (raw):", dict(zip(unique_labels.tolist(), counts.tolist())))
-
-    # Prepare input data
     # Produce an empty tensor to occupy the not used component of the datasets. 
     mock_tensor = torch.zeros_like(test_images)
     if classifier in ['ScatterNet', 'ScatterResNet', 'ScatterSqueezeNet', 'ScatterSqueezeNet2']:
@@ -430,7 +437,6 @@ for gen_model_name in gen_model_names:
 
             assert train_images.size(0) == train_labels.size(0), \
                 f"train_images ({len(train_images)}) and train_labels ({len(train_labels)}) must match!"
-
             valid_labels = valid_labels - valid_labels.min()
             perm = torch.randperm(train_images.size(0))
             train_images, train_labels = train_images[perm], train_labels[perm]
@@ -564,7 +570,7 @@ for gen_model_name in gen_model_names:
                 EXTRAVARS = False
             
         unique_labels, counts = torch.unique(train_labels, return_counts=True)
-        print("Train labels distribution (raw) after possible filtering and augmentation:", dict(zip(unique_labels.tolist(), counts.tolist())))
+        print("Train labels distribution after possible filtering and augmentation:", dict(zip(unique_labels.tolist(), counts.tolist())))
 
         if dataset_sizes == {}:
             dataset_sizes[fold] = [int(len(train_images) * p) for p in dataset_portions]
@@ -662,7 +668,7 @@ for gen_model_name in gen_model_names:
                     train_images_cls2.cpu(),
                     title1=f"Class {galaxy_classes[0]}",
                     title2=f"Class {galaxy_classes[1]}",
-                    save_path=f"./classifier/{classifier}_{gen_model_name}_{galaxy_classes[0]}_{galaxy_classes[1]}_f{fold}_histogram.png"
+                    save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_histogram.png"
                 )
 
                 plot_background_histogram(
@@ -670,7 +676,7 @@ for gen_model_name in gen_model_names:
                     train_images_cls2.cpu(),        # shape (720, 1, 128, 128)
                     img_shape=(1, 128, 128),
                     title="Background histograms",
-                    save_path=f"./classifier/{classifier}_{gen_model_name}_{galaxy_classes[0]}_{galaxy_classes[1]}_f{fold}_background_hist.png"
+                    save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_background_hist.png"
                 )
 
                 for cls in galaxy_classes:
@@ -680,12 +686,12 @@ for gen_model_name in gen_model_names:
                     plot_image_grid(
                         orig_imgs.cpu(),
                         num_images=36,
-                        save_path=f"./classifier/{classifier}_{gen_model_name}_{cls}_f{fold}_real_grid.png"
+                        save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_train_grid.png"
                     )
                     plot_image_grid(
                         test_imgs.cpu(),
                         num_images=36,
-                        save_path=f"./classifier/{classifier}_{gen_model_name}_{cls}_f{fold}_test_grid.png"
+                        save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_test_grid.png"
                     )
 
                     if lambda_generate not in [0, 8]:
@@ -694,21 +700,21 @@ for gen_model_name in gen_model_names:
                         plot_image_grid(
                             gen_imgs,
                             num_images=36,
-                            save_path=f"./classifier/{classifier}_{gen_model_name}_{cls}_f{fold}_generated_grid.png"
+                            save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_generated_grid.png"
                         )
                         plot_histograms(
                             gen_imgs,
                             orig_imgs.cpu(),
                             title1="Generated Images",
                             title2="Train Images",
-                            save_path=f"./classifier/{classifier}_{gen_model_name}_{cls}_f{fold}_histogram.png"
+                            save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_histogram.png"
                         )
                         plot_background_histogram(
                             orig_imgs,
                             gen_imgs,
                             img_shape=(1, 128, 128),
                             title="Background histograms",
-                            save_path=f"./classifier/{classifier}_{gen_model_name}_{cls}_f{fold}_background_hist.png")
+                            save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_background_hist.png")
         
         if USE_CLASS_WEIGHTS:
             unique, counts = np.unique(train_labels.cpu().numpy(), return_counts=True)
@@ -731,7 +737,7 @@ for gen_model_name in gen_model_names:
         if fold in [0, 5] and SHOWIMGS:
             imgs = train_images.detach().cpu().numpy()
             lbls = (train_labels + min(galaxy_classes)).detach().cpu().numpy()
-            plot_images_by_class(imgs, labels=lbls, num_images=5, save_path=f"./classifier/{classifier}_{gen_model_name}_{galaxy_classes}_example_train_data.pdf")
+            plot_images_by_class(imgs, labels=lbls, num_images=5, save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_example_train_data.pdf")
         
         # Prepare input data
         mock_tensor = torch.zeros_like(train_images)
@@ -808,7 +814,7 @@ for gen_model_name in gen_model_names:
         if SHOWIMGS and lambda_generate not in [0, 8]: 
             if classifier in ['TinyCNN', 'SCNN', 'CNNSqueezeNet', 'Rustige', 'ScatterSqueezeNet', 'ScatterSqueezeNet2', 'Binary']:
                 #save_images_tensorboard(generated_images[:36], save_path=f"./classifier/{gen_model_name}_{galaxy_classes}_generated.png", nrow=6)
-                plot_histograms(pristine_train_images, valid_images, title1="Train images", title2="Valid images", imgs3=generated_images, imgs4=test_images, title3='Generated images', title4='Test images', save_path=f"./classifier/{classifier}_{gen_model_name}_{galaxy_classes}_histograms.png")
+                plot_histograms(pristine_train_images, valid_images, title1="Train images", title2="Valid images", imgs3=generated_images, imgs4=test_images, title3='Generated images', title4='Test images', save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_histograms.png")
 
         
         ###############################################
@@ -1010,7 +1016,10 @@ for gen_model_name in gen_model_names:
                         all_pred_probs[key] = []
                         all_pred_labels[key] = []
                         all_true_labels[key] = []
-
+                        mis_images = []
+                        mis_trues  = []
+                        mis_preds  = []
+                        
                         for images, scat, _rest in test_loader:
                             if EXTRAVARS:
                                 meta, labels = _rest
@@ -1036,12 +1045,63 @@ for gen_model_name in gen_model_names:
                             all_pred_labels[key].extend(pred_labels)
                             all_true_labels[key].extend(true_labels)
 
+                            
+                            if SHOWIMGS and experiment == num_experiments - 1:
+                                mask = pred_labels != true_labels
+                                mis_images.append(images.cpu()[mask])
+                                mis_trues .append(true_labels[mask])
+                                mis_preds .append(pred_labels[mask])
+                                
+                                if galaxy_classes == [52, 53]:
+                                    print(f"Confusion matrix for {classifier_name} on fold {fold}, experiment {experiment}, subset size {subset_size}:")
+                                    cm = confusion_matrix(all_true_labels[key], all_pred_labels[key], labels=[0,1])
+                                    plt.figure(figsize=(4,4))
+                                    sns.heatmap(cm, annot=True, fmt='d',
+                                                xticklabels=['RH (52)','RR (53)'],
+                                                yticklabels=['RH (52)','RR (53)'])
+                                    plt.xlabel('Predicted')
+                                    plt.ylabel('True')
+                                    plt.title(f'Confusion Matrix — {classifier_name}')
+                                    plt.savefig(f"./classifier/{classifier_name}_confusion_matrix.png", dpi=150)
+                                    plt.close()
+
                         accuracy = accuracy_score(all_true_labels[key], all_pred_labels[key])
                         precision = precision_score(all_true_labels[key], all_pred_labels[key], average='macro', zero_division=0)
                         recall = recall_score(all_true_labels[key], all_pred_labels[key], average='macro', zero_division=0)
                         f1 = f1_score(all_true_labels[key], all_pred_labels[key], average='macro', zero_division=0)
 
                         update_metrics(metrics, gen_model_name, subset_size, fold, experiment, lr, reg, accuracy, precision, recall, f1, lambda_generate)
+                        
+                        # Print accuracy and other metrics
+                        print(f"Fold {fold}, Experiment {experiment}, Subset Size {subset_size}, Classifier {classifier_name}, "
+                              f"Accuracy: {accuracy:.4f}, Precision: {precision:.4f}, "
+                              f"Recall: {recall:.4f}, F1 Score: {f1:.4f}, ")
+    
+
+                        if SHOWIMGS and mis_images and experiment == num_experiments - 1:
+                            mis_images = torch.cat(mis_images, dim=0)[:36]
+                            mis_trues  = np.concatenate(mis_trues)[:36]
+                            mis_preds  = np.concatenate(mis_preds)[:36]
+
+                            import matplotlib.pyplot as plt
+                            fig, axes = plt.subplots(6, 6, figsize=(12, 12))
+                            axes = axes.flatten()
+
+                            for i, ax in enumerate(axes[:len(mis_images)]):
+                                img_tensor = mis_images[i]                           # shape is either (1,128,128) or (2,128,128)
+                                # pick the first channel if there are two, else drop the singleton channel
+                                img = img_tensor[0] if img_tensor.shape[0] > 1 else img_tensor.squeeze(0)
+                                ax.imshow(img.numpy(), cmap='viridis')
+                                ax.set_title(f"T={mis_trues[i]}, P={mis_preds[i]}")
+                                ax.axis('off')
+
+                            for ax in axes[len(mis_images):]:
+                                ax.axis('off')
+
+                            out_path = f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_misclassified.png"
+                            fig.savefig(out_path, dpi=150, bbox_inches='tight')
+                            plt.close(fig)
+
 
                 end_time = time.time()
                 elapsed_time = end_time - start_time
@@ -1049,6 +1109,35 @@ for gen_model_name in gen_model_names:
                 if subset_size > 20000:
                     with open(log_path, 'w') as file:
                         file.write(f"Time taken to train the model on fold {fold}: {elapsed_time:.2f} seconds \n")
+                        
+
+            # Print average accuracy and other metrics for the fold
+            avg_accuracy = np.mean([
+                metrics[f"{gen_model_name}_accuracy_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}"]
+                for subset_size in dataset_sizes[fold]
+                for experiment in range(num_experiments)
+            ])
+            avg_precision = np.mean([
+                metrics[f"{gen_model_name}_precision_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}"]
+                for subset_size in dataset_sizes[fold]
+                for experiment in range(num_experiments)
+            ])
+            avg_recall = np.mean([
+                metrics[f"{gen_model_name}_recall_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}"]
+                for subset_size in dataset_sizes[fold]
+                for experiment in range(num_experiments)
+            ])
+            avg_f1 = np.mean([
+                metrics[f"{gen_model_name}_f1_score_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}"]
+                for subset_size in dataset_sizes[fold]
+                for experiment in range(num_experiments)
+            ])
+            
+            print(f"Fold {fold}, Classifier {classifier_name}, "
+                  f"Average Accuracy: {avg_accuracy:.4f}, "
+                  f"Average Precision: {avg_precision:.4f}, "
+                  f"Average Recall: {avg_recall:.4f}, "
+                  f"Average F1 Score: {avg_f1:.4f}")
 
             generated_features = []
             with torch.no_grad():
