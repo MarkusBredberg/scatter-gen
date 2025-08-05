@@ -89,7 +89,7 @@ def plot_galaxy_grid(images, filenames, labels, sigmas=(1.0, 2.0, 3.0)):
 
 
     # 5) save + close
-    outname = f"gauss_blur_grid_{'_'.join(map(str, sigmas))}.png"
+    outname = f"stretch_gauss_blur_grid_{'_'.join(map(str, sigmas))}.png"
     plt.savefig(outname, dpi=300)
     plt.close(fig)
     print(f"Wrote {outname}")
@@ -122,7 +122,7 @@ if __name__ == "__main__":
         sample_size=500,
         REMOVEOUTLIERS=True,
         BALANCE=False,
-        STRETCH=False,
+        STRETCH=True,
         AUGMENT=False,
         NORMALISE=True,
         NORMALISETOPM=False,

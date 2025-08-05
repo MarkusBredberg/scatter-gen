@@ -310,7 +310,7 @@ def get_synthetic(
 ################################### DATA SELECTION FUNCTIONS #########################################
 ######################################################################################################
 
-def percentile_stretch(x, lo=2, hi=98):
+def percentile_stretch(x, lo=80, hi=99):
     """
     x: Tensor of shape (B, C, H, W)
     Returns: same shape, linearly rescaled so that the lo-th percentile → 0 and hi-th → 1
@@ -1866,7 +1866,7 @@ def load_RGZ10k(path=root_path + "RGZ_10k", fold=5, target_classes=None, crop_si
 
 def load_PSZ2(path=root_path + "PSZ2/classified/", fold=5, sample_size=300, target_classes=[53], crop_size=(1, 256, 256), downsample_size=(1, 256, 256), GAUSSIAN_BLURRING=False, version='T100kpcSUB', train=False):
     print("Loading PSZ2 data...")
-    
+    print("Gaussian blurring:", GAUSSIAN_BLURRING)
     # Configuration
     version = 'T50kpcSUB' # if not CUBE
     version_folders = ['T50kpcSUB', 'T100kpcSUB']
@@ -1997,17 +1997,21 @@ def load_PSZ2(path=root_path + "PSZ2/classified/", fold=5, sample_size=300, targ
                     #print(f"Warning: {folder_path} not found, skipping.")
                     continue
                 for fname in os.listdir(folder_path):
-                    if not fname.lower().endswith('.npy'):
+                    if not fname.lower().endswith('.fits'):
                         continue
-                    npy_path = os.path.join(folder_path, fname)
-                    arr = np.load(npy_path).astype(float)
+                    base, _ = os.path.splitext(fname)
+                    # skip files that include the version suffix
+                    if base.endswith(version):
+                        continue
+                    fits_path = os.path.join(folder_path, fname)
+                    arr = fits.getdata(fits_path).astype(float)
 
-                    # collapse singleton dims, then if you still have a 3D stack, average into one 2D frame
+                    # collapse singleton dims, then average if it’s a 3D cube
                     arr2 = np.squeeze(arr)
                     if arr2.ndim == 3:
                         arr2 = np.mean(arr2, axis=0)
                     elif arr2.ndim != 2:
-                        raise ValueError(f"Expected 2-D array or 3-D stack, got shape {arr2.shape!r}")
+                        raise ValueError(f"Expected 2-D or 3-D stack, got {arr2.shape!r}")
 
                     if GAUSSIAN_BLURRING:
                         from scipy.ndimage import gaussian_filter
@@ -2017,7 +2021,7 @@ def load_PSZ2(path=root_path + "PSZ2/classified/", fold=5, sample_size=300, targ
                     
                     images.append(tensor) # shape [1, C, H, W]
                     labels.append(label)
-                    filenames.append(fname[:-4])  # remove the .npy extension
+                    filenames.append(os.path.splitext(fname)[0])
         
 
     if len(images) == 0:
@@ -2049,15 +2053,13 @@ def load_PSZ2(path=root_path + "PSZ2/classified/", fold=5, sample_size=300, targ
 
         # report
         if duplicates:
-            #print("Found duplicate images (by hash):")
+            print("Found duplicate images (by hash):")
             for h, dups in duplicates.items():
                 original = seen[h]
-                #print(f"  hash {h}:")
-                #print(f"    original: {original}")
-                #for dup in dups:
-                #    print(f"    duplicate: {dup}")
-        else:
-            print("No exact‐byte duplicates found.")
+                print(f"  hash {h}:")
+                print(f"    original: {original}")
+                for dup in dups:
+                    print(f"    duplicate: {dup}")
 
         # overwrite
         images, labels, filenames = unique_images, unique_labels, unique_filenames
@@ -2183,7 +2185,8 @@ def load_MGCLS(path='/users/mbredber/data/MGCLS/classified_crops_1600/',  # Path
 
 
 def load_galaxies(galaxy_class, path=None, fold=None, island=None, crop_size=None, downsample_size=None, sample_size=None, REMOVEOUTLIERS=True, 
-                  BALANCE=False, AUGMENT=False, STRETCH=False, EXTRADATA=False, NORMALISE=True, NORMALISETOPM=False, SAVE_IMAGES=False, version=None, train=None):
+                  BALANCE=False, AUGMENT=False, STRETCH=False, percentile_lo=80, percentile_hi=99,
+                  EXTRADATA=False, NORMALISE=True, NORMALISETOPM=False, SAVE_IMAGES=False, version=None, train=None):
     """
     Master loader that delegates to specific dataset loaders and returns zero-based labels.
     """
@@ -2363,7 +2366,7 @@ def load_galaxies(galaxy_class, path=None, fold=None, island=None, crop_size=Non
             check_tensor('FITS',   fits_img)
 
             # 4) define your stretches and clipping ranges
-            clip_ranges = [(60,99.9), (60,99.8), (60,99.7)]
+            clip_ranges = [(60,99.9), (70,99.5), (80,99)]
             clip_thresholds = [0.02, 0.025, 0.03, 0.35]  # adjust or extend as you like
             funcs = [
                 ('original', lambda x: x),
@@ -2541,26 +2544,23 @@ def load_galaxies(galaxy_class, path=None, fold=None, island=None, crop_size=Non
             plt.savefig(f"./classifier/{cls}_{set_name}_images.png", dpi=300)
             plt.close(fig)
             
-    # ----------------------------------------------------------------
-    # ensure train_images / train_labels / train_filenames are aligned
-    # ----------------------------------------------------------------
-    # 1. zip them
-    train_triplets = list(zip(train_filenames, train_images, train_labels))
-
-    # 2. sort by filename (so both before- and after-normalisation will use the same order)
-    train_triplets.sort(key=lambda x: x[0])
-
-    # 3. unzip
-    train_filenames, train_images, train_labels = map(list, zip(*train_triplets))
-
-    # (do the same for your eval set if you want consistency there too:)
-    eval_triplets = list(zip(eval_filenames, eval_images, eval_labels))
-    eval_triplets.sort(key=lambda x: x[0])
-    eval_filenames, eval_images, eval_labels = map(list, zip(*eval_triplets))
+    sample_indices = {}
+    # Convert labels to a list if they are tensors
+    if isinstance(train_labels, torch.Tensor):
+        train_labels = train_labels.tolist()
+    for cls in sorted(set(train_labels)):
+        idxs = [i for i, lbl in enumerate(train_labels) if lbl == cls]
+        sample_indices[cls] = idxs[:10]
         
-    plot_class_images(train_images, train_labels, train_filenames, set_name='train_before_normalisation')
-    plot_class_images(eval_images,  eval_labels,  eval_filenames,  set_name='eval_before_normalisation')
-            
+    if isinstance(eval_labels, torch.Tensor):
+        eval_labels = eval_labels.tolist()
+    for cls in sorted(set(eval_labels)):
+        idxs = [i for i, lbl in enumerate(eval_labels) if lbl == cls]
+        sample_indices[cls] = sample_indices.get(cls, []) + idxs[:10]
+        
+    plot_class_images(train_images, train_labels, train_filenames, set_name='train_1.before_normalisation')
+    plot_class_images(eval_images,  eval_labels,  eval_filenames,  set_name='eval_1.before_normalisation')
+
     if NORMALISE:
         if isinstance(train_images, list):
             train_images = torch.stack(train_images)
@@ -2573,11 +2573,11 @@ def load_galaxies(galaxy_class, path=None, fold=None, island=None, crop_size=Non
             stretched = []
             for t in range(all_images.shape[1]):
                 all_images_t = all_images[:, t]  # shape: (B, C, H, W)
-                stretched_t = percentile_stretch(all_images_t, lo=60, hi=99)
+                stretched_t = percentile_stretch(all_images_t, lo=percentile_lo, hi=percentile_hi)  # Percentile stretch over each T
                 stretched.append(stretched_t.unsqueeze(1))  # keep T dim
             all_images = torch.cat(stretched, dim=1)   
         else:
-            all_images = percentile_stretch(all_images, lo=60, hi=99) # Percentile stretch over all images
+            all_images = percentile_stretch(all_images, lo=percentile_lo, hi=percentile_hi) # Percentile stretch over all images
         #all_images = torch.stack([percentile_stretch(img, lo=60, hi=99) for img in all_images]) # Individual percentile stretch
         train_images = all_images[:len(train_images)]
         eval_images  = all_images[len(train_images):]
@@ -2587,7 +2587,10 @@ def load_galaxies(galaxy_class, path=None, fold=None, island=None, crop_size=Non
         all_images = normalise_images(all_images, out_min=-1, out_max=1)
         train_images = all_images[:len(train_images)]
         eval_images  = all_images[len(train_images):]
-    
+        
+    plot_class_images(train_images, train_labels, train_filenames, set_name='train_2.after_normalisation')
+    plot_class_images(eval_images,  eval_labels,  eval_filenames,  set_name='eval_2.after_normalisation')
+
     if STRETCH:
         # Asinh stretch after percentile stretch
         all_images = torch.cat([train_images, eval_images], dim=0)
@@ -2597,6 +2600,10 @@ def load_galaxies(galaxy_class, path=None, fold=None, island=None, crop_size=Non
         #images = log_stretch(pct, alpha=10)                                  # apply log stretch
         train_images = images[:len(train_images)]
         eval_images  = images[len(train_images):]
+        
+    plot_class_images(train_images, train_labels, train_filenames, set_name='train_3.after_stretching')
+    plot_class_images(eval_images,  eval_labels,  eval_filenames,  set_name='eval_3.after_stretching')
+
         
     classes_present = torch.unique(torch.cat([torch.tensor(train_labels), torch.tensor(eval_labels)])).tolist()
     train_images, train_labels, train_filenames, eval_images, eval_labels, eval_filenames = redistribute_excess(train_images, train_labels, eval_images, eval_labels, classes_present, train_filenames, eval_filenames)
@@ -2611,10 +2618,6 @@ def load_galaxies(galaxy_class, path=None, fold=None, island=None, crop_size=Non
                 print(f"Length of {kind} images for class {cls}: {len(cls_imgs)}")
                 np.save(f"{path}_{kind}_{cls}_{len(cls_imgs)}.npy", cls_imgs)
 
-        
-    # then, right after your load_galaxies call:
-    plot_class_images(train_images, train_labels, train_filenames, set_name='train')
-    plot_class_images(eval_images,  eval_labels,  eval_filenames,  set_name='eval')
 
         
     if EXTRADATA:
@@ -2642,9 +2645,6 @@ def load_galaxies(galaxy_class, path=None, fold=None, island=None, crop_size=Non
         
     print("Shape of train_images returned from PSZ2:", train_images.shape)
     
-    print("Five random train labels:", train_labels[:5])
-    print("Five random eval labels:", eval_labels[:5])
-
     
     if EXTRADATA:
         train_data = torch.tensor(np.stack(train_data), dtype=torch.float32)

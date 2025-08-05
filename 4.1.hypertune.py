@@ -86,27 +86,32 @@ num_experiments = 1
 param_grid = {
     'lr':            [1e-4, 1e-3],
     'reg':           [1e-4],
-    'label_smoothing': [0.0],
+    'label_smoothing':[0.0],
     'J':             [2],
     'L':             [12],
-    'order':         [2],  # if fixed
-    'crop_size':     [(256,256), (512, 512)],
-    'downsample_size': [(128,128)],
+    'order':         [2],
+    'percentile_lo': [50, 60, 70],   # ← add this
+    'percentile_hi': [95, 99],       # ← and this
+    'crop_size':     [(256,256), (512,512)],
+    'downsample_size':[(128,128)],
     'version':       ['T100kpcSUB']
 }
 
-# Loop over each hyperparameter combination
-for lr, reg, ls, J_val, L_val, order_val, crop, down, ver in product(
+for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, ver in product(
         param_grid['lr'],
         param_grid['reg'],
         param_grid['label_smoothing'],
         param_grid['J'],
         param_grid['L'],
         param_grid['order'],
+        param_grid['percentile_lo'],    # ← include here
+        param_grid['percentile_hi'],    # ← and here
         param_grid['crop_size'],
         param_grid['downsample_size'],
         param_grid['version']
     ):
+    percentile_lo = lo_val
+    percentile_hi = hi_val
 
     # Assign into your existing variables
     learning_rates       = [lr]
@@ -324,6 +329,8 @@ for lr, reg, ls, J_val, L_val, order_val, crop, down, ver in product(
                     REMOVEOUTLIERS=FILTERED,
                     BALANCE=BALANCE,           # Reduce the larger classes to the size of the smallest class
                     STRETCH=STRETCH,
+                    percentile_lo=percentile_lo,  # Percentile stretch lower bound
+                    percentile_hi=percentile_hi,  # Percentile stretch upper bound
                     AUGMENT=True,
                     NORMALISE=NORMALISEIMGS,
                     NORMALISETOPM=NORMALISEIMGSTOPM,
@@ -501,6 +508,8 @@ for lr, reg, ls, J_val, L_val, order_val, crop, down, ver in product(
                     REMOVEOUTLIERS=FILTERED,
                     BALANCE=BALANCE,           # Reduce the larger classes to the size of the smallest class
                     STRETCH=STRETCH,
+                    percentile_lo=percentile_lo,  # Percentile stretch lower bound
+                    percentile_hi=percentile_hi,  # Percentile stretch upper bound
                     AUGMENT=True,
                     NORMALISE=NORMALISEIMGS,
                     NORMALISETOPM=NORMALISEIMGSTOPM,

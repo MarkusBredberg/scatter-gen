@@ -1913,7 +1913,6 @@ def load_PSZ2(path=root_path + "PSZ2/classified/", fold=5, sample_size=300, targ
     for cls in target_classes:
         class_folder = next(c["description"] for c in get_classes() if c["tag"] == cls)
         label = cls
-        print(f" Processing class: {class_folder!r} (label={label})")
 
         # We only ever look in this one subfolder per class
         for subfolder in [class_folder]:
@@ -1973,8 +1972,6 @@ def load_PSZ2(path=root_path + "PSZ2/classified/", fold=5, sample_size=300, targ
                     images.append(cube)
                     labels.append(label)
                     filenames.append(base)
-
-                print(f"  → added {len(base_names)} cubes; total so far = {len(images)}")
 
             else:
                 # exactly the same .npy→tensor→apply_formatting pipeline, but only one version
@@ -2222,7 +2219,6 @@ def load_galaxies(galaxy_class, path=None, fold=None, island=None, crop_size=Non
 
         # ensure no cluster appears in both
         overlap = set(train_filenames) & set(eval_filenames)
-        print("  filename overlap:", overlap)
         assert not overlap, f"PSZ2 split error — these IDs are in both sets: {overlap}"
         
     else:
@@ -2321,7 +2317,11 @@ def load_galaxies(galaxy_class, path=None, fold=None, island=None, crop_size=Non
                         arr = out.squeeze().cpu().numpy()
 
                         ax = axes[i, j]
-                        im = ax.imshow(arr, cmap='viridis', origin='lower')
+                        if arr.ndim == 3:
+                            im = ax.imshow(np.moveaxis(arr, 0, -1), origin='lower')
+                        else:
+                            im = ax.imshow(arr, cmap='viridis', origin='lower')
+
                         if j == 0:
                             ax.set_ylabel(f'pctile [{lo},{hi}]',
                                         rotation=0, labelpad=40)
@@ -2391,7 +2391,10 @@ def load_galaxies(galaxy_class, path=None, fold=None, island=None, crop_size=Non
                         arr = out.squeeze().cpu().numpy()
 
                         ax = axes[i, j]
-                        im = ax.imshow(arr, cmap='viridis', origin='lower')
+                        if arr.ndim == 3:
+                            im = ax.imshow(np.moveaxis(arr, 0, -1), origin='lower')
+                        else:
+                            im = ax.imshow(arr, cmap='viridis', origin='lower')
 
                         if j == 0:
                             ax.set_ylabel(
@@ -2412,7 +2415,7 @@ def load_galaxies(galaxy_class, path=None, fold=None, island=None, crop_size=Non
 
                 # include suffix in the title & filename
                 fig.suptitle(f"eval {class_id} — {source_name} ({suffix})")
-                plt.savefig(f"./classifier/eval_{class_id}_{source_name}_{suffix}_stretching.png", dpi=300)
+                plt.savefig(f"./classifier/good_{class_id}_eval_{source_name}_{suffix}_stretching.png", dpi=300)
                 plt.close(fig)
 
             

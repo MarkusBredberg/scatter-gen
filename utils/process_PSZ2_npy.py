@@ -74,7 +74,8 @@ for suffix in FILENAME_SUFFIXES:
             buckets = BUCKETS.get(lab, ['unclassified'])
             for b in buckets:
                 dest_dir = os.path.join(out_base, b)
-                dst = os.path.join(dest_dir, fits_fn)
+                dest_fn = f"{slug}.fits"
+                dst     = os.path.join(dest_dir, dest_fn)
                 shutil.copy2(src, dst)
 
         print(f"✅  {fits_fn} → {cls_str}")
