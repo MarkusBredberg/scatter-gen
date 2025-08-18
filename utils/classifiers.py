@@ -397,7 +397,8 @@ class MLPClassifier(nn.Module):
         x = self.dropout(x)
         x = self.fc3(x)
         #x = self.sigmoid(x)
-        return torch.softmax(x)
+        #return torch.softmax(x)
+        return x # logits for BCE loss
 
 
 class DualClassifier(nn.Module):
@@ -927,6 +928,7 @@ class InceptionBlock(nn.Module):
         x2 = self.b2(x)
         x3 = self.b3(x)
         return self.act(self.bn(torch.cat([x1, x2, x3], dim=1)))
+
 
 
 class DualCNNSqueezeNet(nn.Module):

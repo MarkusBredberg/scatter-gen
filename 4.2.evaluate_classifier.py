@@ -1,7 +1,7 @@
 import numpy as np
 import pickle
 import torch
-from sklearn.metrics import accuracy_score, confusion_matrix, roc_curve, auc
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, roc_curve, auc
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import label_binarize
 from utils.data_loader import get_classes, load_galaxies, get_synthetic
@@ -34,7 +34,7 @@ TRAINONGENERATED = False # Use generated data as testdata
 
 classes = get_classes()
 galaxy_classes = [50, 51] # e.g., [10, 11, 12, 13] for FRI, FRII, Compact, Bent
-learning_rates = [1e-3]
+learning_rates = [1e-4]
 regularization_params = [1e-3]
 lambda_values = [0]
 num_experiments = 10
@@ -92,19 +92,13 @@ elif galaxy_classes == [50, 51]:
     if TRAINONGENERATED:
         dataset_sizes = [[1600, 8000, 16000], [1600, 8000, 16000], [1600, 8000, 16000], [1600, 8000, 16000], [1600, 8000, 16000],  [1600, 8000, 16000]]
     else:
-        #dataset_sizes = [[121, 608, 1216], [121, 608, 1216], [121, 608, 1216], [121, 608, 1216], [121, 608, 1216], [121, 608, 1216]]
-        #dataset_sizes = [[121, 1216], [121, 1216], [121, 1216], [121, 1216], [121, 1216], [121, 1216]]
-        #dataset_sizes = [[123, 1232], [123, 1232], [123, 1232], [123, 1232], [123, 1232], [123, 1232]] # New data_loader
-        #dataset_sizes = [[144, 1440], [144, 1440], [144, 1440], [144, 1440], [144, 1440], [144, 1440]] # For RAW
-        #dataset_sizes = [[1440], [1440], [1440], [1440], [1440], [1440]] # For RAW
-        dataset_sizes = [[1264], [1264], [1264], [1264], [1264], [1264]] # For processed data
-        #dataset_sizes = [[126, 1264], [126, 1264], [126, 1264], [126, 1264], [126, 1264], [126, 1264]] # For processed data
-        #dataset_sizes = [[128, 1288], [128, 1288], [128, 1288], [128, 1288], [128, 1288], [128, 1288]] # For old redistribute function
-        #dataset_sizes = [[142, 1424], [142, 1424], [142, 1424], [142, 1424], [142, 1424], [142, 1424]] # For multiple versions of each source
-        #dataset_sizes = [[80, 800], [80, 800], [80, 800], [80, 800], [80, 800], [80, 800]] 
+        #dataset_sizes = [[12, 127, 1272], [12, 127, 1272], [12, 127, 1272], [12, 127, 1272], [12, 127, 1272], [12, 127, 1272]]
+        dataset_sizes = [[12, 124, 1248], [12, 124, 1248], [12, 124, 1248], [12, 124, 1248], [12, 124, 1248], [12, 124, 1248]]
+        #dataset_sizes = [[126, 1264], [126, 1264], [126, 1264], [126, 1264], [126, 1264], [126, 1264]]
+        #dataset_sizes = [[12, 126, 1264], [12, 126, 1264], [12, 126, 1264], [12, 126, 1264], [12, 126, 1264], [12, 126, 1264]]
+        #dataset_sizes = [[14, 144, 1440], [14, 144, 1440], [14, 144, 1440], [14, 144, 1440], [14, 144, 1440], [14, 144, 1440]] 
 elif galaxy_classes == [52, 53]: # RH vs RR
-    #dataset_sizes = [[36, 360], [36, 360], [36, 360], [36, 360], [36, 360], [36, 360]] 
-    dataset_sizes = [[360], [360], [360], [360], [360], [360]] # For RAW
+    dataset_sizes = [[2, 16, 168], [2, 16, 168], [2, 16, 168], [2, 16, 168], [2, 16, 168], [2, 16, 168]]
 elif galaxy_classes == [11, 12]:
     dataset_sizes = [[885, 4428, 8856], [885, 4428, 8856], [885, 4428, 8856], [885, 4428, 8856], [885, 4428, 8856], [885, 4428, 8856]]
 elif galaxy_classes == [10, 11, 12, 13]:
@@ -148,8 +142,8 @@ merge_map = {}
 for sizes in dataset_sizes:
     for size in sizes:
         nd = len(str(size))
-        factor = 10 ** (nd - 2)
-        new_rep = round(size / factor) * factor
+        factor = 10 ** max(nd - 2, 0)
+        new_rep = int(round(size / factor) * factor)
         merge_map[size] = str(new_rep)
 
 print("merge_map =", merge_map)
@@ -210,13 +204,20 @@ for lambda_generate in lambda_values:
                 training_times =  data["training_times"]
                 all_pred_probs =  data["all_pred_probs"]
                 initialize_metrics(tot_metrics, generator, subset_size, fold, experiment, lr, reg, lambda_generate)
+                eval_key = f"{generator}_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}"
+                y_true = all_true_labels.get(eval_key, [])
+                y_pred = all_pred_labels.get(eval_key, [])
+                if not y_true or not y_pred:
+                    continue  # nothing to aggregate for this combo
+
+                acc = accuracy_score(y_true, y_pred)
+                prec = precision_score(y_true, y_pred, average='macro', zero_division=0)
+                rec  = recall_score(y_true, y_pred, average='macro', zero_division=0)
+                f1   = f1_score(y_true, y_pred, average='macro', zero_division=0)
+
                 update_metrics(
                     tot_metrics, generator, subset_size, fold, experiment, lr, reg,
-                    loaded_metrics[f"{generator}_accuracy_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}"][0],
-                    loaded_metrics[f"{generator}_precision_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}"][0],
-                    loaded_metrics[f"{generator}_recall_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}"][0],
-                    loaded_metrics[f"{generator}_f1_score_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}"][0],
-                    lambda_generate,
+                    acc, prec, rec, f1, lambda_generate,
                     history,
                     all_true_labels,
                     all_pred_labels,
@@ -262,7 +263,7 @@ def extract_feats(loader):
         handle.remove()
         return torch.cat(feats,0).numpy()
 
-def visualize_feature_tsne(model, real_loader, gen_loader, wrappername, perplexity=30, n_iter=2000, device='cpu', save_path="./classifier/tsne_by_class.png"):
+def visualize_feature_tsne(model, real_loader, gen_loader, wrappername, perplexity=30, n_iter=2000, device='cpu', save_path="./classifier/tsne_by_class.pdf"):
     model = model.to(device).eval()
     model_name = model.__class__.__name__
     print(f"Model name: {model_name}")
@@ -310,12 +311,12 @@ def visualize_feature_tsne(model, real_loader, gen_loader, wrappername, perplexi
     plot_tsne_density(
         real_2d, gen_2d,
         bins=100,
-        save_path=save_path.replace(".png","_density.png")
+        save_path=save_path.replace(".pdf","_density.pdf")
     )
 
-    print(f"Saved t-SNE plots to {save_path} and density to {save_path.replace('.png','_density.png')}")
+    print(f"Saved t-SNE plots to {save_path} and density to {save_path.replace('.pdf','_density.pdf')}")
 
-def visualize_tsne_by_class(model, real_loader, gen_loader, wrappername, device='cpu', save_path="./classifier/tsne_by_class.png"):
+def visualize_tsne_by_class(model, real_loader, gen_loader, wrappername, device='cpu', save_path="./classifier/tsne_by_class.pdf"):
     model = model.to(device).eval()
     
     try:
@@ -362,7 +363,7 @@ def visualize_tsne_by_class(model, real_loader, gen_loader, wrappername, device=
 
 
     
-def plot_tsne_density(real_coords, gen_coords, bins=100, save_path="./classifier/tsne_density.png"):
+def plot_tsne_density(real_coords, gen_coords, bins=100, save_path="./classifier/tsne_density.pdf"):
     """
     real_coords / gen_coords: np.array of shape (N,2) from your TSNE embedding
     """
@@ -446,13 +447,13 @@ def plot_overlap_image_grids(model, real_loader, gen_loader,
     closest_idx = order[:top_k]
     plot_grid(gen_imgs[closest_idx],
               "Top 25 Generated ➞ Real‐like",
-              f"{galaxy_classes}_{classifier}_{generator}_{dataset_sizes[folds[-1]][-1]}_gen_top25_real_like.png")
+              f"{galaxy_classes}_{classifier}_{generator}_{dataset_sizes[folds[-1]][-1]}_gen_top25_real_like.pdf")
 
     # furthest
     furthest_idx = order[-top_k:]
     plot_grid(gen_imgs[furthest_idx],
               "Top 25 Generated ➞ Outliers",
-              f"{galaxy_classes}_{classifier}_{generator}_{dataset_sizes[folds[-1]][-1]}_gen_top25_outliers.png")
+              f"{galaxy_classes}_{classifier}_{generator}_{dataset_sizes[folds[-1]][-1]}_gen_top25_outliers.pdf")
 
 def plot_accuracy_vs_lambda(lambda_values, metrics, generators, dataset_sizes=dataset_sizes,
                             folds=folds, num_experiments=num_experiments,
@@ -512,7 +513,7 @@ def plot_accuracy_vs_lambda(lambda_values, metrics, generators, dataset_sizes=da
     plt.grid(True, linestyle='--', alpha=0.5)
     plt.tight_layout()
     
-    plot_path = f'{save_dir}/{galaxy_classes}_{classifier}_{generators}_{max(dataset_sizes[-1])}_{lr}_{reg}_accuracy_vs_lambda.png'
+    plot_path = f'{save_dir}/{galaxy_classes}_{classifier}_{generators}_{max(dataset_sizes[-1])}_{lr}_{reg}_accuracy_vs_lambda.pdf'
     plt.savefig(plot_path)
     plt.close()
     print(f"Saved overlayed accuracy vs. lambda plot to {plot_path}")
@@ -574,7 +575,7 @@ def plot_all_metrics_vs_dataset_size(
             plt.tight_layout()
 
             os.makedirs(save_dir, exist_ok=True)
-            fname = f'{save_dir}/{galaxy_classes}_{classifier}_{generator}_{dataset_sizes[folds[-1]][-1]}_{metric}_vs_dataset_size.png'
+            fname = f'{save_dir}/{galaxy_classes}_{classifier}_{generator}_{dataset_sizes[folds[-1]][-1]}_{metric}_vs_dataset_size.pdf'
             plt.savefig(fname)
             plt.close()
 
@@ -645,7 +646,7 @@ def plot_avg_roc_curves(metrics, generators, dataset_sizes=dataset_sizes, merge_
                             ax.set_title(f'Average ROC Curve - {generator} \n {merged_subset_key}, Experiment {experiment}', fontsize=14)
                             ax.legend(loc="lower right")
                             os.makedirs(save_dir, exist_ok=True)
-                            plt.savefig(f'{save_dir}/{galaxy_classes}_{classifier}_{generator}_{merged_subset_key}_average_roc_curve.png')
+                            plt.savefig(f'{save_dir}/{galaxy_classes}_{classifier}_{generator}_{merged_subset_key}_average_roc_curve.pdf')
                             plt.close(fig)
 
 def plot_roc_curves(metrics, generators, dataset_sizes=dataset_sizes,  folds= folds, num_experiments=num_experiments, learning_rates=learning_rates, regularization_params=regularization_params, 
@@ -695,7 +696,7 @@ def plot_roc_curves(metrics, generators, dataset_sizes=dataset_sizes,  folds= fo
                                 ax.set_title(f'ROC Curve - {generator} \n {subset_size}, Fold {fold}, Experiment {experiment}', fontsize=16)
                                 ax.legend(loc="lower right")
                                 os.makedirs(save_dir, exist_ok=True)
-                                plt.savefig(f'{save_dir}/{galaxy_classes}_{classifier}_{generator}_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}_roc_curve.png')
+                                plt.savefig(f'{save_dir}/{galaxy_classes}_{classifier}_{generator}_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}_roc_curve.pdf')
                                 plt.close(fig)
 
 def plot_diff_avg_std_confusion_matrix(metrics, generators, metric_stats,
@@ -761,7 +762,7 @@ def plot_diff_avg_std_confusion_matrix(metrics, generators, metric_stats,
             ax.set_ylabel("True Label", fontsize=14)
             ax.set_title(f"Difference in Average Accuracy: {mean_diff:.2f} ± {std_diff:.2f}", fontsize=16)
             os.makedirs(save_dir, exist_ok=True)
-            save_path = f"{save_dir}/{galaxy_classes}_{classifier}_{generator}_{merged_size}_{lr}_{reg}_{lambda_vals[1]}-{lambda_vals[0]}_diff_confusion_matrix.png"
+            save_path = f"{save_dir}/{galaxy_classes}_{classifier}_{generator}_{merged_size}_{lr}_{reg}_{lambda_vals[1]}-{lambda_vals[0]}_diff_confusion_matrix.pdf"
             plt.savefig(save_path)
             plt.close(fig)
             print("Saved difference in average confusion matrix to", save_path)
@@ -818,22 +819,23 @@ def plot_avg_std_confusion_matrix(metrics, generators, metric_stats, merge_map={
                     cmap=cmap_green,
                     xticklabels=present_descriptions,
                     yticklabels=present_descriptions,
-                    annot_kws={"fontsize": 22},
+                    annot_kws={"fontsize": 40},
                     ax=ax
                 )
                 # increase tick‐label font size
-                ax.set_xticklabels(ax.get_xticklabels(), fontsize=20, rotation=0, ha="right")
-                ax.set_yticklabels(ax.get_yticklabels(), fontsize=20, rotation=90)
-                ax.set_xlabel("Predicted Label", fontsize=22)
-                ax.set_ylabel("True Label", fontsize=22)
-                ax.set_title(f"Average Accuracy: {mean_value:.2f} ± {std_dev:.2f}", fontsize=24)
+                ax.set_xticklabels(ax.get_xticklabels(), fontsize=40, rotation=0, ha="right")
+                ax.set_yticklabels(ax.get_yticklabels(), fontsize=40, rotation=90)
+                ax.set_xlabel("Predicted Label", fontsize=40)
+                ax.set_ylabel("True Label", fontsize=40)
+                ax.set_title(f"Average Accuracy: {mean_value:.2f} ± {std_dev:.2f}", fontsize=40)
                 
                 cbar = ax.collections[0].colorbar
-                cbar.ax.tick_params(labelsize=20)
+                cbar.ax.tick_params(labelsize=40)
 
                 os.makedirs(save_dir, exist_ok=True)
-                save_path = f"{save_dir}/{galaxy_classes}_{classifier}_{generator}_{subset_size}_{lr}_{reg}_{lambda_generate}_avg_confusion_matrix.png"
-                plt.savefig(save_path)
+                save_path = f"{save_dir}/{galaxy_classes}_{classifier}_{generator}_{subset_size}_{lr}_{reg}_{lambda_generate}_avg_confusion_matrix.pdf"
+                #plt.savefig(save_path)
+                plt.savefig(save_path, bbox_inches='tight')
                 plt.close(fig)
                 print(f"Saved average confusion matrix to {save_path}")
 
@@ -865,7 +867,7 @@ def plot_confusion_matrix(metrics, generators, dataset_sizes=dataset_sizes,  fol
                 ax.set_title(f'Model: {generator} \n Total accuracy: {accuracy*100:.2f}%', fontsize=16)
                 ax.set_ylabel('True label', fontsize=18)
                 ax.set_xlabel('Predicted label', fontsize=18)
-                save_path = f'{save_dir}/{galaxy_classes}_{classifier}_{generator}_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}_confusion_matrix.png'
+                save_path = f'{save_dir}/{galaxy_classes}_{classifier}_{generator}_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}_confusion_matrix.pdf'
                 plt.savefig(save_path)
                 plt.close()
  
@@ -1015,7 +1017,7 @@ def plot_loss(
                   ncol=2, columnspacing=1.2, handletextpad=0.7)
 
         plt.tight_layout()
-        plt.savefig(f"./classifier/{galaxy_classes}_{classifier}_{generator}_{dataset_sizes[-1][-1]}_{lr}_{reg}_loss.png")
+        plt.savefig(f"./classifier/{galaxy_classes}_{classifier}_{generator}_{dataset_sizes[-1][-1]}_{lr}_{reg}_loss.pdf")
         plt.close(fig)
 
 def old_plot_loss(
@@ -1135,7 +1137,7 @@ def old_plot_loss(
 
         ax.grid(True)
         plt.tight_layout()
-        plt.savefig(f"./classifier/{galaxy_classes}_{classifier}_{generator}_loss.png")
+        plt.savefig(f"./classifier/{galaxy_classes}_{classifier}_{generator}_loss.pdf")
         plt.close(fig)
 
 
@@ -1333,10 +1335,10 @@ if any(lam > 0 for lam in lambda_values):
             device=device,
             perplexity=30,
             n_iter=1000,
-            save_path=f"./classifier/{galaxy_classes}_{classifier}_{generator}_{dataset_sizes[folds[-1]][-1]}_tsne.png"
+            save_path=f"./classifier/{galaxy_classes}_{classifier}_{generator}_{dataset_sizes[folds[-1]][-1]}_tsne.pdf"
         )
         visualize_tsne_by_class(model, real_loader, gen_loader, wrappername, device=device,
-                                save_path=f"./classifier/{galaxy_classes}_{classifier}_{generator}_{dataset_sizes[folds[-1]][-1]}_tsne_by_class.png"
+                                save_path=f"./classifier/{galaxy_classes}_{classifier}_{generator}_{dataset_sizes[folds[-1]][-1]}_tsne_by_class.pdf"
         )
 
         plot_overlap_image_grids(model, real_loader, gen_loader, device=device)
@@ -1344,7 +1346,7 @@ if any(lam > 0 for lam in lambda_values):
 plot_loss(generators, history=history)
 ##plot_roc_curves(metrics, generators)
 plot_avg_roc_curves(metrics, generators, merge_map=merge_map)
-plot_all_metrics_vs_dataset_size(metrics, generators, merge_map=merge_map)
+#plot_all_metrics_vs_dataset_size(metrics, generators, merge_map=merge_map)
 #plot_accuracy_vs_lambda(lambda_values, metrics, generators)
 ##plot_confusion_matrix(metrics, generators)
 plot_avg_std_confusion_matrix(metrics, generators, metric_stats=metrics_last, merge_map=merge_map)

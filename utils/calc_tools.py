@@ -435,6 +435,10 @@ class CachedScatterDataset(Dataset):
         return image, scat, label
 
 def custom_collate(batch):
+    """
+    Custom collate function to handle different batch structures.
+    This function checks the structure of the first item in the batch
+    and collates accordingly."""
     if not batch:
         return None
     first = batch[0]

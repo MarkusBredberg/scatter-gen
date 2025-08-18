@@ -46,7 +46,7 @@ os.makedirs('./classifier/trained_models_filtered', exist_ok=True)
 matplotlib.use('Agg')
 tqdm.pandas(disable=True)
 
-print("Running ht1 with seed", SEED)
+print("Running ht2 with seed", SEED)
 
 
 #############################################
@@ -91,7 +91,7 @@ param_grid = {
     'percentile_hi': [90, 95, 99], 
     'crop_size':     [(512,512)],
     'downsample_size':[(128,128)],
-    'versions':       [('RAW', 'T25kpc', 'T50kpc', 'T100kpc')]  # 'raw', 'T50kpc', ad hoc tapering: e.g. 'rt50'  strings in list → product() iterates them individually
+    'versions':       ['50kpcSUB']  # 'raw', 'T50kpc', ad hoc tapering: e.g. 'rt50'  strings in list → product() iterates them individually
 } #'versions': [('raw', 'rt50')]  # tuple signals “stack these”
 
 FLUX_CLIPPING = False  # Clip the flux of the images
@@ -162,12 +162,13 @@ if TRAINONGENERATED:
     lambda_values = [8]  # To identify and distinguish TRAINONGENERATED from other runs
     print("Using generated data for testing.")
 
+
 ########################################################################
 ##################### HELPER FUNCTIONS #################################
 ########################################################################
 
 
-def _append_rt_versions(imgs, fns, gen_versions, labels=None):
+def _append_rt_versions(imgs, fns, gen_versions, labels=None, ref_sigma_map=None, bg_inner=64):
     """
     Append runtime-tapered planes to the loaded images and drop samples
     that are missing any requested taper.
@@ -205,7 +206,8 @@ def _append_rt_versions(imgs, fns, gen_versions, labels=None):
             crop_size=crop_size,
             downsample_size=downsample_size,
             percentile_lo=percentile_lo, percentile_hi=percentile_hi,
-            do_stretch=STRETCH
+            do_stretch=STRETCH, use_asinh=True,
+            ref_sigma_map=ref_sigma_map, bg_inner=bg_inner
         )
         kept_sets[gv] = set(kept_fns)
         removed_by_version[gv] = len(skipped)
@@ -804,7 +806,12 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
         if _gen_versions:
             if test_fns is None:
                 raise RuntimeError("versions includes rt*, but filenames were not returned. Set PRINTFILENAMES=True.")
-            test_images, test_labels, test_fns, info_test = _append_rt_versions(test_images, test_fns, _gen_versions, labels=test_labels)
+            ref_sigma_map_test = build_ref_sigma_map(test_images, test_fns, inner=64)
+            test_images, test_labels, test_fns, info_test = _append_rt_versions(
+                test_images, test_fns, _gen_versions,
+                labels=test_labels, ref_sigma_map=ref_sigma_map_test, bg_inner=64
+            )
+
             print(f"[TEST] dropped {info_test['removed_total']} (kept {info_test['kept']}/{info_test['initial']})")
             if REPLACE_WITH_RT:
                 test_images = test_images[:, 1:2]  # keep only the runtime-tapered plane
@@ -956,9 +963,16 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                     if _gen_versions:
                         if train_fns is None or valid_fns is None:
                             raise RuntimeError("versions includes rt*, but train/valid filenames were not returned.")
-                        
-                        train_images, train_labels, train_fns, info_tr = _append_rt_versions(train_images, train_fns, _gen_versions, labels=train_labels)
-                        valid_images, valid_labels, valid_fns, info_va = _append_rt_versions(valid_images, valid_fns, _gen_versions, labels=valid_labels)
+                        ref_sigma_map_train = build_ref_sigma_map(train_images, train_fns, inner=64)
+                        ref_sigma_map_valid = build_ref_sigma_map(valid_images, valid_fns, inner=64)
+                        train_images, train_labels, train_fns, info_tr = _append_rt_versions(
+                            train_images, train_fns, _gen_versions,
+                            labels=train_labels, ref_sigma_map=ref_sigma_map_train, bg_inner=64
+                        )
+                        valid_images, valid_labels, valid_fns, info_va = _append_rt_versions(
+                            valid_images, valid_fns, _gen_versions,
+                            labels=valid_labels, ref_sigma_map=ref_sigma_map_valid, bg_inner=64
+                        )
                         print(f"[TRAIN] dropped {info_tr['removed_total']} (kept {info_tr['kept']}/{info_tr['initial']})")
                         print(f"[VALID] dropped {info_va['removed_total']} (kept {info_va['kept']}/{info_va['initial']})")
                         

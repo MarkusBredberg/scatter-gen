@@ -299,13 +299,16 @@ def plot_background_histogram(orig_imgs, gen_imgs, img_shape=(1, 128, 128), titl
     def total_background(images):
         sums = []
         for im in images.cpu().numpy():
-            im = im.reshape(h, w)       # enforce 2D (H, W)
-            if im.ndim == 3:
-                # stack the 2D mask into a (C, H, W) boolean array
-                mask3d = np.stack([bkg_mask] * im.shape[0], axis=0)
-                sums.append((im * mask3d).sum())
-            else:
-                sums.append(im[bkg_mask].sum())
+            im = np.asarray(im)  # ensure it's a numpy array
+            if im.ndim == 3:  # e.g. (T_or_C, H, W)
+                im = im[0] if im.shape[0] == 1 else im.mean(axis=0)
+            elif im.ndim == 4:  # e.g. (T, C, H, W) or (C, T, H, W)
+                im = im.reshape(im.shape[0]*im.shape[1], im.shape[2], im.shape[3]).mean(axis=0)
+            elif im.ndim == 1 and im.size == h * w:
+                pass
+            elif im.ndim != 2:
+                raise ValueError(f"Expected 2D image; got {im.shape}")
+            im = im.reshape(h, w)
         return sums
 
     # compute for one class (you can loop over classes as needed)
