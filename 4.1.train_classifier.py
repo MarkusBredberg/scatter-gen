@@ -72,17 +72,17 @@ classifier = ["TinyCNN", # Very Simple CNN
 gen_model_names = ['DDPM'] #['ST', 'DDPM', 'wGAN', 'GAN', 'Dual', 'CNN', 'STMLP', 'lavgSTMLP', 'ldiffSTMLP'] # Specify the generative model_name
 num_epochs_cuda = 200
 num_epochs_cpu = 100
-learning_rates = [1e-4]  # Learning rates
-regularization_params = [1e-4]  # Regularisation parameters
+learning_rates = [1e-3]  # Learning rates
+regularization_params = [1e-3]  # Regularisation parameters
 label_smoothing = 0  # Label smoothing for the classifier
-num_experiments = 10
+num_experiments = 100
 folds = [5] # 0-4 for 5-fold cross validation, 5 for only one training
 lambda_values = [0]  # Ratio between generated images and original images per class. 8 is reserfved for TRAINONGENERATED
-percentile_lo = 60 # Percentile stretch lower bound
-percentile_hi = 95  # Percentile stretch upper bound
-versions = ['raw', 'rt40']  # any mix of loadable and runtime-tapered planes. 'rt50' or 'rt100' for tapering. Square brackets for stacking
+percentile_lo = 30 # Percentile stretch lower bound
+percentile_hi = 99  # Percentile stretch upper bound
+versions = ['raw']  # any mix of loadable and runtime-tapered planes. 'rt50' or 'rt100' for tapering. Square brackets for stacking
 
-FLUX_CLIPPING = True  # Clip the flux of the images
+FLUX_CLIPPING = False  # Clip the flux of the images
 STRETCH = True  # Stretch the images with mathematical morphology
 ES, patience = True, 10  # Use early stopping
 SCHEDULER = False  # Use a learning rate scheduler
@@ -394,6 +394,7 @@ def _kernel_from_headers(raw_hdr, targ_hdr, pixscale_arcsec):
         return None
     return Gaussian2DKernel(x_stddev=sx_pix, y_stddev=sy_pix, theta=theta)
 
+
 @lru_cache(maxsize=None)
 def _headers_for_name(base_name: str):
     """
@@ -670,7 +671,6 @@ def initialize_metrics(metrics,
     f"{model_name}"
     f"_ss{subset_size}"
     f"_f{fold}"
-    f"_e{experiment}"
     f"_lr{lr}"
     f"_reg{reg}"
     f"_lam{lam}"
@@ -678,9 +678,11 @@ def initialize_metrics(metrics,
     f"_ds{ds}"
     f"_ver{ver}"
     )
-    metrics[f"{key_base}_accuracy"]   = []
-    metrics[f"{key_base}_precision"]  = []
-    metrics[f"{key_base}_recall"]     = []
+    metrics.setdefault(f"{key_base}_accuracy", [])
+    metrics.setdefault(f"{key_base}_precision", [])
+    metrics.setdefault(f"{key_base}_recall", [])
+    metrics.setdefault(f"{key_base}_f1_score", [])
+
     metrics[f"{key_base}_f1_score"]   = []
 
 def update_metrics(metrics,
@@ -693,7 +695,6 @@ def update_metrics(metrics,
     f"{model_name}"
     f"_ss{subset_size}"
     f"_f{fold}"
-    f"_e{experiment}"
     f"_lr{lr}"
     f"_reg{reg}"
     f"_lam{lam}"
@@ -701,10 +702,11 @@ def update_metrics(metrics,
     f"_ds{ds}"
     f"_ver{ver}"
     )
-    metrics[f"{key_base}_accuracy"].append(accuracy)
-    metrics[f"{key_base}_precision"].append(precision)
-    metrics[f"{key_base}_recall"].append(recall)
-    metrics[f"{key_base}_f1_score"].append(f1)
+    metrics.setdefault(f"{key_base}_accuracy", []).append(accuracy)
+    metrics.setdefault(f"{key_base}_precision", []).append(precision)
+    metrics.setdefault(f"{key_base}_recall", []).append(recall)
+    metrics.setdefault(f"{key_base}_f1_score", []).append(f1)
+
     
 def initialize_history(history, model_name, subset_size, fold, experiment, lr, reg, lambda_generate):
     if model_name not in history:
@@ -771,7 +773,7 @@ for gen_model_name in gen_model_names:
     vae_latent_dim = 64
     
     _out  = load_galaxies(galaxy_classes=galaxy_classes,
-                versions=_versions_to_load, 
+                versions=_versions_to_load or ['raw'], 
                 fold=max(folds), #Any fold other than 5 gives me the test data for the five fold cross validation
                 crop_size=crop_size,
                 downsample_size=downsample_size,
@@ -894,7 +896,7 @@ for gen_model_name in gen_model_names:
             train_labels = torch.empty((0,), dtype=torch.long, device=DEVICE)
             _out = load_galaxies(
                 galaxy_classes=galaxy_classes,
-                versions=_versions_to_load,
+                versions=_versions_to_load or ['raw'],
                 fold=fold,
                 crop_size=crop_size,
                 downsample_size=downsample_size,
@@ -922,7 +924,7 @@ for gen_model_name in gen_model_names:
             # real train + valid
             _out = load_galaxies(
                 galaxy_classes=galaxy_classes,
-                versions=_versions_to_load,
+                versions=_versions_to_load or ['raw'],
                 fold=max(folds),
                 crop_size=crop_size,
                 downsample_size=downsample_size,
@@ -1249,7 +1251,7 @@ for gen_model_name in gen_model_names:
                         save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_summed_intensity_histogram.png"
                     )
                     
-                    
+        
                     if lambda_generate not in [0, 8]:
                         gen_imgs = generated_by_class[cls][:36]
 
@@ -1422,8 +1424,8 @@ for gen_model_name in gen_model_names:
                 else:
                     summary(model_details["model"], input_size=tuple(valid_images.shape[1:]), device=DEVICE)
             FIRSTTIME = False
-
-
+            
+            
         ###############################################
         ############### TRAINING LOOP #################
         ###############################################
@@ -1443,9 +1445,6 @@ for gen_model_name in gen_model_names:
         if SCHEDULER:
             scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=10*lr, 
                                     steps_per_epoch=len(train_loader), epochs=num_epochs)
-        # Print out the shape of the training data
-        print(f"Training data shape: {train_images.shape}, Labels shape: {train_labels.shape}")
-        print(f"Validation data shape: {valid_images.shape}, Labels shape: {valid_labels.shape}")
 
         for classifier_name, model_details in models.items():
             model = model_details["model"].to(DEVICE)
@@ -1712,6 +1711,22 @@ for gen_model_name in gen_model_names:
                             plt.close(fig)
 
 
+                base = (
+                    f"{gen_model_name}"
+                    f"_ss{subset_size}"
+                    f"_f{fold}"
+                    f"_lr{lr}"
+                    f"_reg{reg}"
+                    f"_lam{lambda_generate}"
+                    f"_cs{crop_size[0]}x{crop_size[1]}"
+                    f"_ds{downsample_size[0]}x{downsample_size[1]}"
+                    f"_ver{ver_key}"
+                )
+                mean_acc = float(np.mean(metrics[f"{base}_accuracy"])) if metrics[f"{base}_accuracy"] else float('nan')
+                mean_prec = float(np.mean(metrics[f"{base}_precision"])) if metrics[f"{base}_precision"] else float('nan')
+                mean_rec = float(np.mean(metrics[f"{base}_recall"])) if metrics[f"{base}_recall"] else float('nan')
+                mean_f1 = float(np.mean(metrics[f"{base}_f1_score"])) if metrics[f"{base}_f1_score"] else float('nan')
+                print(f"Fold {fold}, Subset Size {subset_size}, Classifier {classifier_name}, AVERAGE over {num_experiments} experiments — Accuracy: {mean_acc:.4f}, Precision: {mean_prec:.4f}, Recall: {mean_rec:.4f}, F1 Score: {mean_f1:.4f}")
                 end_time = time.time()
                 elapsed_time = end_time - start_time
                 #training_times[subset_size][fold].append(elapsed_time)
@@ -1752,21 +1767,85 @@ for gen_model_name in gen_model_names:
 
             model_save_path = f'./classifier/trained_models/{gen_model_name}_model.pth'
             torch.save(model.state_dict(), model_save_path)
-            
+          
     directory = './classifier/trained_models_filtered/' if FILTERED else './classifier/trained_models/'
     for fold, lr, reg, lambda_generate in param_combinations:
         for subset_size in dataset_sizes[fold]:
             for experiment in range(num_experiments):
+                                
                 metrics_save_path = f'{directory}{classifier}_{galaxy_classes}_{gen_model_name}_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}_metrics_data.pkl'
+
+                # Build robust, per-setting summaries using empirical percentiles
+                robust_summary = {}   # { base_key: {metric: {'n', 'p16','p50','p84','sigma68'} } }
+                skip_keys = {"accuracy", "precision", "recall", "f1_score"}
+                rows = []
+                for key, values in metrics.items():
+                    if key in skip_keys:
+                        continue
+                    if not isinstance(values, (list, tuple)) or len(values) == 0:
+                        continue
+
+                    vals = np.asarray(values, dtype=float)
+                    p16, p50, p84 = np.percentile(vals, [16, 50, 84])
+                    sigma68 = 0.5 * (p84 - p16)
+
+                    base, metric_name = key.rsplit('_', 1)  # split "..._accuracy" → ("...", "accuracy")
+                    robust_summary.setdefault(base, {})[metric_name] = {
+                        "n": int(vals.size),
+                        "p16": float(p16),
+                        "p50": float(p50),   # median
+                        "p84": float(p84),
+                        "sigma68": float(sigma68)  # half-width of the central 68% interval
+                    }
+                    
+                    # Histogram with percentile markers (bins span data range)
+                    vmin, vmax = float(np.min(vals)), float(np.max(vals))
+                    if vmin == vmax:  # guard against a degenerate run where all values are identical
+                        eps = 1e-6
+                        vmin, vmax = vmin - eps, vmax + eps
+                    edges = np.linspace(vmin, vmax, 21)  # 20 bins across [min, max]
+
+                    plt.figure(figsize=(5,3.2))
+                    plt.hist(vals, bins=edges, edgecolor='none', alpha=0.8)
+                    for x, style in [(p16, ':'), (p50, '-'), (p84, ':')]:
+                        plt.axvline(x, linestyle=style)
+                    plt.xlim(vmin, vmax)  # force axis to the observed range
+                    plt.title(key)
+                    plt.xlabel(metric_name)
+                    plt.ylabel("count")
+                    plt.tight_layout()
+
+                    # save one file per metric so nothing gets overwritten
+                    save_path_hist = (
+                        f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_"
+                        f"{dataset_sizes[folds[-1]][-1]}_{metric_name}_histogram.png"
+                    )
+                    plt.savefig(save_path_hist, dpi=150)
+                    plt.close()
+
+                    rows.append({
+                        "setting": base,
+                        "metric": metric_name,
+                        "n": int(vals.size),
+                        "p16": float(p16),
+                        "p50": float(p50),
+                        "p84": float(p84),
+                        "sigma68": float(sigma68)
+                    })
+
+                # Also write a tidy CSV so you can scan summaries quickly
+                summary_csv = f'{directory}{classifier}_{galaxy_classes}_{gen_model_name}_percentile_summary.csv'
+                pd.DataFrame(rows).to_csv(summary_csv, index=False)
+
                 with open(metrics_save_path, 'wb') as f:
                     pickle.dump({
                         "models": models,
                         "history": history,
-                        "metrics": metrics,
+                        "metrics": metrics,                 # raw per-run values remain
                         "metric_colors": metric_colors,
                         "all_true_labels": all_true_labels,
                         "all_pred_labels": all_pred_labels,
                         "training_times": training_times,
-                        "all_pred_probs": all_pred_probs
+                        "all_pred_probs": all_pred_probs,
+                        "percentile_summary": robust_summary  # new robust summaries
                     }, f)
-                print(f"Metrics and related data saved to {metrics_save_path}") 

@@ -44,6 +44,9 @@ def _fits_path_triplet(base_dir, real_base):
     return raw_path, t50_path, t100_path
 
 def _load_fits_arrays_scaled(name, crop_ch=1, out_hw=(128,128)):
+    """
+    Load FITS arrays for a galaxy, crop them to the specified size, and scale them to the output size.
+    """
     # resolve folder + real_base (same logic you already use)
     base_dir = _first(f"{ROOT}/fits/{name}*") or f"{ROOT}/fits/{name}"
     raw_path = _first(f"{base_dir}/{os.path.basename(base_dir)}*.fits")

@@ -63,7 +63,7 @@ num_epochs_cpu = 100
 folds = [5]  # e.g., [1, 2, 3, 4, 5] for five-fold cross-validation
 max_num_galaxies = 1000000  # Upper limit for the all-classes combined training data before classical augmentation
 lambda_values = [0]  # Ratio between generated images and original images per class. 8 is reserfved for TRAINONGENERATED
-num_experiments = 1
+num_experiments = 3
 
 # pick exactly one classifier
 classifier        = ["TinyCNN",       # Very Simple CNN
@@ -77,7 +77,7 @@ classifier        = ["TinyCNN",       # Very Simple CNN
                      "ScatterSqueezeNet",
                      "ScatterSqueezeNet2",
                      "Binary",
-                     "ScatterResNet"][-4]
+                     "ScatterResNet"][-5]
 
 # Define every value you want to try
 param_grid = {
@@ -87,11 +87,11 @@ param_grid = {
     'J':             [2],
     'L':             [12],
     'order':         [2],
-    'percentile_lo': [60, 70],   
-    'percentile_hi': [90, 95, 99], 
+    'percentile_lo': [1, 30, 60],   
+    'percentile_hi': [80, 90, 99], 
     'crop_size':     [(512,512)],
     'downsample_size':[(128,128)],
-    'versions':       [('RAW', 'T25kpc', 'T50kpc', 'T100kpc')]  # 'raw', 'T50kpc', ad hoc tapering: e.g. 'rt50'  strings in list → product() iterates them individually
+    'versions':       ['RAW']  # 'raw', 'T50kpc', ad hoc tapering: e.g. 'rt50'  strings in list → product() iterates them individually
 } #'versions': [('raw', 'rt50')]  # tuple signals “stack these”
 
 FLUX_CLIPPING = False  # Clip the flux of the images
@@ -320,9 +320,7 @@ def _kernel_from_headers(raw_hdr, targ_hdr, pixscale_arcsec):
 @lru_cache(maxsize=None)
 def _headers_for_name(base_name: str):
     """
-    Return (raw_hdr, t50_hdr, t100_hdr, pix_native_arcsec, raw_fits_path) for a cluster base.
-    Tries the canonical fits tree first; if a target header is missing there,
-    fall back to the classified T50/T100 files used by the loader.
+    Return (raw_hdr, t50_hdr, t100_hdr, t25_hdr, pix_native_arcsec, raw_fits_path)
     """
     base_dir = _first(f"{PSZ2_ROOT}/fits/{base_name}*") or f"{PSZ2_ROOT}/fits/{base_name}"
     raw_path = _first(f"{base_dir}/{os.path.basename(base_dir)}.fits") \
@@ -330,23 +328,28 @@ def _headers_for_name(base_name: str):
     if raw_path is None:
         raise FileNotFoundError(f"RAW FITS not found under {base_dir}")
 
-    # try to get taper headers from the same folder first
+    # look beside RAW first
+    t25_path  = _first(f"{base_dir}/{base_name}T25kpc*.fits")
     t50_path  = _first(f"{base_dir}/{base_name}T50kpc*.fits")
     t100_path = _first(f"{base_dir}/{base_name}T100kpc*.fits")
 
-    # robust fallbacks: use the very files the loader reads
+    # fallbacks to 'classified' trees
+    if t25_path is None:
+        t25_path = _first(f"{PSZ2_ROOT}/classified/T25kpc/*/{base_name}.fits") or \
+                   _first(f"{PSZ2_ROOT}/classified/T25kpcSUB/*/{base_name}.fits")
     if t50_path is None:
-        t50_path = _first(f"{PSZ2_ROOT}/classified/T50kpc/*/{base_name}.fits") \
-                or _first(f"{PSZ2_ROOT}/classified/T50kpcSUB/*/{base_name}.fits")
+        t50_path = _first(f"{PSZ2_ROOT}/classified/T50kpc/*/{base_name}.fits") or \
+                   _first(f"{PSZ2_ROOT}/classified/T50kpcSUB/*/{base_name}.fits")
     if t100_path is None:
-        t100_path = _first(f"{PSZ2_ROOT}/classified/T100kpc/*/{base_name}.fits") \
-                 or _first(f"{PSZ2_ROOT}/classified/T100kpcSUB/*/{base_name}.fits")
+        t100_path = _first(f"{PSZ2_ROOT}/classified/T100kpc/*/{base_name}.fits") or \
+                    _first(f"{PSZ2_ROOT}/classified/T100kpcSUB/*/{base_name}.fits")
 
     raw_hdr  = fits.getheader(raw_path)
+    t25_hdr  = fits.getheader(t25_path)  if t25_path  else None
     t50_hdr  = fits.getheader(t50_path)  if t50_path  else None
     t100_hdr = fits.getheader(t100_path) if t100_path else None
     pix_native = _pixscale_arcsec(raw_hdr)
-    return raw_hdr, t50_hdr, t100_hdr, pix_native, raw_path
+    return raw_hdr, t50_hdr, t100_hdr, t25_hdr, pix_native, raw_path
 
 
 def plot_raw_vs_fake_taper(raw_imgs, tapered_imgs, filenames, taper_mode,
@@ -573,11 +576,11 @@ def initialize_metrics(metrics,
     # make a short stable string for each hyperparam
     cs = f"{crop[0]}x{crop[1]}"
     ds = f"{down[0]}x{down[1]}"
+
     key_base = (
     f"{model_name}"
     f"_ss{subset_size}"
     f"_f{fold}"
-    f"_e{experiment}"
     f"_lr{lr}"
     f"_reg{reg}"
     f"_lam{lam}"
@@ -585,10 +588,16 @@ def initialize_metrics(metrics,
     f"_ds{ds}"
     f"_ver{ver}"
     )
-    metrics[f"{key_base}_accuracy"]   = []
-    metrics[f"{key_base}_precision"]  = []
-    metrics[f"{key_base}_recall"]     = []
-    metrics[f"{key_base}_f1_score"]   = []
+    
+    for k in [
+        f"{key_base}_accuracy",
+        f"{key_base}_precision",
+        f"{key_base}_recall",
+        f"{key_base}_f1_score",
+    ]:
+        if k not in metrics:
+            metrics[k] = []
+
 
 def update_metrics(metrics,
                 model_name, subset_size, fold, experiment,
@@ -596,11 +605,11 @@ def update_metrics(metrics,
                 crop, down, ver):
     cs = f"{crop[0]}x{crop[1]}"
     ds = f"{down[0]}x{down[1]}"
+    
     key_base = (
     f"{model_name}"
     f"_ss{subset_size}"
     f"_f{fold}"
-    f"_e{experiment}"
     f"_lr{lr}"
     f"_reg{reg}"
     f"_lam{lam}"
@@ -608,6 +617,7 @@ def update_metrics(metrics,
     f"_ds{ds}"
     f"_ver{ver}"
     )
+
     metrics[f"{key_base}_accuracy"].append(accuracy)
     metrics[f"{key_base}_precision"].append(precision)
     metrics[f"{key_base}_recall"].append(recall)
@@ -1668,6 +1678,22 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                                 plt.close(fig)
 
 
+                    base = (
+                        f"{gen_model_name}"
+                        f"_ss{subset_size}"
+                        f"_f{fold}"
+                        f"_lr{lr}"
+                        f"_reg{reg}"
+                        f"_lam{lambda_generate}"
+                        f"_cs{crop_size[0]}x{crop_size[1]}"
+                        f"_ds{downsample_size[0]}x{downsample_size[1]}"
+                        f"_ver{ver_key}"
+                    )
+                    mean_acc = float(np.mean(metrics[f"{base}_accuracy"])) if metrics[f"{base}_accuracy"] else float('nan')
+                    mean_prec = float(np.mean(metrics[f"{base}_precision"])) if metrics[f"{base}_precision"] else float('nan')
+                    mean_rec = float(np.mean(metrics[f"{base}_recall"])) if metrics[f"{base}_recall"] else float('nan')
+                    mean_f1 = float(np.mean(metrics[f"{base}_f1_score"])) if metrics[f"{base}_f1_score"] else float('nan')
+                    print(f"Fold {fold}, Subset Size {subset_size}, Classifier {classifier_name}, AVERAGE over {num_experiments} experiments — Accuracy: {mean_acc:.4f}, Precision: {mean_prec:.4f}, Recall: {mean_rec:.4f}, F1 Score: {mean_f1:.4f}")
                     end_time = time.time()
                     elapsed_time = end_time - start_time
                     #training_times[subset_size][fold].append(elapsed_time)
@@ -1740,21 +1766,16 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
             pickle.dump(_clean, f)
         print(f"Summary metrics written to {summary_path}")         
 
-# ——— Rank all experiments by mean accuracy ———
+# ——— Rank configurations by mean accuracy across experiments ———
 rankings = []
-prefix = f"{gen_model_names[0]}_accuracy_"
 for key, vals in metrics.items():
-    if key.startswith(prefix):
-        mean_acc = float(np.mean(vals))
-        config = key[len(prefix):]               # strip off the “DDPM_accuracy_” prefix
-        rankings.append((mean_acc, config))
+    if key.endswith("_accuracy"):
+        mean_acc = float(np.mean(vals)) if vals else float("nan")
+        cfg = key[:-len("_accuracy")]           # drop the suffix
+        rankings.append((mean_acc, cfg))
 
-# sort descending
 rankings.sort(key=lambda x: x[0], reverse=True)
 
-# pretty‐print
 print("\nRanked configurations by mean accuracy:")
-for mean_acc, config in rankings:
-    # config format: "{subset}_{fold}_{experiment}_{lr}_{reg}_{lambda}"
-    subset, fold, exp, lr, reg, lam = config.split("_")
-    print(f"acc={mean_acc:.4f} — subset={subset}, fold={fold}, exp={exp}, lr={lr}, reg={reg}, λ={lam}")
+for mean_acc, cfg in rankings:
+    print(f"acc={mean_acc:.4f} — {cfg}")
