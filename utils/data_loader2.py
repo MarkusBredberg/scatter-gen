@@ -45,9 +45,6 @@ sys.path.append(root_path)
 #from MiraBest.MiraBest_F import MBFRConfident, MBFRUncertain, MBFRFull, MBRandom
 
 
-
-
-
 def get_classes():
     return [
         # GALAXY10 size: 3x256x256
@@ -310,7 +307,7 @@ def get_synthetic(
 ################################### DATA SELECTION FUNCTIONS #########################################
 ######################################################################################################
 
-def percentile_stretch(x, lo=80, hi=99):
+def percentile_stretch(x, lo=30, hi=99):
     """
     x: Tensor of shape (B, C, H, W)
     Returns: same shape, linearly rescaled so that the lo-th percentile → 0 and hi-th → 1
@@ -381,6 +378,79 @@ def add_highpass(x, alpha=100):
 
 def gamma_stretch(x, γ=0.5): # x in [0,1]
     return x.pow(γ)
+
+def _to_2d_for_imshow(x, how="first"):
+    """
+    Return a (H, W) numpy array suitable for plt.imshow from a tensor/ndarray.
+
+    Accepts shapes like:
+      (H, W)
+      (C, H, W)            or (H, W, C)
+      (B, C, H, W)         or (T, C, H, W)
+      (B, T, C, H, W)
+
+    Parameters
+    ----------
+    x : torch.Tensor or np.ndarray
+        Image-like object.
+    how : {"first","mean","max"}
+        How to reduce non-spatial/extra axes (channels, time, batch).
+    """
+    import numpy as np
+    import torch
+
+    def _reduce(a, axis=0):
+        if how == "mean":
+            return a.mean(axis=axis)
+        if how == "max":
+            return a.max(axis=axis)
+        # "first"
+        return np.take(a, 0, axis=axis)
+
+    # ---- convert to numpy float32 without altering values ----
+    if isinstance(x, torch.Tensor):
+        a = x.detach().cpu().float().numpy()
+    else:
+        a = np.asarray(x, dtype=np.float32)
+
+    # ---- peel dimensions until we have (H, W) ----
+    if a.ndim == 2:
+        img = a
+
+    elif a.ndim == 3:
+        # Heuristic: channels-first if first dim is small (<=4) and last isn't;
+        # channels-last if last dim is small (<=4) and first isn't.
+        c_first = (a.shape[0] in (1, 2, 3, 4)) and (a.shape[-1] not in (1, 2, 3, 4))
+        c_last  = (a.shape[-1] in (1, 2, 3, 4)) and (a.shape[0]  not in (1, 2, 3, 4))
+
+        if c_first:
+            # (C, H, W)
+            img = a[0] if a.shape[0] == 1 else _reduce(a, axis=0)
+        elif c_last:
+            # (H, W, C)
+            img = a[..., 0] if a.shape[-1] == 1 else _reduce(a, axis=-1)
+        else:
+            # Ambiguous; take first plane along the leading axis.
+            img = _reduce(a, axis=0)
+
+    elif a.ndim == 4:
+        # Assume leading axis is batch/time → reduce then recurse.
+        img = _to_2d_for_imshow(_reduce(a, axis=0), how=how)
+
+    elif a.ndim == 5:
+        # (B, T, C, H, W) → reduce B and T, then recurse.
+        a = _reduce(a, axis=0)
+        a = _reduce(a, axis=0)
+        img = _to_2d_for_imshow(a, how=how)
+
+    else:
+        # Fallback: keep reducing the first axis until 2D.
+        while a.ndim > 2:
+            a = _reduce(a, axis=0)
+        img = a
+
+    # Ensure float32 ndarray
+    return np.asarray(img, dtype=np.float32)
 
 
 def scale_weaker_region(image, adjustment, initial_threshold=0.9, step=0.01):
@@ -693,11 +763,8 @@ def filter_away_faintest(images, labels, region=(128, 128), threshold=0.1, save_
         plt.figure(figsize=(5 * removed_count, 5))
         for i, (img, label, max_val) in enumerate(removed_images):
             plt.subplot(1, removed_count, i + 1)
-            if isinstance(img, torch.Tensor):
-                img = img.detach().cpu().numpy()
-            img = np.squeeze(img)
-            # Use viridis colormap and show a colorbar
-            im = plt.imshow(img, cmap='viridis')
+            arr = _to_2d_for_imshow(img, how="first")
+            im = plt.imshow(arr, cmap='viridis')
             plt.colorbar(im, ax=plt.gca())
             plt.title(f"Removed Image {i+1}\nLabel: {label}, Max: {max_val:.3f}")
             plt.axis('off')
@@ -798,7 +865,8 @@ def remove_outliers(images, labels, threshold=0.1, peak_threshold=0.6, intensity
                         if image_data.dim() == 3 and image_data.shape[0] == 1:
                             image_data = image_data.squeeze(0)
 
-                    axs[ax_row, i].imshow(image_data, cmap='viridis')
+                    arr = _to_2d_for_imshow(image_data, how="first")
+                    axs[ax_row, i].imshow(arr, cmap='viridis')
                     axs[ax_row, i].axis('off')
 
                     # Add a red semi-transparent rectangle (128x128 central crop)
@@ -901,8 +969,69 @@ def complex_apply_transforms_with_config(image, config, img_shape=(128, 128), in
     
     return transformed_image
 
-
 def apply_formatting(image: torch.Tensor,
+                     crop_size: tuple = (1, 128, 128),
+                     downsample_size: tuple = (1, 128, 128)
+                    ) -> torch.Tensor:
+    """
+    Center-crop and resize a single-channel tensor without PIL.
+
+    Args:
+      image: Tensor of shape [C, H0, W0] or [1, H0, W0].
+      crop_size:      (C,Hc,Wc) or (Hc,Wc) or (T,C,Hc,Wc) → will be canonicalized.
+      downsample_size:(C,Ho,Wo) or (Ho,Wo) or (T,C,Ho,Wo) → will be canonicalized.
+
+    Returns:
+      Tensor of shape [C, Ho, Wo].
+    """
+
+    # Canonicalize sizes to (C,H,W)
+    def _canon_size(sz):
+        if len(sz) == 2:
+            return (1, sz[0], sz[1])
+        if len(sz) == 3:
+            return sz
+        if len(sz) == 4:
+            return (sz[-3], sz[-2], sz[-1])
+        raise ValueError(f"crop/downsample size must have 2, 3 or 4 dims, got {sz}")
+
+    crop_size = _canon_size(crop_size)
+    downsample_size = _canon_size(downsample_size)
+
+    # Normalize image dims
+    if image.dim() == 4 and image.size(0) == 1:
+        image = image.squeeze(0)               # [1,H0,W0]
+    if image.dim() == 3:
+        C, H0, W0 = image.shape
+        img = image
+    elif image.dim() == 2:
+        H0, W0 = image.shape
+        img = image.unsqueeze(0)
+        C = 1
+    else:
+        raise ValueError(f"Unexpected image dims: {image.shape}")
+
+    # Grayscale handling based on canonicalized channel dim
+    if crop_size[0] == 1 or downsample_size[0] == 1:
+        img = img.mean(dim=0, keepdim=True)
+
+    # Unpack sizes
+    _, Hc, Wc = crop_size
+    _, Ho, Wo = downsample_size
+
+    # Center crop and resize
+    y0, x0 = H0 // 2, W0 // 2
+    y1, y2 = y0 - Hc // 2, y0 + Hc // 2
+    x1, x2 = x0 - Wc // 2, x0 + Wc // 2
+    y1, y2 = max(0, y1), min(H0, y2)
+    x1, x2 = max(0, x1), min(W0, x2)
+
+    crop = img[:, y1:y2, x1:x2].unsqueeze(0)   # [1,C,Hc,Wc]
+    resized = F.interpolate(crop, size=(Ho, Wo), mode='bilinear', align_corners=False)
+    return resized.squeeze(0)                   # [C,Ho,Wo]
+
+
+def apply_formatting_old(image: torch.Tensor,
                      crop_size: tuple = (1, 1, 128, 128),
                      downsample_size: tuple = (1, 1, 128, 128)
                     ) -> torch.Tensor:
@@ -951,20 +1080,6 @@ def apply_formatting(image: torch.Tensor,
                              mode='bilinear',
                              align_corners=False)
     return resized.squeeze(0)                      # [C,Ho,Wo]
-
-def apply_formatting_old(image, crop_size=(1, 1, 128, 128), downsample_size=(1, 1, 128, 128)):
-    to_gray = (crop_size[-3] == 1) or (downsample_size[-3] == 1)
-    transforms_list = [transforms.ToPILImage()]
-    if to_gray:
-        transforms_list.append(transforms.Grayscale(num_output_channels=1))
-    transforms_list += [
-        transforms.CenterCrop((crop_size[-2], crop_size[-1])),
-        transforms.Resize((downsample_size[-2], downsample_size[-1])),
-        transforms.ToTensor(),
-    ]
-    preprocess = transforms.Compose(transforms_list)
-    return preprocess(image)
-
 
 def img_hash(img: torch.Tensor) -> str:
     #print("Shape of image before hashing:", img.shape)
@@ -1107,14 +1222,20 @@ def augment_images(
     cumulative_augmented_images, cumulative_augmented_labels = [], []
     
     if ST_augmentation:
-        for cls in set(labels):  # Get unique classes from labels
-            images_cls = [img for img, lbl in zip(images, labels) if lbl == cls]
-            path = f'/users/mbredber/scratch/ST_generation/1to{n_gen}_{len(images_cls)}_{cls}.npy'
-            st_images = np.load(path)
-
+        # labels may be a tensor; make them plain ints
+        lbl_list = [int(x) for x in (labels.tolist() if torch.is_tensor(labels) else labels)]
+        for cls in sorted(set(lbl_list)):
+            # don't depend on exact count in the filename; use a pattern
+            pattern = f"/users/mbredber/scratch/ST_generation/1to{n_gen}_*_{cls}.npy"
+            candidates = sorted(glob.glob(pattern))
+            if not candidates:
+                print(f"[augment_images] No ST file matching {pattern}; skipping for class {cls}.")
+                continue
+            st_images = np.load(candidates[0])
             st_images = torch.tensor(st_images).float().unsqueeze(1)
             images.extend(st_images)
-            labels.extend([cls] * len(st_images))
+            lbl_list.extend([cls]*len(st_images))
+        labels = lbl_list
     
     for idx, image in enumerate(images):
         for rot in rotations:
@@ -1863,18 +1984,35 @@ def load_RGZ10k(path=root_path + "RGZ_10k", fold=5, target_classes=None, crop_si
     
     return train_images, train_labels, eval_images, eval_labels
 
-def load_PSZ2(path=root_path + "PSZ2/classified/", fold=5, sample_size=300, target_classes=[53], crop_size=(1, 256, 256), downsample_size=(1, 256, 256), version='T100kpcSUB', FLUX_CLIPPING=False, train=False):
-    # Configuration
-    version_folders = ['RAW', 'T50kpc', 'T100kpc']
-    #version_folders = [
-    #    "T15arcsec","T15SUBarcsec","T25kpc","T25kpcSUB",
-    #    "T30arcsec","T30SUBarcsec","T50kpc","T50kpcSUB",
-    #    "T100kpc","T100kpcSUB","XMM","CHANDRA","R-1.25",
-    #    "compact-model",""   # the version-free name
-    #]
-    # -----------------
-    
-    # if you passed a 4‐tuple, use its first entry as the number of versions to load
+
+def load_PSZ2(path=root_path + "PSZ2/classified/",
+              fold=5,
+              sample_size=300,
+              target_classes=[53],
+              crop_size=(1, 256, 256),
+              downsample_size=(1, 256, 256),
+              versions='T100kpcSUB',      # <-- replaced 'version' with 'versions'
+              USE_GLOBAL_NORMALISATION=False,
+              GLOBAL_NORM_MODE='flux',
+              percentile_lo=1, percentile_hi=99,
+              train=False):
+    """
+    PSZ2 loader with strict version alignment for tesseracts.
+
+    • If T>1 (i.e., crop_size/downsample_size provided as 4-tuples), we:
+      - choose the versions from `versions` (e.g., 'T50kpc', 'T100kpc', 'RAW').
+      - build the set intersection of base names across the chosen versions
+      - if 'RAW' is present, we additionally remove any RAW-only bases not present in T50kpc or T100kpc
+      - stack frames per base into a cube [T, C, H, W]
+
+    • If T==1 we keep the legacy single-version path (FITS -> tensor via apply_formatting).
+
+    NOTE: We now **override** the CUBE selection using `versions`:
+      - If `versions` is a list with length > 1 → CUBE=True (tesseract, PNGs).
+      - Else → CUBE=False (single version, FITS).
+    """
+
+    # --- unpack crop/downsample (kept as-is for compatibility) ---
     if len(crop_size) == 4:
         num_versions, ch_c, h_c, w_c = crop_size
         crop_size = (ch_c, h_c, w_c)
@@ -1885,243 +2023,267 @@ def load_PSZ2(path=root_path + "PSZ2/classified/", fold=5, sample_size=300, targ
         num_versions = None
         ch_c, h_c, w_c = 1, crop_size[0], crop_size[1]
     else:
-        raise ValueError("crop_size must be a 2, 3, or 4-tuple (num_versions, channels, height, width)")
+        raise ValueError("crop_size must be 2, 3 or 4 dims")
+
     if len(downsample_size) == 4:
         num_versions, ch_d, h_d, w_d = downsample_size
         downsample_size = (ch_d, h_d, w_d)
     elif len(downsample_size) == 3:
-        num_versions = None
         ch_d, h_d, w_d = downsample_size
     elif len(downsample_size) == 2:
-        num_versions = None
-        ch_d, h_d, w_d = 1, downsample_size[0], downsample_size[1] 
+        ch_d, h_d, w_d = 1, downsample_size[0], downsample_size[1]
     else:
-        raise ValueError("downsample_size must be a 2, 3, or 4-tuple (num_versions, channels, height, width)")
-    
-    CUBE = True if num_versions is not None else False
+        raise ValueError("downsample_size must be 2, 3 or 4 dims")
 
-    images = []
-    labels = []
-    filenames = []
-    
-    #label_map = {cls_val: idx for idx, cls_val in enumerate(target_classes)}
-    #print("Label map:", label_map)
+    def _canon_one(v):
+        s  = str(v).strip()
+        sl = s.lower()
 
-    for cls in target_classes:
-        class_folder = next(c["description"] for c in get_classes() if c["tag"] == cls)
-        label = cls
-        #print("Processing class:", class_folder, "with label", label)Processing class
-        
-        if CUBE:
-            vf_list = version_folders[:num_versions] if num_versions else version_folders
-            version = 'CUBE'
-            print(f"[load_PSZ2] CUBE mode ON — num_versions={num_versions}, using {vf_list}")
-            for subfolder in [class_folder]:
-                base_names = set()
-                # collect all base filenames that exist in *all* version folders
-                base_files_per_version = []
-                for vf in vf_list:
-                    folder = os.path.join(root_path, "PSZ2/classified", vf, subfolder)
-                    if not os.path.isdir(folder):
-                        print(f"Warning: {folder} does not exist.")
-                        base_files_per_version.append(set())
-                        continue
-                    base_files = {
-                        fname[:-4] for fname in os.listdir(folder)
-                        if fname.endswith(".png")
-                    }
-                    base_files_per_version.append(base_files)
+        # Canonical folders, ordered for readability
+        canonical = {
+            # RAW
+            'raw':          'RAW',
 
-                base_names = set.intersection(*base_files_per_version)
+            # 25 kpc
+            't25kpcsub':    'T25kpcSUB',
+            '25kpcsub':     'T25kpcSUB',
+            't25S':         'T25kpcSUB',
+            '25kpcS':       'T25kpcSUB',
+            't25kpc':       'T25kpc',
+            't25':          'T25kpc',
+            '25kpc':        'T25kpc',
 
-                for base in sorted(base_names):
-                    formatted_versions = []
-                    for vf in vf_list:
-                        npy_path = os.path.join(path, vf, subfolder, f"{base}.npy")
-                        arr = np.load(npy_path).astype(float).squeeze()
-                        if arr.ndim == 3:
-                            arr = arr.mean(axis=0)
+            # 50 kpc
+            't50kpcsub':    'T50kpcSUB',
+            '50kpcsub':     'T50kpcSUB',
+            't50S':        'T50kpcSUB',
+            '50kpcS':      'T50kpcSUB',
+            't50kpc':       'T50kpc',
+            't50':          'T50kpc',
+            '50kpc':        'T50kpc',
 
-                        raw = torch.from_numpy(arr).unsqueeze(0).float()  # [1,H,W]
-                        #fmt = apply_formatting(raw, crop_size, downsample_size)
+            # 100 kpc
+            't100kpcsub':   'T100kpcSUB',
+            '100kpcsub':    'T100kpcSUB',
+            't100S':        'T100kpcSUB',
+            '100kpcS':      'T100kpcSUB',
+            't100kpc':      'T100kpc',
+            't100':         'T100kpc',
+            '100kpc':       'T100kpc',
+        }
+        if sl in canonical:
+            return canonical[sl]
 
-                        # --- compute version‐scaled crop_size so we cover the same sky area ---
-                        # 1) get the RAW header (you already did this):
-                        raw_path1 = os.path.join(path, 'RAW',  subfolder, f"{base}.fits")
-                        raw_path2 = os.path.join(root_path, 'PSZ2','fits', base, f"{base}.fits")
-                        hdr_path  = raw_path1 if os.path.exists(raw_path1) else raw_path2
-                        raw_hdr   = fits.getheader(hdr_path)
+        # Shorthand like 'rt25' or 'rt50kpc' → 'T25kpc' / 'T50kpc'
+        if sl.startswith('rt'):
+            num = sl[2:].rstrip('kpc')
+            if num.isdigit():
+                return f"T{num}kpc"
 
-                        # 2) now for each vf in ['RAW','T50kpc','T100kpc',…]
-                        if vf == 'RAW':
-                            ver_hdr = raw_hdr
-                            fits_path = hdr_path
-                        else:
-                            ver_fits1 = os.path.join(path, vf, subfolder, f"{base}.fits")
-                            ver_fits2 = os.path.join(root_path,'PSZ2','fits', base, f"{base}{vf}.fits")
-                            fits_path = ver_fits1 if os.path.exists(ver_fits1) else ver_fits2
-                            ver_hdr   = fits.getheader(fits_path)
-                            
-                        ch, h0, w0 = crop_size
-                        scale = abs(raw_hdr['CDELT1'] / ver_hdr['CDELT1'])
-                        h1 = int(round(h0 * scale))
-                        w1 = int(round(w0 * scale))
-                        fmt = apply_formatting(raw, (ch, h1, w1), downsample_size)
-                        formatted_versions.append(fmt)
-
-                    cube = torch.stack(formatted_versions, dim=0)  # [num_versions, 1, H, W]
-                    images.append(cube)
-                    labels.append(label)
-                    filenames.append(base)
-
-                    # HOPEFUL WAY - FILL AND CUT TO RESIZE AND USE (Not tried yet)
-                    ## ensure frame is exactly (h_c, w_c) by center‐cropping or zero‐padding
-                    #actual_h, actual_w = frame.shape[-2], frame.shape[-1]
-#
-                    ## if too large, crop centrally
-                    #if actual_h > h_c or actual_w > w_c:
-                    #    top = (actual_h - h_c) // 2
-                    #    left = (actual_w - w_c) // 2
-                    #    frame = frame[..., top:top+h_c, left:left+w_c]
-#
-                    ## if too small, pad equally on all sides
-                    #elif actual_h < h_c or actual_w < w_c:
-                    #    pad_h = h_c - actual_h
-                    #    pad_w = w_c - actual_w
-                    #    pad_top = pad_h // 2
-                    #    pad_bottom = pad_h - pad_top
-                    #    pad_left = pad_w // 2
-                    #    pad_right = pad_w - pad_left
-                    #    frame = F.pad(frame, (pad_left, pad_right, pad_top, pad_bottom), mode='constant', value=0)
-
-                    # **convert to your single‐channel + resize here!**
-
-                #print("Number of cubes added:", len(images), "each of shape", cube.shape)
+        # Fall through untouched (e.g. custom folder names)
+        return s
 
 
-        else:
-            # --- only load .npy files, stretch to [0,1], save as PNG and collect tensors ---
-            print(f"[load_PSZ2] Single-version = {version}")
-            for subfolder in [class_folder]:
-                folder_path = os.path.join(path, version, subfolder)
-                if not os.path.isdir(folder_path):
-                    #print(f"Warning: {folder_path} not found, skipping.")
-                    continue
-                for fname in os.listdir(folder_path):
-                    if not fname.lower().endswith('.fits'):
-                        continue
-                    base, _ = os.path.splitext(fname)
-                    # skip files that include the version suffix
-                    if base.endswith(version):
-                        continue
-                    fits_path = os.path.join(folder_path, fname)
-                    arr = fits.getdata(fits_path).astype(float)
+    if isinstance(versions, (list, tuple)):
+        _vf_list = [_canon_one(v) for v in versions]
+    else:
+        _vf_list = [_canon_one(versions)]
 
-                    # collapse singleton dims, then average if it’s a 3D cube
-                    arr2 = np.squeeze(arr)
-                    if arr2.ndim == 3:
-                        arr2 = np.mean(arr2, axis=0)
-                    elif arr2.ndim != 2:
-                        raise ValueError(f"Expected 2-D or 3-D stack, got {arr2.shape!r}")
+    CUBE = len(_vf_list) > 1   # <-- override: CUBE determined by `versions`
+    # For single-version FITS branch below, reuse local name `version`
+    version = _vf_list[0]
 
-                    if FLUX_CLIPPING:
-                        # 1) read header + raw array
-                        hdr = fits.getheader(fits_path)
-                        raw = fits.getdata(fits_path).astype(float)
+    images, labels, filenames = [], [], []
 
-                        # 2) convert to Jy/pixel (assumes header.FLUXCONV gives Jy per input unit)
-                        fluxconv = hdr.get('FLUXCONV', 1.0)
-                        flux = raw * fluxconv
+    # --- tag -> folder name map ---
+    classes_map = {c["tag"]: c["description"] for c in get_classes()}
 
-                        # 3) clamp to [1e-10,1e-5] Jy/pix and re-scale to [0,1]
-                        flux_t = torch.from_numpy(flux.squeeze()).float()
-                        flux_clipped = flux_t.clamp(1e-10, 1e-5)
-                        flux_norm = (flux_clipped - 1e-10) / (1e-5 - 1e-10)
+    if CUBE:
+        vf_list = _vf_list
+        ref_version = 'RAW' if 'RAW' in {v.upper() for v in vf_list} else vf_list[0]
 
-                        # 4) now format for your network
-                        tensor = apply_formatting(flux_norm, crop_size=crop_size, downsample_size=downsample_size)
-                    else:
-                        raw = torch.from_numpy(arr2).unsqueeze(0).float() 
-                        tensor = apply_formatting(raw, crop_size=crop_size, downsample_size=downsample_size) 
-            
-                        
-                    images.append(tensor) # shape [1, C, H, W]
-                    labels.append(label)
-                    filenames.append(os.path.splitext(fname)[0])
-        
+        def _list_fits_bases(version, class_folder):
+            # use the function arg `path` so callers can override root
+            folder = os.path.join(path, version, class_folder)
+            if not os.path.isdir(folder):
+                raise FileNotFoundError(f"Version folder missing: {folder}")
+            bases = {os.path.splitext(fn)[0] for fn in os.listdir(folder)
+                    if fn.lower().endswith(".fits")}
+            if not bases:
+                raise FileNotFoundError(f"No FITS files found in {folder}")
+            return folder, bases
 
-    if len(images) == 0:
-        raise ValueError("No images loaded. Check the path and file extensions.")
-    
-    assert len(images) == len(labels) == len(filenames), \
-       f"mismatch: {len(images)} imgs, {len(labels)} labels, {len(filenames)} files"
+        # canonical output size and reference crop size
+        ch_out, Ho, Wo = downsample_size
+        ref_ch, Hc_ref, Wc_ref = crop_size
 
-    #print("Length of images before deduplication:", len(images))
-    if target_classes == [50, 51]:
-        # --- dedupe block, pulling in filenames too ---
-        seen = {}                # hash -> first‐seen filename
-        unique_images, unique_labels, unique_filenames = [], [], []
-        duplicates = defaultdict(list)
-
-        for img, lbl, fname in zip(images, labels, filenames):
-            # make sure we hash the exact same raw array you later feed into the network
-            arr = img.squeeze().numpy()  
-            h = hashlib.sha1(arr.tobytes()).hexdigest()
-            if h in seen:
-                # record the duplicate filename
-                duplicates[h].append(fname)
+        for cls in target_classes:
+            class_folder = classes_map.get(cls)
+            if class_folder is None:
                 continue
-            # first time we see this hash
-            seen[h] = fname
-            unique_images.append(img)
-            unique_labels.append(lbl)
-            unique_filenames.append(fname)
+            label = cls  # keep original class ids (50, 51, ...)
 
-        # report
-        if duplicates:
-            print("Found duplicate images (by hash):")
-            for h, dups in duplicates.items():
-                original = seen[h]
-                print(f"  hash {h}:")
-                print(f"    original: {original}")
-                for dup in dups:
-                    print(f"    duplicate: {dup}")
+            # Build intersection of FITS basenames across requested versions for this class
+            folder_map = {}
+            base_sets = {}
+            for vf in vf_list:
+                folder, bases = _list_fits_bases(vf, class_folder)
+                folder_map[vf] = folder
+                base_sets[vf] = bases
 
-        # overwrite
-        images, labels, filenames = unique_images, unique_labels, unique_filenames
+            common_bases = sorted(set.intersection(*base_sets.values()))
+            if not common_bases:
+                print(f"[load_PSZ2] No common basenames for class '{class_folder}' across {vf_list}. Skipping.")
+                continue
+
+            # Helper: pixel scale (deg/pix)
+            def _pixdeg(h):
+                if 'CDELT1' in h:
+                    return abs(h['CDELT1'])
+                cd11 = h.get('CD1_1'); cd12 = h.get('CD1_2', 0.0)
+                if cd11 is not None:
+                    return float(np.hypot(cd11, cd12))
+                raise KeyError("No CDELT* or CD* keywords in FITS header")
+
+            for base in common_bases:
+                # reference header to define physical crop
+                ref_path = os.path.join(folder_map[ref_version], f"{base}.fits")
+                ref_hdr  = fits.getheader(ref_path)
+                ref_pixdeg = _pixdeg(ref_hdr)
+
+                frames = []
+                for vf in vf_list:
+                    fpath = os.path.join(folder_map[vf], f"{base}.fits")
+                    hdr   = fits.getheader(fpath)
+                    arr   = np.squeeze(fits.getdata(fpath)).astype(np.float32)
+                    if arr.ndim == 3:
+                        arr = arr.mean(axis=0)  # collapse cubes if any
+
+                    # scale crop to same physical FOV as reference
+                    s = ref_pixdeg / _pixdeg(hdr)   # >1 ⇒ coarser pixels ⇒ larger crop window
+                    Hc_v = max(1, int(round(Hc_ref * s)))
+                    Wc_v = max(1, int(round(Wc_ref * s)))
+
+                    ten = torch.from_numpy(arr).unsqueeze(0)  # [1,H,W]
+                    frm = apply_formatting(ten, (1, Hc_v, Wc_v), (1, Ho, Wo))
+                    frames.append(frm)
+
+                cube = torch.stack(frames, dim=0)  # [T,1,Ho,Wo] in vf_list order
+                images.append(cube)
+                labels.append(label)
+                filenames.append(base)
+
+
     else:
-        # Remove *all* clusters that appear more than once (i.e. double‑label cases)
-        from collections import Counter
+        # ---------- legacy single-version path (FITS-based) ----------
+        #print(f"[load_PSZ2] Single-version path: version='{version}' (FITS)")
+        for cls in target_classes:
+            class_folder = classes_map.get(cls, None)
+            if class_folder is None:
+                continue
+            label = cls
 
-        # compute hash for each image
-        hashes = [
-            hashlib.sha1(img.squeeze().numpy().tobytes()).hexdigest()
-            for img in images
+            folder_path = os.path.join(path, version, class_folder)
+            if not os.path.isdir(folder_path):
+                continue
+
+            for fname in os.listdir(folder_path):
+                if not fname.lower().endswith(".fits"):
+                    continue
+                base, _ = os.path.splitext(fname)
+                # ignore any file that already embeds the version suffix in its name
+                if base.endswith(version):
+                    continue
+
+                fits_path = os.path.join(folder_path, fname)
+                arr = fits.getdata(fits_path).astype(float)
+                arr2 = np.squeeze(arr)
+                if arr2.ndim == 3:
+                    arr2 = np.mean(arr2, axis=0)
+                elif arr2.ndim != 2:
+                    raise ValueError(f"Expected 2-D or 3-D stack, got {arr2.shape!r}")
+
+                if USE_GLOBAL_NORMALISATION and GLOBAL_NORM_MODE == "flux": # apply global flux normalisation
+                    hdr = fits.getheader(fits_path)
+                    fluxconv = hdr.get('FLUXCONV', 1.0)
+                    flux = arr * fluxconv
+                    flux_t = torch.from_numpy(np.squeeze(flux)).float().unsqueeze(0)
+                    flux_clipped = flux_t.clamp(1e-10, 1e-5)
+                    frame = (flux_clipped - 1e-10) / (1e-5 - 1e-10)
+                else:
+                    frame = torch.from_numpy(arr2).unsqueeze(0).float()
+
+                frame = apply_formatting(frame, crop_size=crop_size, downsample_size=downsample_size)
+                images.append(frame)           # [C,H,W]
+                labels.append(label)
+                filenames.append(base)
+    # ---- GLOBAL, DATASET-WIDE NORMALISATION (one mapping for all sets) ----
+    if USE_GLOBAL_NORMALISATION and GLOBAL_NORM_MODE == "percentile":
+        print(f"[load_PSZ2] Applying global percentile normalisation ({percentile_lo}–{percentile_hi}%)")
+        # compute percentiles on the entire dataset
+        imgs_tensor = torch.stack(images) if isinstance(images, list) else images
+        flat = imgs_tensor.reshape(-1).float()
+        qlo = flat.quantile(percentile_lo/100)
+        qhi = flat.quantile(percentile_hi/100)
+
+        def _apply_fixed_pct_elem(x, lo=qlo, hi=qhi):
+            return ((x - lo) / (hi - lo + 1e-6)).clamp(0, 1).to(x.dtype)
+
+        if isinstance(images, list):
+            images = [_apply_fixed_pct_elem(x) for x in images]
+        else:
+            images = _apply_fixed_pct_elem(images)
+
+
+    # --------- safety checks ---------
+    if len(images) == 0:
+        raise ValueError("No images loaded. Check the PSZ2 path/versions/classes.")
+
+    assert len(images) == len(labels) == len(filenames), \
+        f"mismatch: {len(images)} imgs, {len(labels)} labels, {len(filenames)} files"
+
+    # --------- class-conflict handling (RH vs RR) ----------
+    # For {52 (RH), 53 (RR)} first drop *cluster basenames* that appear in both classes,
+    # independent of pixel identity. Then (optionally) do hash de-dup on the remainder.
+    if set(target_classes) == {52, 53}:
+        # 1) basename-level conflict filter
+        base_to_labels = {}
+        for lbl, base in zip(labels, filenames):
+            base_to_labels.setdefault(base, set()).add(lbl)
+        conflict_bases = {b for b, labs in base_to_labels.items() if len(labs) > 1}
+        if conflict_bases:
+            print(f"Excluding {len(conflict_bases)} ambiguous clusters present in both RH and RR.")
+        filtered_triplets = [
+            (img, lbl, base)
+            for img, lbl, base in zip(images, labels, filenames)
+            if base not in conflict_bases
         ]
-        counts = Counter(hashes)
-        dup_hashes = {h for h, c in counts.items() if c > 1}
-
-        if dup_hashes:
-            print("Removing clusters found in both RH and RR (by hash):")
-            for h in dup_hashes:
-                fnames = [f for f, hh in zip(filenames, hashes) if hh == h]
-                print(f"  hash {h}: files {fnames}")
-
-        # keep only those images whose hash is unique
-        filtered = [
-            (img, lbl, fname)
-            for img, lbl, fname, hh in zip(images, labels, filenames, hashes)
-            if hh not in dup_hashes
-        ]
-        if filtered:
-            images, labels, filenames = zip(*filtered)
-            images, labels, filenames = list(images), list(labels), list(filenames)
+        if filtered_triplets:
+            images, labels, filenames = map(list, zip(*filtered_triplets))
         else:
             images, labels, filenames = [], [], []
 
-    print("Length of unique images:", len(images))
+        # 2) (optional) hash de-dup (keeps only one copy of identical frames)
+        from collections import Counter
+        hashes = []
+        for img in images:
+            arr = img.squeeze().numpy()
+            hashes.append(hashlib.sha1(arr.tobytes()).hexdigest())
+        counts = Counter(hashes)
+        dup_hashes = {h for h, c in counts.items() if c > 1}
+        if dup_hashes:
+            keep = set()
+            seen = set()
+            for i, h in enumerate(hashes):
+                if h not in seen:
+                    keep.add(i)
+                    seen.add(h)
+            images  = [images[i]  for i in sorted(keep)]
+            labels  = [labels[i]  for i in sorted(keep)]
+            filenames = [filenames[i] for i in sorted(keep)]
 
-    # now do your split
+
+    # --------- stratified split ----------
     all_idx = list(range(len(images)))
     train_idx, test_idx = train_test_split(
         all_idx,
@@ -2129,6 +2291,7 @@ def load_PSZ2(path=root_path + "PSZ2/classified/", fold=5, sample_size=300, targ
         stratify=labels,
         random_state=SEED
     )
+
     train_images = [images[i] for i in train_idx]
     train_labels = [labels[i] for i in train_idx]
     eval_images  = [images[i] for i in test_idx]
@@ -2136,6 +2299,7 @@ def load_PSZ2(path=root_path + "PSZ2/classified/", fold=5, sample_size=300, targ
     train_filenames = [filenames[i] for i in train_idx]
     eval_filenames  = [filenames[i] for i in test_idx]
 
+    # --------- return types exactly as before ----------
     return train_images, train_labels, eval_images, eval_labels, train_filenames, eval_filenames
 
 
@@ -2210,50 +2374,51 @@ def load_MGCLS(path='/users/mbredber/data/MGCLS/classified_crops_1600/',  # Path
     return train_images, train_labels, eval_images, eval_labels
 
 
-def load_galaxies(galaxy_class, path=None, version=None, fold=None, island=None, crop_size=None, downsample_size=None, sample_size=None, 
-                  REMOVEOUTLIERS=True, BALANCE=False, AUGMENT=False, FLUX_CLIPPING=False, STRETCH=False, percentile_lo=80, percentile_hi=99,
-                  EXTRADATA=False, NORMALISE=True, NORMALISETOPM=False, SAVE_IMAGES=False, train=None):
+def load_galaxies(galaxy_classes, path=None, versions=None, fold=None, island=None, crop_size=None, downsample_size=None, sample_size=None, 
+                  REMOVEOUTLIERS=True, BALANCE=False, AUGMENT=False, USE_GLOBAL_NORMALISATION=False, GLOBAL_NORM_MODE="percentile", STRETCH=False, percentile_lo=80, percentile_hi=99,
+                 NORMALISE=True, NORMALISETOPM=False, EXTRADATA=False, PRINTFILENAMES=False, SAVE_IMAGES=False, train=None):
     """
     Master loader that delegates to specific dataset loaders and returns zero-based labels.
     """
-    def get_max_class(galaxy_class):
-        if isinstance(galaxy_class, list):
-            return max(galaxy_class)
-        return galaxy_class
+    def get_max_class(galaxy_classes):
+        if isinstance(galaxy_classes, list):
+            return max(galaxy_classes)
+        return galaxy_classes
 
     # Clean up kwargs to remove None values
-    kwargs = {'path': path, 'version': version, 'sample_size': sample_size, 'fold':fold, 'train': train,
-              'island': island, 'crop_size': crop_size, 'downsample_size': downsample_size, 'FLUX_CLIPPING': FLUX_CLIPPING}
+    kwargs = {'path': path, 'versions': versions, 'sample_size': sample_size, 'fold':fold, 'train': train,
+              'island': island, 'crop_size': crop_size, 'downsample_size': downsample_size, 'USE_GLOBAL_NORMALISATION': USE_GLOBAL_NORMALISATION,
+                'GLOBAL_NORM_MODE': GLOBAL_NORM_MODE, 'percentile_lo': percentile_lo, 'percentile_hi': percentile_hi}
     clean_kwargs = {k: v for k, v in kwargs.items() if v is not None}
 
-    max_class = get_max_class(galaxy_class)
+    max_class = get_max_class(galaxy_classes)
 
     # Delegate to specific loaders based on class range
     if max_class < 10:
         path = root_path + 'Galaxy10.h5'
-        target_classes = galaxy_class if isinstance(galaxy_class, list) else [galaxy_class]
+        target_classes = galaxy_classes if isinstance(galaxy_classes, list) else [galaxy_classes]
         data = load_galaxy10(path=path, target_classes=target_classes, **clean_kwargs)
     elif max_class < 14:
         if clean_kwargs.get('crop_size') is not None:
             clean_kwargs['crop_size'] = np.squeeze(clean_kwargs['crop_size'])
         path = root_path + 'firstgalaxydata/'
-        target_classes = galaxy_class if isinstance(galaxy_class, list) else [galaxy_class]
+        target_classes = galaxy_classes if isinstance(galaxy_classes, list) else [galaxy_classes]
         data = load_FIRST(path=path, target_classes=target_classes, **clean_kwargs)
     elif max_class < 18:
         clean_kwargs['crop_size'] = np.squeeze(clean_kwargs.get('crop_size', None))
-        target_classes = galaxy_class if isinstance(galaxy_class, list) else [galaxy_class]
+        target_classes = galaxy_classes if isinstance(galaxy_classes, list) else [galaxy_classes]
         data = load_Mirabest(target_classes=target_classes, **clean_kwargs)
     elif max_class < 30:
-        target_classes = galaxy_class if isinstance(galaxy_class, list) else [galaxy_class]
+        target_classes = galaxy_classes if isinstance(galaxy_classes, list) else [galaxy_classes]
         data = load_MNIST(target_classes=target_classes, **clean_kwargs)
     elif max_class < 37:
-        target_classes = galaxy_class if isinstance(galaxy_class, list) else [galaxy_class]
+        target_classes = galaxy_classes if isinstance(galaxy_classes, list) else [galaxy_classes]
         data = load_RGZ10k(target_classes=target_classes, **clean_kwargs)
     elif max_class < 50:
-        target_classes = galaxy_class if isinstance(galaxy_class, list) else [galaxy_class]
+        target_classes = galaxy_classes if isinstance(galaxy_classes, list) else [galaxy_classes]
         data = load_MGCLS(target_classes=target_classes, **clean_kwargs)
     elif max_class <= 59:
-        target_classes = galaxy_class if isinstance(galaxy_class, list) else [galaxy_class]
+        target_classes = galaxy_classes if isinstance(galaxy_classes, list) else [galaxy_classes]
         data = load_PSZ2(target_classes=target_classes, **clean_kwargs)
     else:
         raise ValueError("Invalid galaxy class provided.")
@@ -2274,12 +2439,11 @@ def load_galaxies(galaxy_class, path=None, version=None, fold=None, island=None,
 
         # ensure no cluster appears in both
         overlap = set(train_filenames) & set(eval_filenames)
-        print("  filename overlap:", overlap)
         assert not overlap, f"PSZ2 split error — these IDs are in both sets: {overlap}"
         
     else:
         raise ValueError("Data loader did not return the expected number of outputs.")
-    
+        
     
     # If images are list, converge them to tensors
     #if isinstance(train_images, list):
@@ -2305,7 +2469,7 @@ def load_galaxies(galaxy_class, path=None, version=None, fold=None, island=None,
     if isinstance(eval_images, list):
         eval_images  = torch.stack(eval_images)
         
-    if galaxy_class[0] == 52 and galaxy_class[1] == 53: # Plot some train and validation images for each class
+    if galaxy_classes[0] == 52 and galaxy_classes[1] == 53: # Plot some train and validation images for each class
         # Plotting the training and evaluation images for each class
         from matplotlib import gridspec
         
@@ -2315,8 +2479,6 @@ def load_galaxies(galaxy_class, path=None, version=None, fold=None, island=None,
         n_eval_classes  = len(unique_eval_labels)
         n_cols = 4  # Number of columns in the grid
         n_rows = max(n_train_classes, n_eval_classes) // n_cols + 1
-        fig = plt.figure(figsize=(16, 4 * n_rows))
-        gs = gridspec.GridSpec(n_rows, n_cols, figure=fig)
         # Plot 5 examples per class for train and eval, with row labels
         n_examples = 5
         train_classes = sorted(set(train_labels))
@@ -2352,15 +2514,14 @@ def load_galaxies(galaxy_class, path=None, version=None, fold=None, island=None,
                             transform=axes[i, 0].transAxes,
                             va='center', ha='right', fontsize=12)
 
-        plt.savefig(f"./classifier/{galaxy_class[0]}_{galaxy_class[1]}_5perclass_labeled.png", dpi=300)
+        plt.savefig(f"./classifier/{galaxy_classes[0]}_{galaxy_classes[1]}_5perclass_labeled.png", dpi=300)
         plt.close(fig)
-        print(f"Saved training and evaluation images for classes {galaxy_class} to ./classifier/{'_'.join(map(str, galaxy_class))}_train_eval_images.png")
+        print(f"Saved training and evaluation images for classes {galaxy_classes} to ./classifier/{'_'.join(map(str, galaxy_classes))}_train_eval_images.png")
 
     if BALANCE:
         train_images, train_labels = balance_classes(train_images, train_labels) # Remove excess images from the largest class
         
-        
-    if STRETCH and (len(crop_size) < 4 or len(downsample_size) < 4 or (crop_size[-4] == 1 and downsample_size[-4] == 1)):
+    if STRETCH and not USE_GLOBAL_NORMALISATION:
         train_class_ids = sorted(set(train_labels))
         for class_id in train_class_ids:
             train_idx   = next(i for i, lbl in enumerate(train_labels) if lbl == class_id)
@@ -2373,23 +2534,10 @@ def load_galaxies(galaxy_class, path=None, version=None, fold=None, island=None,
             fits_data = fits.getdata(fits_path).astype(float)
             fits_img  = torch.from_numpy(fits_data)
             
-            #### PIXEL CLIPPING
-            # 1) read header and raw data
-            #raw_hdr    = fits.getheader(fits_path)
-            #raw_arr    = fits.getdata(fits_path).astype(float)
-#
-            ## 2) convert to Jy/pixel (assumes header.FLUXCONV gives Jy per unit in raw_arr)
-            #flux_arr   = raw_arr * raw_hdr.get('FLUXCONV', 1.0)
-#
-            ## 3) turn into torch, clip, normalize to [0,1]
-            #flux_t     = torch.from_numpy(flux_arr).unsqueeze(0).float()
-            #flux_clip  = flux_t.clamp(1e-10, 1e-5)
-            #flux_norm  = (flux_clip - 1e-10) / (1e-5 - 1e-10)
-            
             # Crop the FITS image to match the crop size
             fits_img = apply_formatting(fits_img, crop_size=(crop_size[-3], crop_size[-2], crop_size[-1]), downsample_size=(downsample_size[-3], downsample_size[-2], downsample_size[-1]))
-            check_tensor('CUTOUT', cls_img)
-            check_tensor('FITS',   fits_img)
+            #check_tensor('CUTOUT', cls_img)
+            #check_tensor('FITS',   fits_img)
 
             # 4) define your stretches and clipping ranges
             clip_ranges = [(60,99.9), (70,99.5), (80,99)]
@@ -2440,7 +2588,21 @@ def load_galaxies(galaxy_class, path=None, version=None, fold=None, island=None,
                         arr = out.squeeze().cpu().numpy()
 
                         ax = axes[i, j]
+                        # ensure arr is 2D (H,W) or color (H,W,3/4) before imshow
+                        if isinstance(arr, torch.Tensor):
+                            arr = arr.detach().cpu().numpy()
+
+                        if arr.ndim == 3:
+                            # Case: (C,H,W) or (T,H,W)
+                            if arr.shape[0] in (3, 4):
+                                # interpret as channels-first RGB(A) → move to (H,W,3/4)
+                                arr = np.moveaxis(arr, 0, -1)
+                            else:
+                                # e.g. (2,H,W): pick the first plane (or use arr.mean(0) if you prefer)
+                                arr = arr[0]
+
                         im = ax.imshow(arr, cmap='viridis', origin='lower')
+
                         if j == 0:
                             ax.set_ylabel(f'pctile [{lo},{hi}]',
                                         rotation=0, labelpad=40)
@@ -2474,8 +2636,8 @@ def load_galaxies(galaxy_class, path=None, version=None, fold=None, island=None,
                 crop_size=(crop_size[-3], crop_size[-2], crop_size[-1]),
                 downsample_size=(downsample_size[-3], downsample_size[-2], downsample_size[-1])
             )
-            check_tensor('CUTOUT_eval', cls_img)
-            check_tensor('FITS_eval',   fits_img)
+            #check_tensor('CUTOUT_eval', cls_img)
+            #check_tensor('FITS_eval',   fits_img)
 
             # same clip‐ranges & funcs
             clip_ranges_plot = [(0,100), (60,99.9), (70,99.8), (80,99.7)]
@@ -2510,6 +2672,19 @@ def load_galaxies(galaxy_class, path=None, version=None, fold=None, island=None,
                         arr = out.squeeze().cpu().numpy()
 
                         ax = axes[i, j]
+                        
+                        if isinstance(arr, torch.Tensor):
+                            arr = arr.detach().cpu().numpy()
+
+                        if arr.ndim == 3:
+                            # Case: (C,H,W) or (T,H,W)
+                            if arr.shape[0] in (3, 4):
+                                # interpret as channels-first RGB(A) → move to (H,W,3/4)
+                                arr = np.moveaxis(arr, 0, -1)
+                            else:
+                                # e.g. (2,H,W): pick the first plane (or use arr.mean(0) if you prefer)
+                                arr = arr[0]
+
                         im = ax.imshow(arr, cmap='viridis', origin='lower')
 
                         if j == 0:
@@ -2534,6 +2709,64 @@ def load_galaxies(galaxy_class, path=None, version=None, fold=None, island=None,
                 plt.savefig(f"./classifier/{class_id}_eval_{source_name}_{suffix}_stretching.png", dpi=300)
                 plt.close(fig)
 
+    def plot_class_images(images, labels, filenames=None, set_name='train'):
+        # ensure labels are a plain list of ints
+        if isinstance(labels, torch.Tensor):
+            labels = labels.tolist()
+
+        # if images have more than one channel (C, H, W), only use the first channel
+        if isinstance(images, torch.Tensor) and images.ndim == 4:
+            images = [img[0] for img in images]
+        
+        desc_map = {c['tag']: c['description'] for c in get_classes()}
+        
+        for cls in sorted(set(labels)):
+            # collect up to 10 examples of this class
+            idxs = [i for i,l in enumerate(labels) if l == cls][:10]
+            if not idxs:
+                continue
+            
+            fig, axes = plt.subplots(2, 5, figsize=(10, 4))
+            fig.suptitle(f"{set_name} images for class {cls} – {desc_map.get(cls, '')}", fontsize=12)
+            
+            for ax, idx in zip(axes.flat, idxs):
+                img = images[idx]
+                arr = img.squeeze().cpu().numpy() if isinstance(img, torch.Tensor) else np.squeeze(img)
+                
+                # If multiple channels take the first channel
+                if arr.ndim == 3 and arr.shape[0] > 1:
+                    arr = arr[0]
+                
+                ax.imshow(arr, cmap='viridis', origin='lower')
+                ax.axis('off')
+                if filenames and idx < len(filenames):
+                    ax.set_title(filenames[idx], fontsize=8)
+            
+            # blank out any unused subplots
+            for ax in axes.flat[len(idxs):]:
+                ax.axis('off')
+            
+            plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+            plt.savefig(f"./classifier/{cls}_{set_name}_images.png", dpi=300)
+            plt.close(fig)
+            
+    sample_indices = {}
+    # Convert labels to a list if they are tensors
+    if isinstance(train_labels, torch.Tensor):
+        train_labels = train_labels.tolist()
+    for cls in sorted(set(train_labels)):
+        idxs = [i for i, lbl in enumerate(train_labels) if lbl == cls]
+        sample_indices[cls] = idxs[:10]
+        
+    if isinstance(eval_labels, torch.Tensor):
+        eval_labels = eval_labels.tolist()
+    for cls in sorted(set(eval_labels)):
+        idxs = [i for i, lbl in enumerate(eval_labels) if lbl == cls]
+        sample_indices[cls] = sample_indices.get(cls, []) + idxs[:10]
+        
+    plot_class_images(train_images, train_labels, train_filenames, set_name='train_1.before_normalisation')
+    plot_class_images(eval_images,  eval_labels,  eval_filenames,  set_name='eval_1.before_normalisation')
+
     if NORMALISE:
         if isinstance(train_images, list):
             train_images = torch.stack(train_images)
@@ -2541,19 +2774,38 @@ def load_galaxies(galaxy_class, path=None, version=None, fold=None, island=None,
             eval_images = torch.stack(eval_images)
         all_images = torch.cat([train_images, eval_images], dim=0)
         #all_images = normalise_images(all_images, out_min=0, out_max=1)  
-        if FLUX_CLIPPING: # Regular normalisation of all images to [0,1]
+        if USE_GLOBAL_NORMALISATION: # Regular normalisation of all images to [0,1]
             all_images = normalise_images(all_images, out_min=0, out_max=1)
         else:  # Percentile stretch to [0,1]
-            if len(all_images.shape) == 5:  # (B, T, C, H, W)
-                #print("Applying stretch separately to each T in shape:", all_images.shape)
-                stretched = []
+            
+            def per_image_percentile_stretch(x, lo=80, hi=99):
+                # x: [B, C, H, W]; returns same shape
+                B = x.shape[0]
+                out = x.clone()
+                for i in range(B):
+                    flat = out[i].reshape(-1)
+                    p_low  = flat.quantile(lo/100)
+                    p_high = flat.quantile(hi/100)
+                    out[i] = ((out[i] - p_low) / (p_high - p_low + 1e-6)).clamp(0, 1)
+                return out
+
+            if all_images.ndim == 5:   # [B, T, C, H, W]
                 for t in range(all_images.shape[1]):
-                    all_images_t = all_images[:, t]  # shape: (B, C, H, W)
-                    stretched_t = percentile_stretch(all_images_t, lo=percentile_lo, hi=percentile_hi)  # Percentile stretch over each T
-                    stretched.append(stretched_t.unsqueeze(1))  # keep T dim
-                all_images = torch.cat(stretched, dim=1)   
-            else:
-                all_images = percentile_stretch(all_images, lo=percentile_lo, hi=percentile_hi) # Percentile stretch over all images
+                    all_images[:, t] = per_image_percentile_stretch(all_images[:, t], percentile_lo, percentile_hi)
+            else:                      # [B, C, H, W]
+                all_images = per_image_percentile_stretch(all_images, percentile_lo, percentile_hi)
+
+            
+            #if len(all_images.shape) == 5:  # (B, T, C, H, W)
+            #    #print("Applying stretch separately to each T in shape:", all_images.shape)
+            #    stretched = []
+            #    for t in range(all_images.shape[1]):
+            #        all_images_t = all_images[:, t]  # shape: (B, C, H, W)
+            #        stretched_t = percentile_stretch(all_images_t, lo=percentile_lo, hi=percentile_hi)  # Percentile stretch over each T
+            #        stretched.append(stretched_t.unsqueeze(1))  # keep T dim
+            #    all_images = torch.cat(stretched, dim=1)   
+            #else:
+            #    all_images = percentile_stretch(all_images, lo=percentile_lo, hi=percentile_hi) # Percentile stretch over all images
         #all_images = torch.stack([percentile_stretch(img, lo=60, hi=99) for img in all_images]) # Individual percentile stretch
         train_images = all_images[:len(train_images)]
         eval_images  = all_images[len(train_images):]
@@ -2563,20 +2815,24 @@ def load_galaxies(galaxy_class, path=None, version=None, fold=None, island=None,
         all_images = normalise_images(all_images, out_min=-1, out_max=1)
         train_images = all_images[:len(train_images)]
         eval_images  = all_images[len(train_images):]
-        
+    
     if STRETCH:
-        # Asinh stretch after percentile stretch
+        # Concatenate so train/eval get the exact same mapping
+        alpha = 10.0
         all_images = torch.cat([train_images, eval_images], dim=0)
-        images = np.stack([img.squeeze().numpy() for img in all_images], axis=0)
-        pct = torch.from_numpy(images).float()     
-        images = asinh_stretch(pct, alpha=10)                                # apply asinh
-        #images = log_stretch(pct, alpha=10)                                  # apply log stretch
-        train_images = images[:len(train_images)]
-        eval_images  = images[len(train_images):]
-        
+
+        # Asinh stretch (elementwise), preserves shape/device/dtype
+        stretched = torch.asinh(all_images * alpha) / math.asinh(alpha)
+
+        # Split back
+        n_tr = train_images.shape[0]
+        train_images = stretched[:n_tr]
+        eval_images  = stretched[n_tr:]
+
+    # Always redistribute excess images for the test data, for fair evaluation
     classes_present = torch.unique(torch.cat([torch.tensor(train_labels), torch.tensor(eval_labels)])).tolist()
     train_images, train_labels, train_filenames, eval_images, eval_labels, eval_filenames = redistribute_excess(train_images, train_labels, eval_images, eval_labels, classes_present, train_filenames, eval_filenames)
-
+    
     if SAVE_IMAGES:
         for kind, imgs, lbls in (
             ('train', train_images, train_labels),
@@ -2584,31 +2840,66 @@ def load_galaxies(galaxy_class, path=None, version=None, fold=None, island=None,
         ):
             for cls in target_classes:
                 cls_imgs = [img for img, lbl in zip(imgs, lbls) if lbl == (cls-min(target_classes))]
-                #print(f"Length of {kind} images for class {cls}: {len(cls_imgs)}")
+                print(f"Length of {kind} images for class {cls}: {len(cls_imgs)}")
                 np.save(f"{path}_{kind}_{cls}_{len(cls_imgs)}.npy", cls_imgs)
 
 
-    # Format and optionally augment
-    if BALANCE:
-        #print("Counts per class before balancing:", collections.Counter(train_labels))
-        train_images, train_labels = balance_classes(train_images, train_labels) # Remove excess images from the largest class
-        #print("Counts per class after balancing:", collections.Counter(train_labels))
         
+    if EXTRADATA and not PRINTFILENAMES:
+        meta_df = pd.read_csv(os.path.join(root_path, "PSZ2/cluster_source_data.csv"))
+        print("PSZ2 metadata columns:", meta_df.columns.tolist())
+        meta_df.rename(columns={"slug": "base"}, inplace=True)
+        meta_df.set_index("base", inplace=True)
 
+        # build a list of metadata rows in the same order as your `filenames` list:
+        train_data = [meta_df.loc[base].values for base in train_filenames]
+        eval_data  = [meta_df.loc[base].values for base in eval_filenames]
+        
     if AUGMENT:
         train_images, train_labels = augment_images(train_images, train_labels, ST_augmentation=False)
-        eval_images, eval_labels = augment_images(eval_images, eval_labels, ST_augmentation=False)
+        if not (galaxy_classes[0] == 52 and galaxy_classes[1] == 53): 
+            eval_images, eval_labels = augment_images(eval_images, eval_labels, ST_augmentation=False) # Only augment if not RR and RH
+        else:
+            if len(eval_images.shape) == 3:
+                eval_images = eval_images.unsqueeze(1)
+            if isinstance(eval_images, (list, tuple)):
+                eval_images = torch.stack(eval_images)
+            if isinstance(eval_labels, (list, tuple)):
+                eval_labels = torch.tensor(eval_labels, dtype=torch.long)
+        if EXTRADATA and not PRINTFILENAMES:
+                n_aug = 8  # default is 4*2 = 8
+                train_data = [row for row in train_data for _ in range(n_aug)]
+                if not (galaxy_classes[0] == 52 and galaxy_classes[1] == 53):
+                    eval_data  = [row for row in eval_data  for _ in range(n_aug)]
+        if PRINTFILENAMES:
+            n_aug = 8  # default is 4*2 = 8
+            train_filenames = [fname for fname in train_filenames for _ in range(n_aug)]
+            if not (galaxy_classes[0] == 52 and galaxy_classes[1] == 53): 
+                eval_filenames  = [fname for fname in eval_filenames  for _ in range(n_aug)]
+
     else:
-        train_images = train_images if isinstance(train_images, torch.Tensor) else torch.stack(train_images)
-        train_labels = torch.tensor(train_labels, dtype=torch.long)
-        eval_images  = eval_images if isinstance(eval_images, torch.Tensor) else torch.stack(eval_images)        
-        eval_labels  = torch.tensor(eval_labels,  dtype=torch.long)
+        # Unsqueeze if the images are of shape (B, H, W) 
+        if len(train_images.shape) == 3:
+            train_images = train_images.unsqueeze(1)
+        if len(eval_images.shape) == 3:
+            eval_images = eval_images.unsqueeze(1)
+        if isinstance(train_images, (list, tuple)):
+            train_images = torch.stack(train_images)
+        if isinstance(train_labels, (list, tuple)):
+            train_labels = torch.tensor(train_labels, dtype=torch.long)
+        if isinstance(eval_images, (list, tuple)):
+            eval_images = torch.stack(eval_images)
+        if isinstance(eval_labels, (list, tuple)):
+            eval_labels = torch.tensor(eval_labels, dtype=torch.long)
         
     print("Shape of train_images returned from PSZ2:", train_images.shape)
-
     
-    if EXTRADATA:
+    if PRINTFILENAMES:
         return train_images, train_labels, eval_images, eval_labels, train_filenames, eval_filenames
+    elif EXTRADATA:
+        train_data = torch.tensor(np.stack(train_data), dtype=torch.float32)
+        eval_data  = torch.tensor(np.stack(eval_data),  dtype=torch.float32)
+        return train_images, train_labels, eval_images, eval_labels, train_data, eval_data
     
     
     return train_images, train_labels, eval_images, eval_labels

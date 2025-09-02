@@ -26,7 +26,7 @@ from sklearn.metrics import confusion_matrix
 import seaborn as sns
 import matplotlib 
 import matplotlib.pyplot as plt
-import sys, os, glob
+import sys, os, glob, re
 
 SEED = 42  # Set a seed for reproducibility
 def set_seed(seed):
@@ -46,7 +46,7 @@ os.makedirs('./classifier/trained_models_filtered', exist_ok=True)
 matplotlib.use('Agg')
 tqdm.pandas(disable=True)
 
-print("Running ht test with seed", SEED)
+print("Running test for rt with seed", SEED)
 
 
 #############################################
@@ -63,7 +63,7 @@ num_epochs_cpu = 100
 folds = [5]  # e.g., [1, 2, 3, 4, 5] for five-fold cross-validation
 max_num_galaxies = 1000000  # Upper limit for the all-classes combined training data before classical augmentation
 lambda_values = [0]  # Ratio between generated images and original images per class. 8 is reserfved for TRAINONGENERATED
-num_experiments = 1
+num_experiments = 3
 
 # pick exactly one classifier
 classifier        = ["TinyCNN",       # Very Simple CNN
@@ -87,11 +87,11 @@ param_grid = {
     'J':             [2],
     'L':             [12],
     'order':         [2],
-    'percentile_lo': [60, 70],   
-    'percentile_hi': [90, 95, 99], 
+    'percentile_lo': [1, 30, 60],   
+    'percentile_hi': [80, 90, 99], 
     'crop_size':     [(512,512)],
     'downsample_size':[(128,128)],
-    'versions':       [('raw', 'rt40')]  # 'raw', 'T50kpc', ad hoc tapering: e.g. 'rt50'  strings in list → product() iterates them individually
+    'versions':       ['rt25kpc']  # 'raw', 'T50kpc', ad hoc tapering: e.g. 'rt50'  strings in list → product() iterates them individually
 } #'versions': [('raw', 'rt50')]  # tuple signals “stack these”
 
 FLUX_CLIPPING = False  # Clip the flux of the images
@@ -162,47 +162,9 @@ if TRAINONGENERATED:
     lambda_values = [8]  # To identify and distinguish TRAINONGENERATED from other runs
     print("Using generated data for testing.")
 
-
 ########################################################################
 ##################### HELPER FUNCTIONS #################################
 ########################################################################
-
-def _synthetic_taper_header(raw_hdr, t50_hdr, t100_hdr, desired_kpc):
-    """
-    Build a minimal 'target header' dict with BMAJ/BMIN/BPA (in degrees)
-    for an arbitrary desired_kpc. We calibrate kpc/arcsec from an existing
-    T50 or T100 header if available; fall back to the other if one is missing.
-    We make the target beam circular (conservative) and never sharper than RAW.
-    """
-    # pull available calibrator
-    k_cal, hdr_cal = None, None
-    if t50_hdr is not None:
-        k_cal, hdr_cal = 50.0, t50_hdr
-    elif t100_hdr is not None:
-        k_cal, hdr_cal = 100.0, t100_hdr
-    else:
-        raise RuntimeError("No T50/T100 header available to calibrate kpc/arcsec for synthetic taper.")
-
-    # angular size (arcsec) that corresponded to the calibrator kpc
-    bmaj_cal_as = float(hdr_cal['BMAJ']*3600.0)
-    # kpc per arcsec from the calibrator
-    kpc_per_arcsec = k_cal / bmaj_cal_as
-
-    # desired target FWHM in arcsec for desired_kpc
-    theta_des_as = float(desired_kpc) / kpc_per_arcsec
-
-    # do not request a target finer than the raw beam
-    bmaj_raw_as = float(raw_hdr['BMAJ']*3600.0)
-    bmin_raw_as = float(raw_hdr['BMIN']*3600.0)
-    theta_des_as = max(theta_des_as, max(bmaj_raw_as, bmin_raw_as))
-
-    # make a circular target beam at theta_des_as
-    bmaj_deg = theta_des_as / 3600.0
-    bmin_deg = theta_des_as / 3600.0
-    bpa_deg  = float(raw_hdr.get('BPA', 0.0))  # arbitrary if circular
-
-    # return a tiny header-like mapping with keys your code expects
-    return {'BMAJ': bmaj_deg, 'BMIN': bmin_deg, 'BPA': bpa_deg}
 
 
 def _append_rt_versions(imgs, fns, gen_versions, labels=None):
@@ -358,9 +320,7 @@ def _kernel_from_headers(raw_hdr, targ_hdr, pixscale_arcsec):
 @lru_cache(maxsize=None)
 def _headers_for_name(base_name: str):
     """
-    Return (raw_hdr, t50_hdr, t100_hdr, pix_native_arcsec, raw_fits_path) for a cluster base.
-    Tries the canonical fits tree first; if a target header is missing there,
-    fall back to the classified T50/T100 files used by the loader.
+    Return (raw_hdr, t25_hdr, t50_hdr, t100_hdr, pix_native_arcsec, raw_fits_path)
     """
     base_dir = _first(f"{PSZ2_ROOT}/fits/{base_name}*") or f"{PSZ2_ROOT}/fits/{base_name}"
     raw_path = _first(f"{base_dir}/{os.path.basename(base_dir)}.fits") \
@@ -368,23 +328,28 @@ def _headers_for_name(base_name: str):
     if raw_path is None:
         raise FileNotFoundError(f"RAW FITS not found under {base_dir}")
 
-    # try to get taper headers from the same folder first
+    # look beside RAW first
+    t25_path  = _first(f"{base_dir}/{base_name}T25kpc*.fits")
     t50_path  = _first(f"{base_dir}/{base_name}T50kpc*.fits")
     t100_path = _first(f"{base_dir}/{base_name}T100kpc*.fits")
 
-    # robust fallbacks: use the very files the loader reads
+    # fallbacks to 'classified' trees
+    if t25_path is None:
+        t25_path = _first(f"{PSZ2_ROOT}/classified/T25kpc/*/{base_name}.fits") or \
+                   _first(f"{PSZ2_ROOT}/classified/T25kpcSUB/*/{base_name}.fits")
     if t50_path is None:
-        t50_path = _first(f"{PSZ2_ROOT}/classified/T50kpc/*/{base_name}.fits") \
-                or _first(f"{PSZ2_ROOT}/classified/T50kpcSUB/*/{base_name}.fits")
+        t50_path = _first(f"{PSZ2_ROOT}/classified/T50kpc/*/{base_name}.fits") or \
+                   _first(f"{PSZ2_ROOT}/classified/T50kpcSUB/*/{base_name}.fits")
     if t100_path is None:
-        t100_path = _first(f"{PSZ2_ROOT}/classified/T100kpc/*/{base_name}.fits") \
-                 or _first(f"{PSZ2_ROOT}/classified/T100kpcSUB/*/{base_name}.fits")
+        t100_path = _first(f"{PSZ2_ROOT}/classified/T100kpc/*/{base_name}.fits") or \
+                    _first(f"{PSZ2_ROOT}/classified/T100kpcSUB/*/{base_name}.fits")
 
     raw_hdr  = fits.getheader(raw_path)
+    t25_hdr  = fits.getheader(t25_path)  if t25_path  else None
     t50_hdr  = fits.getheader(t50_path)  if t50_path  else None
     t100_hdr = fits.getheader(t100_path) if t100_path else None
     pix_native = _pixscale_arcsec(raw_hdr)
-    return raw_hdr, t50_hdr, t100_hdr, pix_native, raw_path
+    return raw_hdr, t25_hdr, t50_hdr, t100_hdr, pix_native, raw_path
 
 
 def plot_raw_vs_fake_taper(raw_imgs, tapered_imgs, filenames, taper_mode,
@@ -474,13 +439,8 @@ def apply_taper_to_tensor(
     ref_sigma_map=None, bg_inner=64,
     debug_dir=None
 ):
-    import re
     mode = str(mode).lower()
-    _kpc = None
-    m = re.fullmatch(r'rt(\d+)(?:kpc)?', mode)
-    if m:
-        _kpc = int(m.group(1))      # e.g. rt75 → 75 kpc, rt40kpc → 40 kpc
-    want = None if _kpc is None else f'{_kpc}kpc'
+    want = {'rt25':'t25','rt50':'t50','rt100':'t100'}.get(mode)
     if want is None:
         # no tapering requested
         keep_mask = torch.ones(len(filenames), dtype=torch.bool)
@@ -492,30 +452,28 @@ def apply_taper_to_tensor(
 
     out, kept_fns, kept_flags, skipped = [], [], [], []
     for base in map(str, filenames):
-        raw_hdr, t50_hdr, t100_hdr, pix_native_as, raw_path = _headers_for_name(base)
+        raw_hdr, t25_hdr, t50_hdr, t100_hdr, pix_native_as, raw_path = _headers_for_name(base)
 
-        if _kpc is None:
-            # legacy: specific prebuilt tapers
-            targ_hdr = t50_hdr if mode == 'rt50' else (t100_hdr if mode == 'rt100' else None)
+        # Select target header based on the requested taper mode
+        targ_hdr = None
+        if want == 't25':
+            targ_hdr = t25_hdr
+        elif want == 't50':
+            targ_hdr = t50_hdr
+        elif want == 't100':
+            targ_hdr = t100_hdr
         else:
-            # synthetic: build a header for arbitrary kpc using whichever calibrator exists
-            try:
-                targ_hdr = _synthetic_taper_header(raw_hdr, t50_hdr, t100_hdr, desired_kpc=_kpc)
-            except Exception as e:
-                targ_hdr = None
+            targ_hdr = None
 
-        # skip if we still don't have a target
+        # existing guard:
         if targ_hdr is None:
-            skipped.append(base)
-            kept_flags.append(False)
-            continue
+            skipped.append(base); kept_flags.append(False); continue
 
         # 1) load RAW
         raw_native = np.squeeze(fits.getdata(raw_path)).astype(float)
         raw_native = np.nan_to_num(raw_native, copy=False)
 
-        # 2) PSF-match on the native grid (kernel guaranteed to exist conceptually,
-        #     but we still guard against numerical degeneracy)
+        # 2) Compute image-plane PSF kernel
         ker = _kernel_from_headers(raw_hdr, targ_hdr, pix_native_as)
         if ker is not None:
             matched = convolve_fft(raw_native, ker, boundary='fill', fill_value=0.0,
@@ -615,11 +573,11 @@ def initialize_metrics(metrics,
     # make a short stable string for each hyperparam
     cs = f"{crop[0]}x{crop[1]}"
     ds = f"{down[0]}x{down[1]}"
+
     key_base = (
     f"{model_name}"
     f"_ss{subset_size}"
     f"_f{fold}"
-    f"_e{experiment}"
     f"_lr{lr}"
     f"_reg{reg}"
     f"_lam{lam}"
@@ -627,10 +585,16 @@ def initialize_metrics(metrics,
     f"_ds{ds}"
     f"_ver{ver}"
     )
-    metrics[f"{key_base}_accuracy"]   = []
-    metrics[f"{key_base}_precision"]  = []
-    metrics[f"{key_base}_recall"]     = []
-    metrics[f"{key_base}_f1_score"]   = []
+    
+    for k in [
+        f"{key_base}_accuracy",
+        f"{key_base}_precision",
+        f"{key_base}_recall",
+        f"{key_base}_f1_score",
+    ]:
+        if k not in metrics:
+            metrics[k] = []
+
 
 def update_metrics(metrics,
                 model_name, subset_size, fold, experiment,
@@ -638,11 +602,11 @@ def update_metrics(metrics,
                 crop, down, ver):
     cs = f"{crop[0]}x{crop[1]}"
     ds = f"{down[0]}x{down[1]}"
+    
     key_base = (
     f"{model_name}"
     f"_ss{subset_size}"
     f"_f{fold}"
-    f"_e{experiment}"
     f"_lr{lr}"
     f"_reg{reg}"
     f"_lam{lam}"
@@ -650,6 +614,7 @@ def update_metrics(metrics,
     f"_ds{ds}"
     f"_ver{ver}"
     )
+
     metrics[f"{key_base}_accuracy"].append(accuracy)
     metrics[f"{key_base}_precision"].append(precision)
     metrics[f"{key_base}_recall"].append(recall)
@@ -723,38 +688,22 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
     img_shape = downsample_size
 
     # parse versions
-    import re
-
     def _split_versions(v):
         v = v if isinstance(v, (list, tuple)) else [v]
         v = [str(x).lower() for x in v]
-        # treat ANY rt<kpc> as runtime-taper
-        gen  = [x for x in v if re.fullmatch(r'rt\d+(?:kpc)?', x)]
-        load = [x for x in v if x not in gen]
+        gen, load = [], []
+        for x in v:
+            # accept rt25 / rt25kpc / RT25KPC, etc.
+            m = re.fullmatch(r'rt(\d+)(?:kpc)?', x)
+            if m:
+                gen.append(f"rt{m.group(1)}")
+            else:
+                load.append(x)
         return load, gen
 
-    def _norm_load(v):
-        # map to what your loader expects
-        m = {
-            'raw': 'RAW',
-            't50kpc': 'T50kpc',
-            't100kpc': 'T100kpc',
-            'full': 'FULL',
-            'clean': 'CLEAN',
-        }
-        s = str(v).lower()
-        return m.get(s, v)
 
     _load_versions, _gen_versions = _split_versions(versions)
-
-    # if the user only asked for runtime tapers, load RAW on disk
-    if len(_load_versions) == 0:
-        _versions_to_load = 'RAW'
-    elif len(_load_versions) == 1:
-        _versions_to_load = _norm_load(_load_versions[0])
-    else:
-        _versions_to_load = [_norm_load(v) for v in _load_versions]
-
+    _versions_to_load = _load_versions if _load_versions else ['raw']   # or ['RAW'] if your loader uses that
     print(f"_versions_to_load={_versions_to_load}, _gen_versions={_gen_versions}")
 
 
@@ -833,14 +782,13 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
         vae_latent_dim = 64
         
         _out  = load_galaxies(galaxy_classes=galaxy_classes,
-                    versions=_versions_to_load, 
+                    versions=_versions_to_load or ['raw'], 
                     fold=max(folds), #Any fold other than 5 gives me the test data for the five fold cross validation
                     crop_size=crop_size,
                     downsample_size=downsample_size,
                     sample_size=max_num_galaxies, 
                     REMOVEOUTLIERS=FILTERED,
                     BALANCE=BALANCE,           # Reduce the larger classes to the size of the smallest class
-                    FLUX_CLIPPING=FLUX_CLIPPING,
                     STRETCH=STRETCH,
                     percentile_lo=percentile_lo,  # Percentile stretch lower bound
                     percentile_hi=percentile_hi,  # Percentile stretch upper bound
@@ -956,7 +904,7 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                 train_labels = torch.empty((0,), dtype=torch.long, device=DEVICE)
                 _out = load_galaxies(
                     galaxy_classes=galaxy_classes,
-                    versions=_versions_to_load,
+                    versions=_versions_to_load or ['raw'],
                     fold=fold,
                     crop_size=crop_size,
                     downsample_size=downsample_size,
@@ -984,14 +932,13 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                 # real train + valid
                 _out = load_galaxies(
                     galaxy_classes=galaxy_classes,
-                    versions=_versions_to_load,
+                    versions=_versions_to_load or ['raw'],
                     fold=max(folds),
                     crop_size=crop_size,
                     downsample_size=downsample_size,
                     sample_size=max_num_galaxies, 
                     REMOVEOUTLIERS=FILTERED,
                     BALANCE=BALANCE,
-                    FLUX_CLIPPING=FLUX_CLIPPING,
                     STRETCH=STRETCH,
                     percentile_lo=percentile_lo,
                     percentile_hi=percentile_hi,
@@ -1261,7 +1208,7 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                         train_images_cls2.cpu(),
                         title1=f"Class {galaxy_classes[0]}",
                         title2=f"Class {galaxy_classes[1]}",
-                        save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_histogram.png"
+                        save_path=f"./classifier/test/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_histogram.png"
                     )
 
                     plot_background_histogram(
@@ -1269,7 +1216,7 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                         train_images_cls2.cpu(),        # shape (720, 1, 128, 128)
                         img_shape=(1, 128, 128),
                         title="Background histograms",
-                        save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_background_hist.png"
+                        save_path=f"./classifier/test/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_background_hist.png"
                     )
 
                     for cls in galaxy_classes:
@@ -1279,12 +1226,12 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                         plot_image_grid(
                             orig_imgs.cpu(),
                             num_images=36,
-                            save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_train_grid.png"
+                            save_path=f"./classifier/test/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_train_grid.png"
                         )
                         plot_image_grid(
                             test_imgs.cpu(),
                             num_images=36,
-                            save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_test_grid.png"
+                            save_path=f"./classifier/test/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_test_grid.png"
                         )
                         
                         if lambda_generate not in [0, 8]:
@@ -1293,21 +1240,21 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                             plot_image_grid(
                                 gen_imgs,
                                 num_images=36,
-                                save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_generated_grid.png"
+                                save_path=f"./classifier/test/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_generated_grid.png"
                             )
                             plot_histograms(
                                 gen_imgs,
                                 orig_imgs.cpu(),
                                 title1="Generated Images",
                                 title2="Train Images",
-                                save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_histogram.png"
+                                save_path=f"./classifier/test/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_histogram.png"
                             )
                             plot_background_histogram(
                                 orig_imgs,
                                 gen_imgs,
                                 img_shape=(1, 128, 128),
                                 title="Background histograms",
-                                save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_background_hist.png")
+                                save_path=f"./classifier/test/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_background_hist.png")
             
             if USE_CLASS_WEIGHTS:
                 unique, counts = np.unique(train_labels.cpu().numpy(), return_counts=True)
@@ -1330,7 +1277,7 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
             if fold in [0, 5] and SHOWIMGS:
                 imgs = train_images.detach().cpu().numpy()
                 lbls = (train_labels + min(galaxy_classes)).detach().cpu().numpy() # This is to match the original class labels
-                plot_images_by_class(imgs, labels=lbls, num_images=5, save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_example_train_data.pdf")
+                plot_images_by_class(imgs, labels=lbls, num_images=5, save_path=f"./classifier/test/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_example_train_data.pdf")
             
             # Prepare input data
             mock_tensor = torch.zeros_like(train_images)
@@ -1405,7 +1352,7 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
             if SHOWIMGS and lambda_generate not in [0, 8]: 
                 if classifier in ['TinyCNN', 'SCNN', 'CNNSqueezeNet', 'Rustige', 'ScatterSqueezeNet', 'ScatterSqueezeNet2', 'Binary']:
                     #save_images_tensorboard(generated_images[:36], save_path=f"./classifier/{gen_model_name}_{galaxy_classes}_generated.png", nrow=6)
-                    plot_histograms(pristine_train_images, valid_images, title1="Train images", title2="Valid images", imgs3=generated_images, imgs4=test_images, title3='Generated images', title4='Test images', save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_histograms.png")
+                    plot_histograms(pristine_train_images, valid_images, title1="Train images", title2="Valid images", imgs3=generated_images, imgs4=test_images, title3='Generated images', title4='Test images', save_path=f"./classifier/test/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_histograms.png")
 
             
             ###############################################
@@ -1728,11 +1675,27 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                                 for ax in axes[len(mis_images):]:
                                     ax.axis('off')
 
-                                out_path = f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_misclassified.png"
+                                out_path = f"./classifier/test/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_misclassified.png"
                                 fig.savefig(out_path, dpi=150, bbox_inches='tight')
                                 plt.close(fig)
 
 
+                    base = (
+                        f"{gen_model_name}"
+                        f"_ss{subset_size}"
+                        f"_f{fold}"
+                        f"_lr{lr}"
+                        f"_reg{reg}"
+                        f"_lam{lambda_generate}"
+                        f"_cs{crop_size[0]}x{crop_size[1]}"
+                        f"_ds{downsample_size[0]}x{downsample_size[1]}"
+                        f"_ver{ver_key}"
+                    )
+                    mean_acc = float(np.mean(metrics[f"{base}_accuracy"])) if metrics[f"{base}_accuracy"] else float('nan')
+                    mean_prec = float(np.mean(metrics[f"{base}_precision"])) if metrics[f"{base}_precision"] else float('nan')
+                    mean_rec = float(np.mean(metrics[f"{base}_recall"])) if metrics[f"{base}_recall"] else float('nan')
+                    mean_f1 = float(np.mean(metrics[f"{base}_f1_score"])) if metrics[f"{base}_f1_score"] else float('nan')
+                    print(f"Fold {fold}, Subset Size {subset_size}, Classifier {classifier_name}, AVERAGE over {num_experiments} experiments — Accuracy: {mean_acc:.4f}, Precision: {mean_prec:.4f}, Recall: {mean_rec:.4f}, F1 Score: {mean_f1:.4f}")
                     end_time = time.time()
                     elapsed_time = end_time - start_time
                     #training_times[subset_size][fold].append(elapsed_time)
@@ -1805,21 +1768,16 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
             pickle.dump(_clean, f)
         print(f"Summary metrics written to {summary_path}")         
 
-# ——— Rank all experiments by mean accuracy ———
+# ——— Rank configurations by mean accuracy across experiments ———
 rankings = []
-prefix = f"{gen_model_names[0]}_accuracy_"
 for key, vals in metrics.items():
-    if key.startswith(prefix):
-        mean_acc = float(np.mean(vals))
-        config = key[len(prefix):]               # strip off the “DDPM_accuracy_” prefix
-        rankings.append((mean_acc, config))
+    if key.endswith("_accuracy"):
+        mean_acc = float(np.mean(vals)) if vals else float("nan")
+        cfg = key[:-len("_accuracy")]           # drop the suffix
+        rankings.append((mean_acc, cfg))
 
-# sort descending
 rankings.sort(key=lambda x: x[0], reverse=True)
 
-# pretty‐print
 print("\nRanked configurations by mean accuracy:")
-for mean_acc, config in rankings:
-    # config format: "{subset}_{fold}_{experiment}_{lr}_{reg}_{lambda}"
-    subset, fold, exp, lr, reg, lam = config.split("_")
-    print(f"acc={mean_acc:.4f} — subset={subset}, fold={fold}, exp={exp}, lr={lr}, reg={reg}, λ={lam}")
+for mean_acc, cfg in rankings:
+    print(f"acc={mean_acc:.4f} — {cfg}")

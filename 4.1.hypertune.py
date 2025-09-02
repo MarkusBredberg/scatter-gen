@@ -77,7 +77,7 @@ classifier        = ["TinyCNN",       # Very Simple CNN
                      "ScatterSqueezeNet",
                      "ScatterSqueezeNet2",
                      "Binary",
-                     "ScatterResNet"][-5]
+                     "ScatterResNet"][-4]
 
 # Define every value you want to try
 param_grid = {
@@ -91,7 +91,7 @@ param_grid = {
     'percentile_hi': [80, 90, 99], 
     'crop_size':     [(512,512)],
     'downsample_size':[(128,128)],
-    'versions':       ['RAW']  # 'raw', 'T50kpc', ad hoc tapering: e.g. 'rt50'  strings in list → product() iterates them individually
+    'versions':       ['rt25kpc']  # 'raw', 'T50kpc', ad hoc tapering: e.g. 'rt50'  strings in list → product() iterates them individually
 } #'versions': [('raw', 'rt50')]  # tuple signals “stack these”
 
 FLUX_CLIPPING = False  # Clip the flux of the images
@@ -320,7 +320,7 @@ def _kernel_from_headers(raw_hdr, targ_hdr, pixscale_arcsec):
 @lru_cache(maxsize=None)
 def _headers_for_name(base_name: str):
     """
-    Return (raw_hdr, t50_hdr, t100_hdr, t25_hdr, pix_native_arcsec, raw_fits_path)
+    Return (raw_hdr, t25_hdr, t50_hdr, t100_hdr, pix_native_arcsec, raw_fits_path)
     """
     base_dir = _first(f"{PSZ2_ROOT}/fits/{base_name}*") or f"{PSZ2_ROOT}/fits/{base_name}"
     raw_path = _first(f"{base_dir}/{os.path.basename(base_dir)}.fits") \
@@ -785,7 +785,6 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                     sample_size=max_num_galaxies, 
                     REMOVEOUTLIERS=FILTERED,
                     BALANCE=BALANCE,           # Reduce the larger classes to the size of the smallest class
-                    FLUX_CLIPPING=FLUX_CLIPPING,
                     STRETCH=STRETCH,
                     percentile_lo=percentile_lo,  # Percentile stretch lower bound
                     percentile_hi=percentile_hi,  # Percentile stretch upper bound
@@ -936,7 +935,6 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                     sample_size=max_num_galaxies, 
                     REMOVEOUTLIERS=FILTERED,
                     BALANCE=BALANCE,
-                    FLUX_CLIPPING=FLUX_CLIPPING,
                     STRETCH=STRETCH,
                     percentile_lo=percentile_lo,
                     percentile_hi=percentile_hi,

@@ -26,7 +26,7 @@ from sklearn.metrics import confusion_matrix
 import seaborn as sns
 import matplotlib 
 import matplotlib.pyplot as plt
-import sys, os, glob
+import sys, os, glob, re
 
 SEED = 42  # Set a seed for reproducibility
 def set_seed(seed):
@@ -63,7 +63,7 @@ num_epochs_cpu = 100
 folds = [5]  # e.g., [1, 2, 3, 4, 5] for five-fold cross-validation
 max_num_galaxies = 1000000  # Upper limit for the all-classes combined training data before classical augmentation
 lambda_values = [0]  # Ratio between generated images and original images per class. 8 is reserfved for TRAINONGENERATED
-num_experiments = 1
+num_experiments = 3
 
 # pick exactly one classifier
 classifier        = ["TinyCNN",       # Very Simple CNN
@@ -87,15 +87,16 @@ param_grid = {
     'J':             [2],
     'L':             [12],
     'order':         [2],
-    'percentile_lo': [60, 70],   
-    'percentile_hi': [90, 95, 99], 
+    'percentile_lo': [1, 30, 60],   
+    'percentile_hi': [80, 90, 99], 
     'crop_size':     [(512,512)],
     'downsample_size':[(128,128)],
-    'versions':       ['50kpcSUB']  # 'raw', 'T50kpc', ad hoc tapering: e.g. 'rt50'  strings in list → product() iterates them individually
+    'versions':       ['rt25kpc']  # 'raw', 'T50kpc', ad hoc tapering: e.g. 'rt50'  strings in list → product() iterates them individually
 } #'versions': [('raw', 'rt50')]  # tuple signals “stack these”
 
-FLUX_CLIPPING = False  # Clip the flux of the images
-STRETCH = True  # Stretch the images with mathematical morphology
+STRETCH = True  # Arcsinh stretch
+USE_GLOBAL_NORMALISATION = False           # single on/off switch . False - image-by-image normalisation 
+GLOBAL_NORM_MODE = "percentile"           # "percentile" or "flux"
 ES, patience = True, 10  # Use early stopping
 SCHEDULER = False  # Use a learning rate scheduler
 SHOWIMGS = False  # Show some generated images for each class (Tool for control)
@@ -162,13 +163,71 @@ if TRAINONGENERATED:
     lambda_values = [8]  # To identify and distinguish TRAINONGENERATED from other runs
     print("Using generated data for testing.")
 
-
 ########################################################################
 ##################### HELPER FUNCTIONS #################################
 ########################################################################
 
+def _taper_header_for_size(base_name: str, kpc: int):
+    """
+    Find and return the FITS header for a target runtime-taper size T{kpc}kpc.
+    Searches beside the RAW file first, then in classified trees, mirroring the fixed-size logic.
+    Returns None if not found.
+    """
+    base_dir = _first(f"{PSZ2_ROOT}/fits/{base_name}*") or f"{PSZ2_ROOT}/fits/{base_name}"
+    cand = _first(f"{base_dir}/{base_name}T{kpc}kpc*.fits")
+    if cand is None:
+        cand = (_first(f"{PSZ2_ROOT}/classified/T{kpc}kpc/*/{base_name}.fits")
+                or _first(f"{PSZ2_ROOT}/classified/T{kpc}kpcSUB/*/{base_name}.fits"))
+    return fits.getheader(cand) if cand else None
 
-def _append_rt_versions(imgs, fns, gen_versions, labels=None, ref_sigma_map=None, bg_inner=64):
+def _scale_hdr(hdr, factor):
+    if hdr is None:
+        return None
+    maj = float(hdr['BMAJ']) * factor
+    min_ = float(hdr['BMIN']) * factor
+    pa = float(hdr.get('BPA', 0.0))
+    out = fits.Header()
+    out['BMAJ'] = maj
+    out['BMIN'] = min_
+    out['BPA']  = pa
+    return out
+
+def _interp_hdr(h1, h2, t):
+    if h1 is None or h2 is None:
+        return None
+    maj  = (1 - t) * float(h1['BMAJ']) + t * float(h2['BMAJ'])
+    min_ = (1 - t) * float(h1['BMIN']) + t * float(h2['BMIN'])
+    pa1 = float(h1.get('BPA', 0.0))
+    pa2 = float(h2.get('BPA', pa1))
+    d = ((pa2 - pa1 + 180) % 360) - 180  # shortest‐arc interpolation
+    pa  = pa1 + t * d
+    out = fits.Header()
+    out['BMAJ'] = maj
+    out['BMIN'] = min_
+    out['BPA']  = pa
+    return out
+
+def _synthesize_targ_hdr(want_kpc, t25_hdr, t50_hdr, t100_hdr):
+    pairs = []
+    if t25_hdr  is not None: pairs.append((25,  t25_hdr))
+    if t50_hdr  is not None: pairs.append((50,  t50_hdr))
+    if t100_hdr is not None: pairs.append((100, t100_hdr))
+    if not pairs:
+        return None
+    pairs.sort(key=lambda x: x[0])
+    if want_kpc <= pairs[0][0]:
+        k0, h0 = pairs[0]
+        return _scale_hdr(h0, want_kpc / float(k0))
+    if want_kpc >= pairs[-1][0]:
+        k1, h1 = pairs[-1]
+        return _scale_hdr(h1, want_kpc / float(k1))
+    for (k1, h1), (k2, h2) in zip(pairs, pairs[1:]):
+        if k1 <= want_kpc <= k2:
+            t = (want_kpc - k1) / (k2 - k1)
+            return _interp_hdr(h1, h2, t)
+    return None
+
+def _append_rt_versions(imgs, fns, gen_versions, labels=None):
     """
     Append runtime-tapered planes to the loaded images and drop samples
     that are missing any requested taper.
@@ -206,8 +265,7 @@ def _append_rt_versions(imgs, fns, gen_versions, labels=None, ref_sigma_map=None
             crop_size=crop_size,
             downsample_size=downsample_size,
             percentile_lo=percentile_lo, percentile_hi=percentile_hi,
-            do_stretch=STRETCH, use_asinh=True,
-            ref_sigma_map=ref_sigma_map, bg_inner=bg_inner
+            do_stretch=STRETCH
         )
         kept_sets[gv] = set(kept_fns)
         removed_by_version[gv] = len(skipped)
@@ -262,7 +320,6 @@ def _append_rt_versions(imgs, fns, gen_versions, labels=None, ref_sigma_map=None
         print(f"[rt-append] No taper versions requested. Kept all {B} samples.")
 
     return imgs_out, labels_kept, fns_kept, info
-
 
 def _first(pattern: str):
     hits = sorted(glob.glob(pattern))
@@ -322,9 +379,7 @@ def _kernel_from_headers(raw_hdr, targ_hdr, pixscale_arcsec):
 @lru_cache(maxsize=None)
 def _headers_for_name(base_name: str):
     """
-    Return (raw_hdr, t50_hdr, t100_hdr, pix_native_arcsec, raw_fits_path) for a cluster base.
-    Tries the canonical fits tree first; if a target header is missing there,
-    fall back to the classified T50/T100 files used by the loader.
+    Return (raw_hdr, t25_hdr, t50_hdr, t100_hdr, pix_native_arcsec, raw_fits_path)
     """
     base_dir = _first(f"{PSZ2_ROOT}/fits/{base_name}*") or f"{PSZ2_ROOT}/fits/{base_name}"
     raw_path = _first(f"{base_dir}/{os.path.basename(base_dir)}.fits") \
@@ -332,23 +387,28 @@ def _headers_for_name(base_name: str):
     if raw_path is None:
         raise FileNotFoundError(f"RAW FITS not found under {base_dir}")
 
-    # try to get taper headers from the same folder first
+    # look beside RAW first
+    t25_path  = _first(f"{base_dir}/{base_name}T25kpc*.fits")
     t50_path  = _first(f"{base_dir}/{base_name}T50kpc*.fits")
     t100_path = _first(f"{base_dir}/{base_name}T100kpc*.fits")
 
-    # robust fallbacks: use the very files the loader reads
+    # fallbacks to 'classified' trees
+    if t25_path is None:
+        t25_path = _first(f"{PSZ2_ROOT}/classified/T25kpc/*/{base_name}.fits") or \
+                   _first(f"{PSZ2_ROOT}/classified/T25kpcSUB/*/{base_name}.fits")
     if t50_path is None:
-        t50_path = _first(f"{PSZ2_ROOT}/classified/T50kpc/*/{base_name}.fits") \
-                or _first(f"{PSZ2_ROOT}/classified/T50kpcSUB/*/{base_name}.fits")
+        t50_path = _first(f"{PSZ2_ROOT}/classified/T50kpc/*/{base_name}.fits") or \
+                   _first(f"{PSZ2_ROOT}/classified/T50kpcSUB/*/{base_name}.fits")
     if t100_path is None:
-        t100_path = _first(f"{PSZ2_ROOT}/classified/T100kpc/*/{base_name}.fits") \
-                 or _first(f"{PSZ2_ROOT}/classified/T100kpcSUB/*/{base_name}.fits")
+        t100_path = _first(f"{PSZ2_ROOT}/classified/T100kpc/*/{base_name}.fits") or \
+                    _first(f"{PSZ2_ROOT}/classified/T100kpcSUB/*/{base_name}.fits")
 
     raw_hdr  = fits.getheader(raw_path)
+    t25_hdr  = fits.getheader(t25_path)  if t25_path  else None
     t50_hdr  = fits.getheader(t50_path)  if t50_path  else None
     t100_hdr = fits.getheader(t100_path) if t100_path else None
     pix_native = _pixscale_arcsec(raw_hdr)
-    return raw_hdr, t50_hdr, t100_hdr, pix_native, raw_path
+    return raw_hdr, t25_hdr, t50_hdr, t100_hdr, pix_native, raw_path
 
 
 def plot_raw_vs_fake_taper(raw_imgs, tapered_imgs, filenames, taper_mode,
@@ -439,9 +499,9 @@ def apply_taper_to_tensor(
     debug_dir=None
 ):
     mode = str(mode).lower()
-    want = {'rt25':'t25','rt50':'t50','rt100':'t100'}.get(mode)
-    if want is None:
-        # no tapering requested
+    m = re.fullmatch(r'rt(\d+)', mode)
+    want_kpc = int(m.group(1)) if m else None
+    if want_kpc is None:
         keep_mask = torch.ones(len(filenames), dtype=torch.bool)
         return (imgs if imgs.dim()==4 else imgs.unsqueeze(1)), keep_mask, list(map(str, filenames)), []
 
@@ -451,58 +511,58 @@ def apply_taper_to_tensor(
 
     out, kept_fns, kept_flags, skipped = [], [], [], []
     for base in map(str, filenames):
-        raw_hdr, t50_hdr, t100_hdr, pix_native_as, raw_path = _headers_for_name(base)
+        # NOTE: your _headers_for_name returns in this order:
+        raw_hdr, t25_hdr, t50_hdr, t100_hdr, pix_native_as, raw_path = _headers_for_name(base)
 
-        # Select target header based on the requested taper mode
-        targ_hdr = None
-        if want == 't25':
-            t25_path = (
-                _first(f"{PSZ2_ROOT}/fits/{base}/{base}T25kpc*.fits")
-                or _first(f"{PSZ2_ROOT}/classified/T25kpc/*/{base}.fits")
-                or _first(f"{PSZ2_ROOT}/classified/T25kpcSUB/*/{base}.fits")
-            )
-            targ_hdr = fits.getheader(t25_path) if t25_path else None
-        elif want == 't50':
-            targ_hdr = t50_hdr
-        elif want == 't100':
-            targ_hdr = t100_hdr
+        # Choose (or synthesize) the target header
+        if   want_kpc == 25:   targ_hdr = t25_hdr
+        elif want_kpc == 50:   targ_hdr = t50_hdr
+        elif want_kpc == 100:  targ_hdr = t100_hdr
+        else:
+            # off-grid: try exact file first, then synthesize
+            targ_hdr = _taper_header_for_size(base, want_kpc)
+            if targ_hdr is None:
+                targ_hdr = _synthesize_targ_hdr(want_kpc, t25_hdr, t50_hdr, t100_hdr)
 
-        # existing guard:
-        if targ_hdr is None:
-            skipped.append(base); kept_flags.append(False); continue
+        # —— enforce parity with fixed sets ——
+        if want_kpc in (25, 50, 100):
+            # exact parity: require that exact fixed header exists
+            if targ_hdr is None:
+                skipped.append(base); kept_flags.append(False); continue
+        else:
+            # off-grid: require that the source *has* a redshift (at least one fixed header present)
+            if (t25_hdr is None) and (t50_hdr is None) and (t100_hdr is None):
+                skipped.append(base); kept_flags.append(False); continue
+            if targ_hdr is None:
+                # could not synthesize even though some fixed headers exist → skip
+                skipped.append(base); kept_flags.append(False); continue
 
-        # 1) load RAW
+        # 1) Load RAW
         raw_native = np.squeeze(fits.getdata(raw_path)).astype(float)
         raw_native = np.nan_to_num(raw_native, copy=False)
 
-        # 2) Compute image-plane PSF kernel
+        # 2) PSF kernel; if it degenerates, skip (no raw-through)
         ker = _kernel_from_headers(raw_hdr, targ_hdr, pix_native_as)
-        if ker is not None:
-            matched = convolve_fft(raw_native, ker, boundary='fill', fill_value=0.0,
-                                   nan_treatment='interpolate', normalize_kernel=True)
-            matched = np.nan_to_num(matched, copy=False)
-        else:
-            # If kernel collapses numerically, also skip to avoid raw-through
-            skipped.append(base)
-            kept_flags.append(False)
-            continue
+        if ker is None:
+            skipped.append(base); kept_flags.append(False); continue
+
+        matched = convolve_fft(raw_native, ker, boundary='fill', fill_value=0.0,
+                               nan_treatment='interpolate', normalize_kernel=True)
+        matched = np.nan_to_num(matched, copy=False)
 
         # 3) center-crop + resize
-        t = torch.from_numpy(matched).float().unsqueeze(0)  # [1,H,W]
+        t = torch.from_numpy(matched).float().unsqueeze(0)
         formatted = apply_formatting(t, crop_size=(1, crop_size[-2], crop_size[-1]),
                                      downsample_size=(1, Hout, Wout)).squeeze(0)
 
         # 4) percentile stretch
-        if do_stretch:
-            stretched = _per_image_percentile_stretch(formatted.squeeze(0), percentile_lo, percentile_hi).unsqueeze(0)
-        else:
-            stretched = formatted
+        stretched = _per_image_percentile_stretch(formatted.squeeze(0), percentile_lo, percentile_hi).unsqueeze(0) if do_stretch else formatted
 
-        # 5) asinh (if mirroring loader)
+        # 5) asinh
         if use_asinh:
             stretched = torch.asinh(10.0 * stretched) / math.asinh(10.0)
 
-        # 6) noise-match to reference σ (background only)
+        # 6) optional noise-match
         if ref_sigma_map is not None and base in ref_sigma_map:
             mask = _background_ring_mask(Hout, Wout, inner=bg_inner)
             sig_fake = _robust_sigma(stretched.squeeze(0)[mask])
@@ -518,23 +578,18 @@ def apply_taper_to_tensor(
         kept_fns.append(base)
         kept_flags.append(True)
 
-        # 7) optional quick diagnostics
         if debug_dir:
             os.makedirs(debug_dir, exist_ok=True)
             fig, ax = plt.subplots(1,2, figsize=(6,3))
-            ax[0].imshow(formatted.squeeze(0), cmap='viridis', origin='lower')
-            ax[0].set_title('PSF-matched'); ax[0].axis('off')
-            ax[1].imshow(stretched.squeeze(0), cmap='viridis', origin='lower')
-            ax[1].set_title('final'); ax[1].axis('off')
+            ax[0].imshow(formatted.squeeze(0), cmap='viridis', origin='lower'); ax[0].axis('off'); ax[0].set_title('PSF-matched')
+            ax[1].imshow(stretched.squeeze(0), cmap='viridis', origin='lower'); ax[1].axis('off'); ax[1].set_title('final')
             fig.suptitle(base); fig.tight_layout()
-            fig.savefig(os.path.join(debug_dir, f"{base}_{want}.png"), dpi=140)
+            fig.savefig(os.path.join(debug_dir, f"{base}_rt{want_kpc}.png"), dpi=140)
             plt.close(fig)
 
     keep_mask = torch.tensor(kept_flags, dtype=torch.bool)
-    out = torch.stack(out, dim=0).to(device=device, dtype=dtype) if out else \
-          torch.empty((0,1,Hout,Wout), device=device, dtype=dtype)
+    out = torch.stack(out, dim=0).to(device=device, dtype=dtype) if out else torch.empty((0,1,Hout,Wout), device=device, dtype=dtype)
     return out, keep_mask, kept_fns, skipped
-
 
 
 
@@ -575,11 +630,11 @@ def initialize_metrics(metrics,
     # make a short stable string for each hyperparam
     cs = f"{crop[0]}x{crop[1]}"
     ds = f"{down[0]}x{down[1]}"
+
     key_base = (
     f"{model_name}"
     f"_ss{subset_size}"
     f"_f{fold}"
-    f"_e{experiment}"
     f"_lr{lr}"
     f"_reg{reg}"
     f"_lam{lam}"
@@ -587,10 +642,16 @@ def initialize_metrics(metrics,
     f"_ds{ds}"
     f"_ver{ver}"
     )
-    metrics[f"{key_base}_accuracy"]   = []
-    metrics[f"{key_base}_precision"]  = []
-    metrics[f"{key_base}_recall"]     = []
-    metrics[f"{key_base}_f1_score"]   = []
+    
+    for k in [
+        f"{key_base}_accuracy",
+        f"{key_base}_precision",
+        f"{key_base}_recall",
+        f"{key_base}_f1_score",
+    ]:
+        if k not in metrics:
+            metrics[k] = []
+
 
 def update_metrics(metrics,
                 model_name, subset_size, fold, experiment,
@@ -598,11 +659,11 @@ def update_metrics(metrics,
                 crop, down, ver):
     cs = f"{crop[0]}x{crop[1]}"
     ds = f"{down[0]}x{down[1]}"
+    
     key_base = (
     f"{model_name}"
     f"_ss{subset_size}"
     f"_f{fold}"
-    f"_e{experiment}"
     f"_lr{lr}"
     f"_reg{reg}"
     f"_lam{lam}"
@@ -610,6 +671,7 @@ def update_metrics(metrics,
     f"_ds{ds}"
     f"_ver{ver}"
     )
+
     metrics[f"{key_base}_accuracy"].append(accuracy)
     metrics[f"{key_base}_precision"].append(precision)
     metrics[f"{key_base}_recall"].append(recall)
@@ -664,9 +726,9 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
     
     print(f"\n▶ Experiment: g_classes={galaxy_classes}, lr={lr}, reg={reg}, ls={ls}, "
         f"J={J}, L={L}, crop={crop_size}, down={downsample_size}, ver={versions}, "
-        f"lo={percentile_lo}, hi={percentile_hi}, flux_clipping={FLUX_CLIPPING}, "
-        f"classifier={classifier} ◀\n")
-    
+        f"lo={percentile_lo}, hi={percentile_hi}, classifier={classifier}, "
+        f"global_norm={USE_GLOBAL_NORMALISATION}, norm_mode={GLOBAL_NORM_MODE} ◀\n")
+
     if any (cls in galaxy_classes for cls in [10, 11, 12, 13]):
         crop_size = (128, 128)  # Crop size for the images
         downsample_size = (128, 128)  # Downsample size for the images
@@ -686,9 +748,15 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
     def _split_versions(v):
         v = v if isinstance(v, (list, tuple)) else [v]
         v = [str(x).lower() for x in v]
-        gen = [x for x in v if x in ('rt25', 'rt50', 'rt100')]
-        load = [x for x in v if x not in gen]
+        gen, load = [], []
+        for x in v:
+            m = re.fullmatch(r'rt(\d+)(?:kpc)?', x)
+            if m:
+                gen.append(f"rt{m.group(1)}")
+            else:
+                load.append(x)
         return load, gen
+
 
     _load_versions, _gen_versions = _split_versions(versions)
     _versions_to_load = _load_versions if _load_versions else ['raw']   # or ['RAW'] if your loader uses that
@@ -721,6 +789,7 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
             return "+".join(map(str, v))
         return str(v)
     ver_key = _verkey(versions)
+
 
     ###############################################
     ########## INITIALIZE DICTIONARIES ############
@@ -777,13 +846,14 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                     sample_size=max_num_galaxies, 
                     REMOVEOUTLIERS=FILTERED,
                     BALANCE=BALANCE,           # Reduce the larger classes to the size of the smallest class
-                    FLUX_CLIPPING=FLUX_CLIPPING,
                     STRETCH=STRETCH,
                     percentile_lo=percentile_lo,  # Percentile stretch lower bound
                     percentile_hi=percentile_hi,  # Percentile stretch upper bound
                     AUGMENT=not LATE_AUG,
                     NORMALISE=NORMALISEIMGS,
                     NORMALISETOPM=NORMALISEIMGSTOPM,
+                    USE_GLOBAL_NORMALISATION=USE_GLOBAL_NORMALISATION,
+                    GLOBAL_NORM_MODE=GLOBAL_NORM_MODE,
                     PRINTFILENAMES=PRINTFILENAMES,
                     train=False)
 
@@ -806,12 +876,7 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
         if _gen_versions:
             if test_fns is None:
                 raise RuntimeError("versions includes rt*, but filenames were not returned. Set PRINTFILENAMES=True.")
-            ref_sigma_map_test = build_ref_sigma_map(test_images, test_fns, inner=64)
-            test_images, test_labels, test_fns, info_test = _append_rt_versions(
-                test_images, test_fns, _gen_versions,
-                labels=test_labels, ref_sigma_map=ref_sigma_map_test, bg_inner=64
-            )
-
+            test_images, test_labels, test_fns, info_test = _append_rt_versions(test_images, test_fns, _gen_versions, labels=test_labels)
             print(f"[TEST] dropped {info_test['removed_total']} (kept {info_test['kept']}/{info_test['initial']})")
             if REPLACE_WITH_RT:
                 test_images = test_images[:, 1:2]  # keep only the runtime-tapered plane
@@ -876,6 +941,54 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
             test_dataset = TensorDataset(test_images, mock_tensor, test_labels)
                                 
         test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=custom_collate, drop_last=False)
+        
+        # --- PSF matching for the test/eval set only (RAW → rtXX) ---
+        if _gen_versions:
+            if test_fns is None:
+                raise RuntimeError("versions includes rt*, but filenames were not returned. Set PRINTFILENAMES=True.")
+            # append runtime-tapered planes (and drop samples missing the target taper)
+            test_images, test_labels, test_fns, info_test = _append_rt_versions(
+                test_images, test_fns, _gen_versions, labels=test_labels
+            )
+            print(f"[TEST] dropped {info_test['removed_total']} (kept {info_test['kept']}/{info_test['initial']})")
+
+            if REPLACE_WITH_RT:
+                # keep only the RT plane
+                test_images = test_images[:, 1:2]
+                print(f"[TEST] after replacing with RT: {test_images.size(0)} images")
+
+            # (optional) parity vs fixed T25kpc — do this BEFORE augmentation
+            ASSERT_PARITY = True  # set False to skip the T25kpc parity assertion
+            if ASSERT_PARITY and _gen_versions == ['rt25']:
+                _out_fixed = load_galaxies(
+                    galaxy_classes=galaxy_classes,
+                    versions=['T25kpc'],
+                    fold=max(folds),
+                    crop_size=crop_size,
+                    downsample_size=downsample_size,
+                    sample_size=max_num_galaxies,
+                    REMOVEOUTLIERS=FILTERED,
+                    BALANCE=BALANCE,
+                    STRETCH=STRETCH,
+                    percentile_lo=percentile_lo,
+                    percentile_hi=percentile_hi,
+                    AUGMENT=False,
+                    NORMALISE=NORMALISEIMGS,
+                    NORMALISETOPM=NORMALISEIMGSTOPM,
+                    PRINTFILENAMES=PRINTFILENAMES,
+                    USE_GLOBAL_NORMALISATION=USE_GLOBAL_NORMALISATION,
+                    GLOBAL_NORM_MODE=GLOBAL_NORM_MODE,
+                    train=False
+                )
+                _, _, t25_test_images, _ = _out_fixed[:4]
+                assert test_images.size(0) == t25_test_images.size(0), \
+                    f"rt25 kept {test_images.size(0)} but T25kpc has {t25_test_images.size(0)}"
+
+            # augment test after parity check for fairness
+            if LATE_AUG:
+                test_images, test_labels, test_fns = late_augment(test_images, test_labels, test_fns)
+                print(f"[TEST] after late augmentation: {test_images.size(0)} images")
+
 
         ###############################################
         ########### LOOP OVER DATA FOLD ###############
@@ -908,6 +1021,8 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                     AUGMENT=False,   
                     NORMALISE=NORMALISEIMGS,
                     NORMALISETOPM=NORMALISEIMGSTOPM,
+                    USE_GLOBAL_NORMALISATION=USE_GLOBAL_NORMALISATION,
+                    GLOBAL_NORM_MODE=GLOBAL_NORM_MODE,
                     train=True)
                 
                 if len(_out) == 4:
@@ -933,13 +1048,14 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                     sample_size=max_num_galaxies, 
                     REMOVEOUTLIERS=FILTERED,
                     BALANCE=BALANCE,
-                    FLUX_CLIPPING=FLUX_CLIPPING,
                     STRETCH=STRETCH,
                     percentile_lo=percentile_lo,
                     percentile_hi=percentile_hi,
                     AUGMENT=not LATE_AUG,
                     NORMALISE=NORMALISEIMGS,
                     NORMALISETOPM=NORMALISEIMGSTOPM,
+                    USE_GLOBAL_NORMALISATION=USE_GLOBAL_NORMALISATION,
+                    GLOBAL_NORM_MODE=GLOBAL_NORM_MODE,
                     PRINTFILENAMES=PRINTFILENAMES,
                     train=True)
 
@@ -963,16 +1079,9 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                     if _gen_versions:
                         if train_fns is None or valid_fns is None:
                             raise RuntimeError("versions includes rt*, but train/valid filenames were not returned.")
-                        ref_sigma_map_train = build_ref_sigma_map(train_images, train_fns, inner=64)
-                        ref_sigma_map_valid = build_ref_sigma_map(valid_images, valid_fns, inner=64)
-                        train_images, train_labels, train_fns, info_tr = _append_rt_versions(
-                            train_images, train_fns, _gen_versions,
-                            labels=train_labels, ref_sigma_map=ref_sigma_map_train, bg_inner=64
-                        )
-                        valid_images, valid_labels, valid_fns, info_va = _append_rt_versions(
-                            valid_images, valid_fns, _gen_versions,
-                            labels=valid_labels, ref_sigma_map=ref_sigma_map_valid, bg_inner=64
-                        )
+                        
+                        train_images, train_labels, train_fns, info_tr = _append_rt_versions(train_images, train_fns, _gen_versions, labels=train_labels)
+                        valid_images, valid_labels, valid_fns, info_va = _append_rt_versions(valid_images, valid_fns, _gen_versions, labels=valid_labels)
                         print(f"[TRAIN] dropped {info_tr['removed_total']} (kept {info_tr['kept']}/{info_tr['initial']})")
                         print(f"[VALID] dropped {info_va['removed_total']} (kept {info_va['kept']}/{info_va['initial']})")
                         
@@ -1682,6 +1791,22 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                                 plt.close(fig)
 
 
+                    base = (
+                        f"{gen_model_name}"
+                        f"_ss{subset_size}"
+                        f"_f{fold}"
+                        f"_lr{lr}"
+                        f"_reg{reg}"
+                        f"_lam{lambda_generate}"
+                        f"_cs{crop_size[0]}x{crop_size[1]}"
+                        f"_ds{downsample_size[0]}x{downsample_size[1]}"
+                        f"_ver{ver_key}"
+                    )
+                    mean_acc = float(np.mean(metrics[f"{base}_accuracy"])) if metrics[f"{base}_accuracy"] else float('nan')
+                    mean_prec = float(np.mean(metrics[f"{base}_precision"])) if metrics[f"{base}_precision"] else float('nan')
+                    mean_rec = float(np.mean(metrics[f"{base}_recall"])) if metrics[f"{base}_recall"] else float('nan')
+                    mean_f1 = float(np.mean(metrics[f"{base}_f1_score"])) if metrics[f"{base}_f1_score"] else float('nan')
+                    print(f"Fold {fold}, Subset Size {subset_size}, Classifier {classifier_name}, AVERAGE over {num_experiments} experiments — Accuracy: {mean_acc:.4f}, Precision: {mean_prec:.4f}, Recall: {mean_rec:.4f}, F1 Score: {mean_f1:.4f}")
                     end_time = time.time()
                     elapsed_time = end_time - start_time
                     #training_times[subset_size][fold].append(elapsed_time)
@@ -1754,21 +1879,16 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
             pickle.dump(_clean, f)
         print(f"Summary metrics written to {summary_path}")         
 
-# ——— Rank all experiments by mean accuracy ———
+# ——— Rank configurations by mean accuracy across experiments ———
 rankings = []
-prefix = f"{gen_model_names[0]}_accuracy_"
 for key, vals in metrics.items():
-    if key.startswith(prefix):
-        mean_acc = float(np.mean(vals))
-        config = key[len(prefix):]               # strip off the “DDPM_accuracy_” prefix
-        rankings.append((mean_acc, config))
+    if key.endswith("_accuracy"):
+        mean_acc = float(np.mean(vals)) if vals else float("nan")
+        cfg = key[:-len("_accuracy")]           # drop the suffix
+        rankings.append((mean_acc, cfg))
 
-# sort descending
 rankings.sort(key=lambda x: x[0], reverse=True)
 
-# pretty‐print
 print("\nRanked configurations by mean accuracy:")
-for mean_acc, config in rankings:
-    # config format: "{subset}_{fold}_{experiment}_{lr}_{reg}_{lambda}"
-    subset, fold, exp, lr, reg, lam = config.split("_")
-    print(f"acc={mean_acc:.4f} — subset={subset}, fold={fold}, exp={exp}, lr={lr}, reg={reg}, λ={lam}")
+for mean_acc, cfg in rankings:
+    print(f"acc={mean_acc:.4f} — {cfg}")

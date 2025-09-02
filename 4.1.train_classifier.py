@@ -26,7 +26,7 @@ from sklearn.metrics import confusion_matrix
 import seaborn as sns
 import matplotlib 
 import matplotlib.pyplot as plt
-import sys, os, glob
+import sys, os, glob, re
 
 SEED = 42  # Set a seed for reproducibility
 def set_seed(seed):
@@ -58,7 +58,7 @@ print("Running script 4.1 Latest version with seed", SEED)
 classes = get_classes()
 galaxy_classes = [50, 51]  # Classes to classify
 max_num_galaxies = 1000000  # Upper limit for the all-classes combined training data before classical augmentation
-dataset_portions = [0.01, 0.1, 1]  # Portions of complete dataset for the accuracy vs dataset size
+dataset_portions = [1]  # Portions of complete dataset for the accuracy vs dataset size
 J, L, order = 2, 12, 2  # Scatter transform parameters
 classifier = ["TinyCNN", # Very Simple CNN
               "Rustige", # Simple CNN from Rustige et al. 2023, https://github.com/floriangriese/wGAN-supported-augmentation/blob/main/src/Classifiers/SimpleClassifiers/Classifiers.py
@@ -70,20 +70,21 @@ classifier = ["TinyCNN", # Very Simple CNN
               "ScatterNet", "ScatterSqueezeNet", "ScatterSqueezeNet2",
               "Binary", "ScatterResNet"][-4]
 gen_model_names = ['DDPM'] #['ST', 'DDPM', 'wGAN', 'GAN', 'Dual', 'CNN', 'STMLP', 'lavgSTMLP', 'ldiffSTMLP'] # Specify the generative model_name
-num_epochs_cuda = 200
-num_epochs_cpu = 100
+label_smoothing = 0  # Label smoothing for the classifier
+num_experiments = 5
 learning_rates = [1e-3]  # Learning rates
 regularization_params = [1e-3]  # Regularisation parameters
-label_smoothing = 0  # Label smoothing for the classifier
-num_experiments = 100
-folds = [5] # 0-4 for 5-fold cross validation, 5 for only one training
-lambda_values = [0]  # Ratio between generated images and original images per class. 8 is reserfved for TRAINONGENERATED
 percentile_lo = 30 # Percentile stretch lower bound
 percentile_hi = 99  # Percentile stretch upper bound
-versions = ['raw']  # any mix of loadable and runtime-tapered planes. 'rt50' or 'rt100' for tapering. Square brackets for stacking
+versions = ['RAW']  # any mix of loadable and runtime-tapered planes. 'rt50' or 'rt100' for tapering. Square brackets for stacking
+folds = [5] # 0-4 for 5-fold cross validation, 5 for only one training
+lambda_values = [0]  # Ratio between generated images and original images per class. 8 is reserfved for TRAINONGENERATED
+num_epochs_cuda = 200
+num_epochs_cpu = 100
 
-FLUX_CLIPPING = False  # Clip the flux of the images
-STRETCH = True  # Stretch the images with mathematical morphology
+STRETCH = True  # Arcsinh stretch 
+USE_GLOBAL_NORMALISATION = False           # single on/off switch . False - image-by-image normalisation 
+GLOBAL_NORM_MODE = "flux"           # "percentile" or "flux"
 ES, patience = True, 10  # Use early stopping
 SCHEDULER = False  # Use a learning rate scheduler
 SHOWIMGS = True  # Show some generated images for each class (Tool for control)
@@ -159,9 +160,6 @@ else:
 ARCSEC = np.deg2rad(1/3600.0)
 PSZ2_ROOT = "/users/mbredber/scratch/data/PSZ2"  # FITS root used below
 
-# parse versions
-# add near the imports
-import re
 
 def _split_versions(v):
     v = v if isinstance(v, (list, tuple)) else [v]
@@ -187,6 +185,8 @@ REPLACE_WITH_RT = (
 LATE_AUG = bool(_gen_versions) # True if any(v.startswith('rt') for v in _gen_versions)
 PRINTFILENAMES = bool(_gen_versions)
 EXTRAVARS = False  # Use extra features (redshift, mass, size) for the classifier. Will automatically be true if test_meta is not None.
+if not USE_GLOBAL_NORMALISATION:
+    GLOBAL_NORM_MODE = 'None' 
 
 if set(galaxy_classes) & {18} or set(galaxy_classes) & {19}:
     galaxy_classes = [20, 21, 21, 22, 23, 24, 25, 26, 27, 28, 29]  # Include all digits if 18 or 19 is in target_classes
@@ -394,11 +394,10 @@ def _kernel_from_headers(raw_hdr, targ_hdr, pixscale_arcsec):
         return None
     return Gaussian2DKernel(x_stddev=sx_pix, y_stddev=sy_pix, theta=theta)
 
-
 @lru_cache(maxsize=None)
 def _headers_for_name(base_name: str):
     """
-    Return (raw_hdr, t50_hdr, t100_hdr, t25_hdr, pix_native_arcsec, raw_fits_path)
+    Return (raw_hdr, t25_hdr, t50_hdr, t100_hdr, pix_native_arcsec, raw_fits_path)
     """
     base_dir = _first(f"{PSZ2_ROOT}/fits/{base_name}*") or f"{PSZ2_ROOT}/fits/{base_name}"
     raw_path = _first(f"{base_dir}/{os.path.basename(base_dir)}.fits") \
@@ -427,8 +426,7 @@ def _headers_for_name(base_name: str):
     t50_hdr  = fits.getheader(t50_path)  if t50_path  else None
     t100_hdr = fits.getheader(t100_path) if t100_path else None
     pix_native = _pixscale_arcsec(raw_hdr)
-    return raw_hdr, t50_hdr, t100_hdr, t25_hdr, pix_native, raw_path
-
+    return raw_hdr, t25_hdr, t50_hdr, t100_hdr, pix_native, raw_path
 
 
 def plot_raw_vs_fake_taper(raw_imgs, tapered_imgs, filenames, taper_mode,
@@ -445,7 +443,7 @@ def plot_raw_vs_fake_taper(raw_imgs, tapered_imgs, filenames, taper_mode,
     axes[0, 0].set_ylabel("RAW", fontsize=11)
     axes[1, 0].set_ylabel("RAW → " + ("50 kpc" if taper_mode=="rt50" else "100 kpc"), fontsize=11)
     os.makedirs(save_dir, exist_ok=True)
-    out = os.path.join(save_dir, f"raw_vs_{taper_mode}_eval_{n}x2_{raw_imgs.shape[-2]}x{raw_imgs.shape[-1]}.png")
+    out = os.path.join(save_dir, f"raw_vs_{taper_mode}_eval_{n}x2_{raw_imgs.shape[-2]}x{raw_imgs.shape[-1]}.pdf")
     plt.savefig(out, dpi=150, bbox_inches="tight"); plt.close(fig)
     print(f"Saved {out}")
 
@@ -518,7 +516,6 @@ def apply_taper_to_tensor(
     ref_sigma_map=None, bg_inner=64,
     debug_dir=None
 ):
-    import re
     mode = str(mode).lower()
     _kpc = None
     m = re.fullmatch(r'rt(\d+)(?:kpc)?', mode)
@@ -558,16 +555,13 @@ def apply_taper_to_tensor(
 
         # skip if we still don't have a target
         if targ_hdr is None:
-            skipped.append(base)
-            kept_flags.append(False)
-            continue
+            skipped.append(base); kept_flags.append(False); continue
 
         # 1) load RAW
         raw_native = np.squeeze(fits.getdata(raw_path)).astype(float)
         raw_native = np.nan_to_num(raw_native, copy=False)
 
-        # 2) PSF-match on the native grid (kernel guaranteed to exist conceptually,
-        #     but we still guard against numerical degeneracy)
+        # 2) Compute image-plane PSF kernel
         ker = _kernel_from_headers(raw_hdr, targ_hdr, pix_native_as)
         if ker is not None:
             matched = convolve_fft(raw_native, ker, boundary='fill', fill_value=0.0,
@@ -780,13 +774,14 @@ for gen_model_name in gen_model_names:
                 sample_size=max_num_galaxies, 
                 REMOVEOUTLIERS=FILTERED,
                 BALANCE=BALANCE,           # Reduce the larger classes to the size of the smallest class
-                FLUX_CLIPPING=FLUX_CLIPPING,
                 STRETCH=STRETCH,
                 percentile_lo=percentile_lo,  # Percentile stretch lower bound
                 percentile_hi=percentile_hi,  # Percentile stretch upper bound
-                AUGMENT=not LATE_AUG,
                 NORMALISE=NORMALISEIMGS,
                 NORMALISETOPM=NORMALISEIMGSTOPM,
+                USE_GLOBAL_NORMALISATION=USE_GLOBAL_NORMALISATION,
+                GLOBAL_NORM_MODE=GLOBAL_NORM_MODE,
+                AUGMENT=not LATE_AUG,
                 PRINTFILENAMES=PRINTFILENAMES,
                 train=False)
 
@@ -883,7 +878,7 @@ for gen_model_name in gen_model_names:
     param_combinations = list(itertools.product(folds, learning_rates, regularization_params, lambda_values))
     for fold, lr, reg, lambda_generate in param_combinations:
         torch.cuda.empty_cache()
-        runname = f"{galaxy_classes}_{gen_model_name}_lr{lr}_reg{reg}_lo{percentile_lo}_hi{percentile_hi}_cs{crop_size[0]}x{crop_size[1]}"
+        runname = f"{galaxy_classes}_{gen_model_name}_lr{lr}_reg{reg}_ver{_versions_to_load}_nm{GLOBAL_NORM_MODE}_lo{percentile_lo}_hi{percentile_hi}_cs{crop_size[0]}x{crop_size[1]}"
 
         log_path = f"./classifier/log_{runname}.txt"
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
@@ -903,9 +898,11 @@ for gen_model_name in gen_model_names:
                 sample_size=max_num_galaxies,
                 REMOVEOUTLIERS=FILTERED,
                 BALANCE=BALANCE,           # Reduce the larger classes to the size of the smallest class
-                AUGMENT=False,   
                 NORMALISE=NORMALISEIMGS,
                 NORMALISETOPM=NORMALISEIMGSTOPM,
+                USE_GLOBAL_NORMALISATION=USE_GLOBAL_NORMALISATION,
+                GLOBAL_NORM_MODE=GLOBAL_NORM_MODE,
+                AUGMENT=False,
                 train=True)
             
             if len(_out) == 4:
@@ -931,13 +928,14 @@ for gen_model_name in gen_model_names:
                 sample_size=max_num_galaxies, 
                 REMOVEOUTLIERS=FILTERED,
                 BALANCE=BALANCE,
-                FLUX_CLIPPING=FLUX_CLIPPING,
                 STRETCH=STRETCH,
                 percentile_lo=percentile_lo,
                 percentile_hi=percentile_hi,
                 AUGMENT=not LATE_AUG,
                 NORMALISE=NORMALISEIMGS,
                 NORMALISETOPM=NORMALISEIMGSTOPM,
+                USE_GLOBAL_NORMALISATION=USE_GLOBAL_NORMALISATION,
+                GLOBAL_NORM_MODE=GLOBAL_NORM_MODE,
                 PRINTFILENAMES=PRINTFILENAMES,
                 train=True)
 
@@ -1201,7 +1199,7 @@ for gen_model_name in gen_model_names:
                     train_images_cls2.cpu(),
                     title1=f"Class {galaxy_classes[0]}",
                     title2=f"Class {galaxy_classes[1]}",
-                    save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_histogram.png"
+                    save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_histogram.pdf"
                 )
 
                 plot_background_histogram(
@@ -1209,7 +1207,7 @@ for gen_model_name in gen_model_names:
                     train_images_cls2.cpu(),        # shape (720, 1, 128, 128)
                     img_shape=(1, 128, 128),
                     title="Background histograms",
-                    save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_background_hist.png"
+                    save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_background_hist.pdf"
                 )
 
                 for cls in galaxy_classes:
@@ -1219,12 +1217,12 @@ for gen_model_name in gen_model_names:
                     plot_image_grid(
                         orig_imgs.cpu(),
                         num_images=36,
-                        save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_train_grid.png"
+                        save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_train_grid.pdf"
                     )
                     plot_image_grid(
                         test_imgs.cpu(),
                         num_images=36,
-                        save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_test_grid.png"
+                        save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_test_grid.pdf"
                     )
                     tag_to_desc = { d["tag"]: d["description"] for d in get_classes() }
                     
@@ -1248,7 +1246,7 @@ for gen_model_name in gen_model_names:
                         train_images_cls2.cpu(),
                         label1=tag_to_desc[classes[galaxy_classes[0]]['tag']],
                         label2=tag_to_desc[classes[galaxy_classes[1]]['tag']],
-                        save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_summed_intensity_histogram.png"
+                        save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_summed_intensity_histogram.pdf"
                     )
                     
         
@@ -1258,21 +1256,21 @@ for gen_model_name in gen_model_names:
                         plot_image_grid(
                             gen_imgs,
                             num_images=36,
-                            save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_generated_grid.png"
+                            save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_generated_grid.pdf"
                         )
                         plot_histograms(
                             gen_imgs,
                             orig_imgs.cpu(),
                             title1="Generated Images",
                             title2="Train Images",
-                            save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_histogram.png"
+                            save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_histogram.pdf"
                         )
                         plot_background_histogram(
                             orig_imgs,
                             gen_imgs,
                             img_shape=(1, 128, 128),
                             title="Background histograms",
-                            save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_background_hist.png")
+                            save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_background_hist.pdf")
         
         if USE_CLASS_WEIGHTS:
             unique, counts = np.unique(train_labels.cpu().numpy(), return_counts=True)
@@ -1370,7 +1368,7 @@ for gen_model_name in gen_model_names:
         if SHOWIMGS and lambda_generate not in [0, 8]: 
             if classifier in ['TinyCNN', 'SCNN', 'CNNSqueezeNet', 'Rustige', 'ScatterSqueezeNet', 'ScatterSqueezeNet2', 'Binary']:
                 #save_images_tensorboard(generated_images[:36], save_path=f"./classifier/{gen_model_name}_{galaxy_classes}_generated.png", nrow=6)
-                plot_histograms(pristine_train_images, valid_images, title1="Train images", title2="Valid images", imgs3=generated_images, imgs4=test_images, title3='Generated images', title4='Test images', save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_histograms.png")
+                plot_histograms(pristine_train_images, valid_images, title1="Train images", title2="Valid images", imgs3=generated_images, imgs4=test_images, title3='Generated images', title4='Test images', save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_histograms.pdf")
 
         
         ###############################################
@@ -1425,7 +1423,7 @@ for gen_model_name in gen_model_names:
                     summary(model_details["model"], input_size=tuple(valid_images.shape[1:]), device=DEVICE)
             FIRSTTIME = False
             
-            
+   
         ###############################################
         ############### TRAINING LOOP #################
         ###############################################
@@ -1669,12 +1667,13 @@ for gen_model_name in gen_model_names:
                                     plt.xlabel('Predicted')
                                     plt.ylabel('True')
                                     plt.title(f'Confusion Matrix — {classifier_name}')
-                                    plt.savefig(f"./{galaxy_classes}_{classifier_name}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_confusion_matrix.png", dpi=150)
+                                    plt.savefig(f"./{galaxy_classes}_{classifier_name}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_confusion_matrix.pdf", dpi=150)
                                     plt.close()
 
                         accuracy = accuracy_score(all_true_labels[key], all_pred_labels[key])
                         precision = precision_score(all_true_labels[key], all_pred_labels[key], average='macro', zero_division=0)
-                        recall = recall_score(all_true_labels[key], all_pred_labels[key], average='macro', zero_division=0)
+                        #recall = recall_score(all_true_labels[key], all_pred_labels[key], average='macro', zero_division=0)
+                        recall = recall_score(all_true_labels[key], all_pred_labels[key], average='binary', pos_label=1, zero_division=0)
                         f1 = f1_score(all_true_labels[key], all_pred_labels[key], average='macro', zero_division=0)
 
                         update_metrics(metrics, gen_model_name, subset_size, fold, experiment, lr, reg, accuracy, precision, recall, f1, lambda_generate, crop_size, downsample_size, ver_key)
@@ -1706,7 +1705,7 @@ for gen_model_name in gen_model_names:
                             for ax in axes[len(mis_images):]:
                                 ax.axis('off')
 
-                            out_path = f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_misclassified.png"
+                            out_path = f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_misclassified.pdf"
                             fig.savefig(out_path, dpi=150, bbox_inches='tight')
                             plt.close(fig)
 
@@ -1767,7 +1766,7 @@ for gen_model_name in gen_model_names:
 
             model_save_path = f'./classifier/trained_models/{gen_model_name}_model.pth'
             torch.save(model.state_dict(), model_save_path)
-          
+    
     directory = './classifier/trained_models_filtered/' if FILTERED else './classifier/trained_models/'
     for fold, lr, reg, lambda_generate in param_combinations:
         for subset_size in dataset_sizes[fold]:
@@ -1818,7 +1817,7 @@ for gen_model_name in gen_model_names:
                     # save one file per metric so nothing gets overwritten
                     save_path_hist = (
                         f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_"
-                        f"{dataset_sizes[folds[-1]][-1]}_{metric_name}_histogram.png"
+                        f"{dataset_sizes[folds[-1]][-1]}_{metric_name}_histogram.pdf"
                     )
                     plt.savefig(save_path_hist, dpi=150)
                     plt.close()
@@ -1849,3 +1848,4 @@ for gen_model_name in gen_model_names:
                         "all_pred_probs": all_pred_probs,
                         "percentile_summary": robust_summary  # new robust summaries
                     }, f)
+                    

@@ -37,7 +37,7 @@ galaxy_classes = [50, 51] # e.g., [10, 11, 12, 13] for FRI, FRII, Compact, Bent
 learning_rates = [1e-3]
 regularization_params = [1e-3]
 lambda_values = [0]
-num_experiments = 10
+num_experiments = 5
 folds = [5] # Number of folds for cross-validation
 generators = ['DDPM']
 classifier = ["TinyCNN", "Rustige", "SCNN", "CNNSqueezeNet", "DualCNNSqueezeNet", "CloudNet", "DANN", "ScatterNet", "ScatterDual", "ScatterSqueezeNet", "Binary", "ScatterResNet"][-3]
@@ -94,9 +94,10 @@ elif galaxy_classes == [50, 51]:
     else:
         #dataset_sizes = [[12, 127, 1272], [12, 127, 1272], [12, 127, 1272], [12, 127, 1272], [12, 127, 1272], [12, 127, 1272]]
         #dataset_sizes = [[12, 124, 1248], [12, 124, 1248], [12, 124, 1248], [12, 124, 1248], [12, 124, 1248], [12, 124, 1248]]
-        #dataset_sizes = [[126, 1264], [126, 1264], [126, 1264], [126, 1264], [126, 1264], [126, 1264]]
+        #dataset_sizes = [[1264], [1264], [1264], [1264], [1264], [1264]]
         #dataset_sizes = [[12, 126, 1264], [12, 126, 1264], [12, 126, 1264], [12, 126, 1264], [12, 126, 1264], [12, 126, 1264]]
-        dataset_sizes = [[14, 144, 1440], [14, 144, 1440], [14, 144, 1440], [14, 144, 1440], [14, 144, 1440], [14, 144, 1440]] 
+        #dataset_sizes = [[14, 144, 1440], [14, 144, 1440], [14, 144, 1440], [14, 144, 1440], [14, 144, 1440], [14, 144, 1440]] 
+        dataset_sizes = [[1440], [1440], [1440], [1440], [1440], [1440]]
 elif galaxy_classes == [52, 53]: # RH vs RR
     dataset_sizes = [[2, 16, 168], [2, 16, 168], [2, 16, 168], [2, 16, 168], [2, 16, 168], [2, 16, 168]]
 elif galaxy_classes == [11, 12]:
@@ -210,10 +211,17 @@ for lambda_generate in lambda_values:
                 if not y_true or not y_pred:
                     continue  # nothing to aggregate for this combo
 
-                acc = accuracy_score(y_true, y_pred)
+                # use the number of target classes
+                is_binary = (len(galaxy_classes) == 2)
+
+                # ...
+                acc  = accuracy_score(y_true, y_pred)
                 prec = precision_score(y_true, y_pred, average='macro', zero_division=0)
-                rec  = recall_score(y_true, y_pred, average='macro', zero_division=0)
+                rec  = (recall_score(y_true, y_pred, average='binary', pos_label=1, zero_division=0)
+                        if is_binary else
+                        recall_score(y_true, y_pred, average='macro', zero_division=0))
                 f1   = f1_score(y_true, y_pred, average='macro', zero_division=0)
+
 
                 update_metrics(
                     tot_metrics, generator, subset_size, fold, experiment, lr, reg,
@@ -552,7 +560,8 @@ def plot_all_metrics_vs_dataset_size(
                             continue
                         key = f"{generator}_{metric}_{subset_size}_{fold}_{exp}_{lr}_{reg}_{λ}"
                         if key in metrics and metrics[key]:
-                            metric_values_per_category[merge_map[subset_size]].append(metrics[key][-1])
+                            bucket = str(merge_map.get(subset_size, subset_size))  # don’t drop sizes missing from merge_map
+                            metric_values_per_category[bucket].append(metrics[key][0])  # use the single recorded value
 
                 # sort categories and compute mean±std
                 categories = sorted(metric_values_per_category.keys(), key=lambda x: int(x))
@@ -578,6 +587,7 @@ def plot_all_metrics_vs_dataset_size(
             fname = f'{save_dir}/{galaxy_classes}_{classifier}_{generator}_{dataset_sizes[folds[-1]][-1]}_{metric}_vs_dataset_size.pdf'
             plt.savefig(fname)
             plt.close()
+            print(f"Saved {title} vs Dataset Size plot to {fname}")
 
 def plot_avg_roc_curves(metrics, generators, dataset_sizes=dataset_sizes, merge_map=merge_map, 
                          folds= folds, num_experiments=num_experiments, 
@@ -587,6 +597,7 @@ def plot_avg_roc_curves(metrics, generators, dataset_sizes=dataset_sizes, merge_
                         save_dir='./classifier'):
     min_label = min(galaxy_classes)
     adjusted_classes = [cls - min_label for cls in galaxy_classes]
+    fpr_grid = np.linspace(0, 1, 100)
     for generator in generators:
         for lr in learning_rates:
             for reg in regularization_params:
@@ -603,50 +614,55 @@ def plot_avg_roc_curves(metrics, generators, dataset_sizes=dataset_sizes, merge_
                                 pred_probs = pred_probs_dict.get(key)
                                 if (true_labels is None) or (pred_probs is None) or (len(true_labels) == 0) or (len(pred_probs) == 0):
                                     continue
-                                pred_probs = np.array(pred_probs)
-                                true_labels_bin = label_binarize(true_labels, classes=np.arange(len(adjusted_classes)))                                
-                                # handle binary vs. multi-class based on number of classes
+                                pred_probs = np.asarray(pred_probs)
+                                y = np.asarray(true_labels)
+
+                                # Map tags -> indices only if labels aren't already 0..C-1
+                                if y.max() > len(galaxy_classes) - 1:
+                                    tag_to_idx = {tag: i for i, tag in enumerate(sorted(galaxy_classes))}
+                                    y = np.vectorize(tag_to_idx.get)(y)
+
+                                # ROC is undefined if only one class is present in this fold; skip it.
+                                if np.unique(y).size < 2:
+                                    continue
+
                                 if len(adjusted_classes) == 2:
-                                    # ensure we pull out the “positive”‐class scores no matter the shape
-                                    if pred_probs.ndim > 1 and pred_probs.shape[1] > 1:
-                                        scores = pred_probs[:, 1]
-                                    else:
-                                        scores = pred_probs.ravel()
-                                    fpr, tpr, _ = roc_curve(true_labels, scores, pos_label=adjusted_classes[1])
-                                    interp_tpr = np.interp(np.linspace(0, 1, 100), fpr, tpr)
-                                    roc_values[adjusted_classes[1]].append(interp_tpr)
+                                    scores = pred_probs[:, 1] if pred_probs.ndim == 2 and pred_probs.shape[1] > 1 else pred_probs.ravel()
+                                    fpr, tpr, _ = roc_curve(true_labels, scores, pos_label=1)
+                                    interp_tpr = np.interp(fpr_grid, fpr, tpr)
+                                    roc_values[1].append(interp_tpr)
                                 else:
+                                    y_bin = label_binarize(y, classes=np.arange(len(adjusted_classes)))
                                     for i, class_label in enumerate(adjusted_classes):
-                                        try:
-                                            fpr, tpr, _ = roc_curve(true_labels_bin[:, i], pred_probs[:, i])
-                                            interp_tpr = np.interp(np.linspace(0, 1, 100), fpr, tpr)
-                                            roc_values[class_label].append(interp_tpr)
-                                        except ValueError as e:
-                                            print(f"Error computing ROC for class {class_label}: {e}")
-                                            continue
+                                        fpr, tpr, _ = roc_curve(y_bin[:, i], pred_probs[:, i])
+                                        interp_tpr = np.interp(fpr_grid, fpr, tpr)
+                                        roc_values[class_label].append(interp_tpr)
 
-
-                            fig, ax = plt.subplots(figsize=(6, 5))
+                            fig, ax = plt.subplots(figsize=(8, 7), dpi=200)
+                            ax.tick_params(axis='both', which='major', labelsize=18, width=2, length=6)
+                            for spine in ax.spines.values():
+                                spine.set_linewidth(2)
                             for class_label, galaxy_class in zip(adjusted_classes, galaxy_classes):
                                 if not roc_values[class_label]:
                                     continue
                                 tpr_values = np.array(roc_values[class_label])
                                 mean_tpr = np.mean(tpr_values, axis=0)
                                 std_tpr = np.std(tpr_values, axis=0)
-                                mean_auc = auc(np.linspace(0, 1, 100), mean_tpr)
-                                ax.plot(np.linspace(0, 1, 100), mean_tpr, lw=2,
-                                        label=f'{class_descriptions.get(galaxy_class, "Unknown Class")} ROC (area = {mean_auc:.2f})')
-                                ax.fill_between(np.linspace(0, 1, 100), mean_tpr - std_tpr, mean_tpr + std_tpr, alpha=0.2)
-                            ax.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+                                mean_auc = auc(fpr_grid, mean_tpr)
+                                n = tpr_values.shape[0]
+                                ax.plot(fpr_grid, mean_tpr, lw=3.5,
+                                        label=f'Mean ROC (AUC={mean_auc:.2f}, n={n})')
+                                ax.fill_between(fpr_grid, mean_tpr - std_tpr, mean_tpr + std_tpr, alpha=0.25)
+
+                            ax.plot([0, 1], [0, 1], color='navy', lw=3, linestyle='--')
                             ax.set_xlim([0.0, 1.0])
                             ax.set_ylim([0.0, 1.05])
-                            ax.set_xlabel('False Positive Rate', fontsize=18)
-                            ax.set_ylabel('True Positive Rate', fontsize=18)
+                            ax.set_xlabel('False Positive Rate', fontsize=22)
+                            ax.set_ylabel('True Positive Rate', fontsize=22)
                             merged_subset_key = merge_map.get(subset_size, str(subset_size))
-                            ax.set_title(f'Average ROC Curve - {generator} \n {merged_subset_key}, Experiment {experiment}', fontsize=14)
-                            ax.legend(loc="lower right")
+                            ax.legend(loc="lower right", fontsize=18)
                             os.makedirs(save_dir, exist_ok=True)
-                            plt.savefig(f'{save_dir}/{galaxy_classes}_{classifier}_{generator}_{merged_subset_key}_average_roc_curve.pdf')
+                            plt.savefig(f'{save_dir}/{galaxy_classes}_{classifier}_{generator}_{merged_subset_key}_{lr}_{reg}_{lambda_generate}_avg_roc_curve.pdf')
                             plt.close(fig)
 
 def plot_roc_curves(metrics, generators, dataset_sizes=dataset_sizes,  folds= folds, num_experiments=num_experiments, learning_rates=learning_rates, regularization_params=regularization_params, 
@@ -765,7 +781,6 @@ def plot_diff_avg_std_confusion_matrix(metrics, generators, metric_stats,
             save_path = f"{save_dir}/{galaxy_classes}_{classifier}_{generator}_{merged_size}_{lr}_{reg}_{lambda_vals[1]}-{lambda_vals[0]}_diff_confusion_matrix.pdf"
             plt.savefig(save_path)
             plt.close(fig)
-            print("Saved difference in average confusion matrix to", save_path)
 
 
 def plot_avg_std_confusion_matrix(metrics, generators, metric_stats, merge_map={249: "250", 250: "250", 2492: "2500", 2505: "2500", 24928: "25000", 25056: "25000"}, save_dir='./classifier'):
@@ -834,10 +849,8 @@ def plot_avg_std_confusion_matrix(metrics, generators, metric_stats, merge_map={
 
                 os.makedirs(save_dir, exist_ok=True)
                 save_path = f"{save_dir}/{galaxy_classes}_{classifier}_{generator}_{subset_size}_{lr}_{reg}_{lambda_generate}_avg_confusion_matrix.pdf"
-                #plt.savefig(save_path)
                 plt.savefig(save_path, bbox_inches='tight')
                 plt.close(fig)
-                print(f"Saved average confusion matrix to {save_path}")
 
 
 def plot_confusion_matrix(metrics, generators, dataset_sizes=dataset_sizes,  folds= folds, num_experiments=num_experiments, 
@@ -1151,18 +1164,44 @@ class_descriptions = [cls['description'] for cls in classes if cls['tag'] in gal
 from collections import defaultdict
 import numpy as np
 
-
-
 metrics_last = defaultdict(lambda: defaultdict(list))
 for λ in lambda_values:
     for fold in folds:
-        subset = max(dataset_sizes[fold])      # the “last” (largest) subset of this fold
+        subset = max(dataset_sizes[fold])
         for exp, lr, reg in itertools.product(range(num_experiments), learning_rates, regularization_params):
-            for metric in ["accuracy","precision","recall","f1_score"]:
-                key = f"{generator}_{metric}_{subset}_{fold}_{exp}_{lr}_{reg}_{λ}"
-                val = metrics.get(key)
-                if val is not None:
-                    metrics_last[λ][metric].append(val[0])
+            eval_key = f"{generators[0]}_{subset}_{fold}_{exp}_{lr}_{reg}_{λ}"
+            y_true_dict = metrics.get(f"{generators[0]}_all_true_labels_{subset}_{fold}_{exp}_{lr}_{reg}_{λ}", [])
+            y_pred_dict = metrics.get(f"{generators[0]}_all_pred_labels_{subset}_{fold}_{exp}_{lr}_{reg}_{λ}", [])
+            if not y_true_dict or not y_pred_dict:
+                continue
+            y_true = y_true_dict[0].get(eval_key, [])
+            y_pred = y_pred_dict[0].get(eval_key, [])
+            if not y_true or not y_pred:
+                continue
+            metrics_last[λ]["accuracy"].append(accuracy_score(y_true, y_pred))
+            metrics_last[λ]["precision"].append(precision_score(y_true, y_pred, average='macro', zero_division=0))
+            metrics_last[λ]["recall"].append(
+                recall_score(y_true, y_pred,
+                            average='binary' if is_binary else 'macro',
+                            pos_label=1 if is_binary else None,
+                            zero_division=0)
+            )
+            metrics_last[λ]["f1_score"].append(f1_score(y_true, y_pred, average='macro', zero_division=0))
+            
+            # For comparison also read in the metric values from the metrics dict
+            acc_list = metrics.get(f"{generators[0]}_accuracy_{subset}_{fold}_{exp}_{lr}_{reg}_{λ}", [])
+            prec_list = metrics.get(f"{generators[0]}_precision_{subset}_{fold}_{exp}_{lr}_{reg}_{λ}", [])
+            rec_list = metrics.get(f"{generators[0]}_recall_{subset}_{fold}_{exp}_{lr}_{reg}_{λ}", [])
+            f1_list = metrics.get(f"{generators[0]}_f1_score_{subset}_{fold}_{exp}_{lr}_{reg}_{λ}", [])
+            if acc_list:
+                metrics_last[λ]["accuracy"].append(acc_list[0])
+            if prec_list:   
+                metrics_last[λ]["precision"].append(prec_list[0])
+            if rec_list:
+                metrics_last[λ]["recall"].append(rec_list[0])
+            if f1_list:
+                metrics_last[λ]["f1_score"].append(f1_list[0])
+
 
 # ——— Rankings for each λ and metric ———
 for λ, stats in metrics_last.items():
@@ -1182,31 +1221,46 @@ for λ, stats in metrics_last.items():
         std  = np.std(vals)
         print(f"{metric.capitalize()}: Mean = {mean:.4f}, Std = {std:.4f}")
 
-print("\nTraining Times:")
-# Aggregate training times per merged category
-merged_times = {}
-for subset_size, train_folds in training_times.items():
-    try:
-        category = merge_map[subset_size]
-    except KeyError:
-        print("Skipping non-numeric or unexpected key:", subset_size)
-        continue
-    for _, elapsed_times in train_folds.items():
-        if not elapsed_times:
-            continue
-        if category not in merged_times:
-            merged_times[category] = []
-        merged_times[category].extend(elapsed_times)
+print("\nTraining Times (aggregated):")
+from collections import defaultdict
 
-# For the merged category "25000", compute and print the summary
-if "25000" in merged_times and merged_times["25000"]:
-    times = merged_times["25000"]
-    mean_time = np.mean(times)
-    std_time = np.std(times)
-    data_points = len(times)
-    print(f"Average training time for 25000 input images is {mean_time:.2f} ± {std_time:.2f} seconds (based on {data_points} data points)")
+all_subset_sizes = {s for fs in dataset_sizes for s in fs}
+merged_times = defaultdict(list)
+
+# Pull training-times dicts we stored in `metrics` during the load step
+for k, v in metrics.items():
+    if "_training_times_" not in k or not v:
+        continue
+    tt = v[0]
+    if not isinstance(tt, dict):
+        continue
+
+    # Detect layout per top-level key
+    for k1, v1 in tt.items():
+        if not isinstance(v1, dict):
+            continue
+
+        if isinstance(k1, (int, np.integer)) and k1 in all_subset_sizes:
+            # Layout A: tt[subset_size][fold] -> list
+            subset_size = int(k1)
+            cat = merge_map.get(subset_size, str(subset_size))
+            for times in v1.values():
+                if isinstance(times, (list, tuple, np.ndarray)):
+                    merged_times[cat].extend(list(times))
+        else:
+            # Layout B: tt[fold][subset_size] -> list
+            for sub_k, times in v1.items():
+                if isinstance(sub_k, (int, np.integer)) and sub_k in all_subset_sizes:
+                    cat = merge_map.get(sub_k, str(sub_k))
+                    if isinstance(times, (list, tuple, np.ndarray)):
+                        merged_times[cat].extend(list(times))
+
+if not merged_times:
+    print("No training times recorded.")
 else:
-    print("No training times recorded for merged category: 25000")
+    for cat, times in sorted(merged_times.items(), key=lambda x: int(x[0])):
+        times = np.asarray(times, dtype=float)
+        print(f"{cat}: {times.mean():.2f} ± {times.std():.2f} seconds (n={len(times)})")
 
 
 # If there exist a lambda>0
@@ -1344,11 +1398,11 @@ if any(lam > 0 for lam in lambda_values):
         plot_overlap_image_grids(model, real_loader, gen_loader, device=device)
 #
 plot_loss(generators, history=history)
-##plot_roc_curves(metrics, generators)
-plot_avg_roc_curves(metrics, generators, merge_map=merge_map)
+#plot_roc_curves(metrics, generators)
+#plot_avg_roc_curves(metrics, generators, merge_map=merge_map)
 #plot_all_metrics_vs_dataset_size(metrics, generators, merge_map=merge_map)
 #plot_accuracy_vs_lambda(lambda_values, metrics, generators)
-##plot_confusion_matrix(metrics, generators)
+#plot_confusion_matrix(metrics, generators)
 plot_avg_std_confusion_matrix(metrics, generators, metric_stats=metrics_last, merge_map=merge_map)
 #plot_diff_avg_std_confusion_matrix(metrics, generators, metric_stats=metrics_last, merge_map=merge_map)
 

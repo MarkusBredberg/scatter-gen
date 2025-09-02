@@ -167,8 +167,6 @@ def load_headers(base, ds_factor=1.0):
     return raw_hdr, t50_hdr, t100_hdr, pix_eff
 
 
-
-
 def plot_galaxy_grid(images, filenames, labels, sigmas=(1.0, 3.0, 5.0)):
     """
     3 DE rows, a thin spacer row, then 3 NDE rows.
@@ -279,7 +277,7 @@ def plot_galaxy_grid(images, filenames, labels, sigmas=(1.0, 3.0, 5.0)):
         axes[4, j].spines['top'].set_color('white')
         axes[4, j].spines['top'].set_linewidth(3)
 
-    outname = f"psz2_psfmatch_repro_cs{crop_size[-1]}_out{images.shape[-1]}_p{60}-{95}.pdf"
+    outname = f"psz2_psfmatch_repro_cs{crop_size[-1]}_out{images.shape[-1]}_grid2.pdf"
     plt.savefig(outname, dpi=300, bbox_inches="tight", pad_inches=0.02)
     plt.close(fig)
     print(f"Wrote {outname}")

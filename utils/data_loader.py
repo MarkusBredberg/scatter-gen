@@ -45,9 +45,6 @@ sys.path.append(root_path)
 #from MiraBest.MiraBest_F import MBFRConfident, MBFRUncertain, MBFRFull, MBRandom
 
 
-
-
-
 def get_classes():
     return [
         # GALAXY10 size: 3x256x256
@@ -1995,7 +1992,9 @@ def load_PSZ2(path=root_path + "PSZ2/classified/",
               crop_size=(1, 256, 256),
               downsample_size=(1, 256, 256),
               versions='T100kpcSUB',      # <-- replaced 'version' with 'versions'
-              FLUX_CLIPPING=False,
+              USE_GLOBAL_NORMALISATION=False,
+              GLOBAL_NORM_MODE='flux',
+              percentile_lo=1, percentile_hi=99,
               train=False):
     """
     PSZ2 loader with strict version alignment for tesseracts.
@@ -2012,6 +2011,7 @@ def load_PSZ2(path=root_path + "PSZ2/classified/",
       - If `versions` is a list with length > 1 → CUBE=True (tesseract, PNGs).
       - Else → CUBE=False (single version, FITS).
     """
+
     # --- unpack crop/downsample (kept as-is for compatibility) ---
     if len(crop_size) == 4:
         num_versions, ch_c, h_c, w_c = crop_size
@@ -2140,8 +2140,6 @@ def load_PSZ2(path=root_path + "PSZ2/classified/",
                         raise ValueError(f"Unexpected FITS shape {arr.shape} in {fits_path}")
 
                     frame = torch.from_numpy(arr).unsqueeze(0)  # [1,H,W]
-
-                    # If you want FLUX_CLIPPING here, insert your existing block before formatting.
                     frame = apply_formatting(frame, crop_size, downsample_size)
                     frames.append(frame)
 
@@ -2179,7 +2177,7 @@ def load_PSZ2(path=root_path + "PSZ2/classified/",
                 elif arr2.ndim != 2:
                     raise ValueError(f"Expected 2-D or 3-D stack, got {arr2.shape!r}")
 
-                if FLUX_CLIPPING:
+                if USE_GLOBAL_NORMALISATION and GLOBAL_NORM_MODE == "flux": # apply global flux normalisation
                     hdr = fits.getheader(fits_path)
                     fluxconv = hdr.get('FLUXCONV', 1.0)
                     flux = arr * fluxconv
@@ -2193,6 +2191,23 @@ def load_PSZ2(path=root_path + "PSZ2/classified/",
                 images.append(frame)           # [C,H,W]
                 labels.append(label)
                 filenames.append(base)
+    # ---- GLOBAL, DATASET-WIDE NORMALISATION (one mapping for all sets) ----
+    if USE_GLOBAL_NORMALISATION and GLOBAL_NORM_MODE == "percentile":
+        print(f"[load_PSZ2] Applying global percentile normalisation ({percentile_lo}–{percentile_hi}%)")
+        # compute percentiles on the entire dataset
+        imgs_tensor = torch.stack(images) if isinstance(images, list) else images
+        flat = imgs_tensor.reshape(-1).float()
+        qlo = flat.quantile(percentile_lo/100)
+        qhi = flat.quantile(percentile_hi/100)
+
+        def _apply_fixed_pct_elem(x, lo=qlo, hi=qhi):
+            return ((x - lo) / (hi - lo + 1e-6)).clamp(0, 1).to(x.dtype)
+
+        if isinstance(images, list):
+            images = [_apply_fixed_pct_elem(x) for x in images]
+        else:
+            images = _apply_fixed_pct_elem(images)
+
 
     # --------- safety checks ---------
     if len(images) == 0:
@@ -2334,8 +2349,8 @@ def load_MGCLS(path='/users/mbredber/data/MGCLS/classified_crops_1600/',  # Path
 
 
 def load_galaxies(galaxy_classes, path=None, versions=None, fold=None, island=None, crop_size=None, downsample_size=None, sample_size=None, 
-                  REMOVEOUTLIERS=True, BALANCE=False, AUGMENT=False, FLUX_CLIPPING=False, STRETCH=False, percentile_lo=80, percentile_hi=99,
-                  EXTRADATA=False, PRINTFILENAMES=False, NORMALISE=True, NORMALISETOPM=False, SAVE_IMAGES=False, train=None):
+                  REMOVEOUTLIERS=True, BALANCE=False, AUGMENT=False, USE_GLOBAL_NORMALISATION=False, GLOBAL_NORM_MODE="percentile", STRETCH=False, percentile_lo=80, percentile_hi=99,
+                 NORMALISE=True, NORMALISETOPM=False, EXTRADATA=False, PRINTFILENAMES=False, SAVE_IMAGES=False, train=None):
     """
     Master loader that delegates to specific dataset loaders and returns zero-based labels.
     """
@@ -2346,7 +2361,8 @@ def load_galaxies(galaxy_classes, path=None, versions=None, fold=None, island=No
 
     # Clean up kwargs to remove None values
     kwargs = {'path': path, 'versions': versions, 'sample_size': sample_size, 'fold':fold, 'train': train,
-              'island': island, 'crop_size': crop_size, 'downsample_size': downsample_size, 'FLUX_CLIPPING': FLUX_CLIPPING}
+              'island': island, 'crop_size': crop_size, 'downsample_size': downsample_size, 'USE_GLOBAL_NORMALISATION': USE_GLOBAL_NORMALISATION,
+                'GLOBAL_NORM_MODE': GLOBAL_NORM_MODE, 'percentile_lo': percentile_lo, 'percentile_hi': percentile_hi}
     clean_kwargs = {k: v for k, v in kwargs.items() if v is not None}
 
     max_class = get_max_class(galaxy_classes)
@@ -2401,7 +2417,7 @@ def load_galaxies(galaxy_classes, path=None, versions=None, fold=None, island=No
         
     else:
         raise ValueError("Data loader did not return the expected number of outputs.")
-    
+        
     
     # If images are list, converge them to tensors
     #if isinstance(train_images, list):
@@ -2479,8 +2495,7 @@ def load_galaxies(galaxy_classes, path=None, versions=None, fold=None, island=No
     if BALANCE:
         train_images, train_labels = balance_classes(train_images, train_labels) # Remove excess images from the largest class
         
-        
-    if STRETCH and not FLUX_CLIPPING:
+    if STRETCH and not USE_GLOBAL_NORMALISATION:
         train_class_ids = sorted(set(train_labels))
         for class_id in train_class_ids:
             train_idx   = next(i for i, lbl in enumerate(train_labels) if lbl == class_id)
@@ -2733,7 +2748,7 @@ def load_galaxies(galaxy_classes, path=None, versions=None, fold=None, island=No
             eval_images = torch.stack(eval_images)
         all_images = torch.cat([train_images, eval_images], dim=0)
         #all_images = normalise_images(all_images, out_min=0, out_max=1)  
-        if FLUX_CLIPPING: # Regular normalisation of all images to [0,1]
+        if USE_GLOBAL_NORMALISATION: # Regular normalisation of all images to [0,1]
             all_images = normalise_images(all_images, out_min=0, out_max=1)
         else:  # Percentile stretch to [0,1]
             
