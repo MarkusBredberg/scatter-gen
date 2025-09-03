@@ -1,31 +1,38 @@
 #!/usr/bin/env python3
 
-crop_size = (3, 1, 512, 512)  # (T, C, H, W) for 3 channels, 512x512 images
 from utils.data_loader2 import load_galaxies
+from utils.data_loader2 import apply_formatting
 import numpy as np
 from pathlib import Path
-from scipy.ndimage import gaussian_filter 
 import matplotlib.pyplot as plt
+from matplotlib import colors as mcolors
 from astropy.io import fits
 from astropy.convolution import convolve_fft, Gaussian2DKernel
 import os, glob
 import torch
-from utils.data_loader2 import apply_formatting
 
 
-print("Loading scatter_galaxies/plot_gauss_blur_grid2.py...")
+print("Loading scatter_galaxies/plot_gauss_blur_grid_editing.py...")
 
 ARCSEC = np.deg2rad(1/3600)
+crop_size = (3, 1, 512, 512)  # (T, C, H, W) for 3 channels, 512x512 images
 
 def _stretch_from_p(arr, p_lo, p_hi):
-     y = (arr - p_lo) / (p_hi - p_lo + 1e-6)
-     return np.clip(y, 0, 1)
+    """Linear stretch based on given percentiles."""
+    return (arr - p_lo) / (p_hi - p_lo + 1e-6)
+
+def _stretch_from_p_with_clip(arr, p_lo, p_hi, clip=True):
+    if arr is None:
+        return None
+    y = (arr - p_lo) / (p_hi - p_lo + 1e-6)
+    return np.clip(y, 0, 1) if clip else y
  
 def _nanpct(arr, lo=60, hi=95):
     """Percentiles that ignore NaNs."""
     return tuple(np.nanpercentile(arr, [lo, hi]))
 
 def _nanrms(a, b):
+    """RMS difference between two arrays, ignoring NaNs."""
     m = np.isfinite(a) & np.isfinite(b)
     if not np.any(m):
         return np.nan
@@ -34,35 +41,33 @@ def _nanrms(a, b):
 
 def _fits_path_triplet(base_dir, real_base):
     raw_path  = f"{base_dir}/{real_base}.fits"
+    t25_path  = _first(f"{base_dir}/{real_base}T25kpc*.fits")
     t50_path  = _first(f"{base_dir}/{real_base}T50kpc*.fits")
     t100_path = _first(f"{base_dir}/{real_base}T100kpc*.fits")
-    return raw_path, t50_path, t100_path
+    return raw_path, t25_path, t50_path, t100_path
 
 def _load_fits_arrays_scaled(name, crop_ch=1, out_hw=(128,128)):
-    # resolve folder + real_base (same logic you already use)
     base_dir = _first(f"{ROOT}/fits/{name}*") or f"{ROOT}/fits/{name}"
     raw_path = _first(f"{base_dir}/{os.path.basename(base_dir)}*.fits")
     if raw_path is None:
         raise FileNotFoundError(f"RAW FITS not found under {base_dir}")
     real_base = os.path.splitext(os.path.basename(raw_path))[0]
-    raw_path, t50_path, t100_path = _fits_path_triplet(base_dir, real_base)
+    raw_path, t25_path, t50_path, t100_path = _fits_path_triplet(base_dir, real_base)
 
-    # headers
     raw_hdr  = fits.getheader(raw_path)
+    t25_hdr  = fits.getheader(t25_path)  if t25_path  else None
     t50_hdr  = fits.getheader(t50_path)  if t50_path  else None
     t100_hdr = fits.getheader(t100_path) if t100_path else None
 
-    # native pix scale (arcsec / pix)
     pix_native = _pixscale_arcsec(raw_hdr)
 
-    # read arrays
     raw_arr  = np.squeeze(fits.getdata(raw_path)).astype(float)
+    t25_arr  = np.squeeze(fits.getdata(t25_path)).astype(float)   if t25_path  else None
     t50_arr  = np.squeeze(fits.getdata(t50_path)).astype(float)   if t50_path  else None
     t100_arr = np.squeeze(fits.getdata(t100_path)).astype(float)  if t100_path else None
 
-    # match sky area to RAW by scaling the crop size using CDELT ratio
     ch, Hc_raw, Wc_raw = crop_ch, crop_size[-2], crop_size[-1]
-    outH, outW        = out_hw
+    outH, outW = out_hw
 
     def _fmt(arr, ver_hdr):
         if ver_hdr is None or arr is None:
@@ -70,19 +75,19 @@ def _load_fits_arrays_scaled(name, crop_ch=1, out_hw=(128,128)):
         scale = abs(raw_hdr['CDELT1'] / ver_hdr['CDELT1'])
         Hc = int(round(Hc_raw * scale))
         Wc = int(round(Wc_raw * scale))
-        ten = torch.from_numpy(arr).unsqueeze(0).float()       # [1,H,W]
+        ten = torch.from_numpy(arr).unsqueeze(0).float()
         ten = apply_formatting(ten, (ch, Hc, Wc), (ch, outH, outW)).squeeze(0).numpy()
         return ten
 
     raw_cut  = _fmt(raw_arr,  raw_hdr)
+    t25_cut  = _fmt(t25_arr,  t25_hdr)
     t50_cut  = _fmt(t50_arr,  t50_hdr)
     t100_cut = _fmt(t100_arr, t100_hdr)
 
-    # effective pixel scale for the *displayed* arrays (downsample factor)
-    ds_factor = (int(round(Hc_raw)) / outH)   # 512 / 128 = 4 in your run
+    ds_factor = (int(round(Hc_raw)) / outH)
     pix_eff_arcsec = pix_native * ds_factor
 
-    return raw_cut, t50_cut, t100_cut, raw_hdr, t50_hdr, t100_hdr, pix_eff_arcsec
+    return raw_cut, t25_cut, t50_cut, t100_cut, raw_hdr, t25_hdr, t50_hdr, t100_hdr, pix_eff_arcsec
 
 def fwhm_to_sigma_rad(fwhm_arcsec):
     return (fwhm_arcsec*ARCSEC) / (2*np.sqrt(2*np.log(2)))
@@ -167,12 +172,18 @@ def load_headers(base, ds_factor=1.0):
     return raw_hdr, t50_hdr, t100_hdr, pix_eff
 
 
-def plot_galaxy_grid(images, filenames, labels, sigmas=(1.0, 3.0, 5.0)):
+def plot_galaxy_grid(images, filenames, labels, lo=60, hi=95):
     """
-    3 DE rows, a thin spacer row, then 3 NDE rows.
-    Columns: RAW, T50 kpc, T100 kpc, then Gaussian blurs of RAW.
+    Layout (9 columns):
+      T25, RAW→25, Residual 25,  T50, RAW→50, Residual 50,  T100, RAW→100, Residual 100
+
+    Colour scales:
+      • All non-residual panels share ONE global stretch (lo/hi percentiles computed from
+        *all* T and RAW→T arrays across every row).
+      • Residuals are (T_s - RAW→T_s) in that same normalised space, displayed with
+        viridis using ONE symmetric range [-R, +R] (R = 99.5th pct of |residual| over all rows).
     """
-    # pick 3 per class, DE first
+    # pick 3 per class (DE first), then a spacer row, then 3 NDE
     de_idx  = [i for i, y in enumerate(labels) if int(y) == 50][:3]
     nde_idx = [i for i, y in enumerate(labels) if int(y) == 51][:3]
     order   = de_idx + nde_idx
@@ -183,101 +194,125 @@ def plot_galaxy_grid(images, filenames, labels, sigmas=(1.0, 3.0, 5.0)):
     filenames  = [filenames[i] for i in order]
     labels     = [labels[i]    for i in order]
 
-    # layout
-    n_each  = 3
-    gap     = 1                 # spacer row
-    n_rows  = n_each*2 + gap    # 7 total
-    n_cols = 5  # RAW, T50, T100, RAW→50, RAW→100
-
-    # compact figure with square axes; small wspace/hspace
-    cell = 1.6                   # inches per tile (tweak if you want larger)
+    # Prepare grid
+    n_each, gap = 3, 1
+    n_rows, n_cols = n_each*2 + gap, 9
+    cell = 1.6
     fig, axes = plt.subplots(
         n_rows, n_cols,
         figsize=(n_cols*cell, n_rows*cell*0.98),
         gridspec_kw=dict(
             left=0.04, right=0.995, top=0.92, bottom=0.05,
             wspace=0.04, hspace=0.04,
-            height_ratios=[1,1,1,0.12,1,1,1]  # thin spacer row
-        ),
+            height_ratios=[1,1,1,0.12,1,1,1]),
         constrained_layout=False
     )
-    
-
-    # column titles (set once, before the loop)       
-    col_titles = ["RAW", "T50 kpc", "T100 kpc", "RAW → 50 kpc", "RAW → 100 kpc"]
+    col_titles = [
+        "T25 kpc", "RAW → 25 kpc", "Residual 25",
+        "T50 kpc", "RAW → 50 kpc", "Residual 50",
+        "T100 kpc", "RAW → 100 kpc", "Residual 100",
+    ]
     for ax, t in zip(axes[0], col_titles):
         ax.set_title(t, fontsize=12, pad=6)
 
-    # map our 6 sources onto 7 grid-rows (skip spacer row index 3)
+    # map our 6 sources onto 7 grid-rows (skip spacer=3)
     row_map = [0,1,2,4,5,6]
+    outH, outW = images.shape[-2], images.shape[-1]
 
+    # -------- Pass 1: load arrays for every row --------
+    rows = []
     for i_src, grid_row in enumerate(row_map):
         name = Path(str(filenames[i_src])).stem
+        raw_cut, t25_cut, t50_cut, t100_cut, raw_hdr, t25_hdr, t50_hdr, t100_hdr, pix_eff = \
+            _load_fits_arrays_scaled(name, crop_ch=1, out_hw=(outH, outW))
 
-        # === work with pre-stretch FITS arrays ===
-        raw_cut, t50_cut, t100_cut, raw_hdr, t50_hdr, t100_hdr, pix_eff = \
-            _load_fits_arrays_scaled(name, crop_ch=1, out_hw=(images.shape[-2], images.shape[-1]))
+        r2_25  = convolve_to_target(raw_cut, raw_hdr, t25_hdr,  pix_eff) if t25_hdr  is not None else None
+        r2_50  = convolve_to_target(raw_cut, raw_hdr, t50_hdr,  pix_eff) if t50_hdr  is not None else None
+        r2_100 = convolve_to_target(raw_cut, raw_hdr, t100_hdr, pix_eff) if t100_hdr is not None else None
 
-        # PSF-match the *pre-stretch* RAW
-        raw_to_50  = convolve_to_target(raw_cut,  raw_hdr, t50_hdr,  pix_eff)
-        raw_to_100 = convolve_to_target(raw_cut,  raw_hdr, t100_hdr, pix_eff)
+        rows.append(dict(name=name, grid_row=grid_row,
+                         t25=t25_cut, t50=t50_cut, t100=t100_cut,
+                         r25=r2_25,  r50=r2_50,  r100=r2_100))
 
-        # --- HYBRID STRETCHING ---
-        # RAW: use RAW's own percentiles
-        r_lo, r_hi = _nanpct(raw_cut, 60, 95)
-        raw_s      = _stretch_from_p(raw_cut, r_lo, r_hi)
+    # -------- Global lo/hi for ALL non-residual panels --------
+    all_vals = []
+    for r in rows:
+        for k in ("t25","t50","t100","r25","r50","r100"):
+            a = r[k]
+            if a is not None:
+                aa = np.asarray(a, float)
+                aa = aa[np.isfinite(aa)]
+                if aa.size:
+                    all_vals.append(aa.ravel())
+    if all_vals:
+        v = np.concatenate(all_vals)
+        g_lo, g_hi = np.nanpercentile(v, [lo, hi])
+        if not np.isfinite(g_hi - g_lo) or g_hi <= g_lo:
+            g_lo, g_hi = np.nanmin(v), np.nanmax(v)
+    else:
+        g_lo, g_hi = 0.0, 1.0
 
-        # T50: use T50's percentiles
-        if t50_cut is not None and np.isfinite(t50_cut).any():
-            p50_lo, p50_hi = _nanpct(t50_cut, 60, 95)
-            t50_s   = _stretch_from_p(t50_cut, p50_lo, p50_hi)
-        else:
-            t50_s   = None  # or _stretch_from_p(t50_cut, r_lo, r_hi) as a fallback
+    # -------- Pass 2: apply the global stretch, compute residuals --------
+    residual_vals = []
+    for r in rows:
+        t25_s  = _stretch_from_p(r['t25'],  g_lo, g_hi) if r['t25']  is not None else None
+        r25_s  = _stretch_from_p(r['r25'],  g_lo, g_hi) if r['r25']  is not None else None
+        res25  = (t25_s  - r25_s) if (t25_s  is not None and r25_s  is not None) else None
 
-        # T100: use T100's percentiles
-        if t100_cut is not None and np.isfinite(t100_cut).any():
-            p100_lo, p100_hi = _nanpct(t100_cut, 60, 95)
-            t100_s  = _stretch_from_p(t100_cut,  p100_lo, p100_hi)
-        else:
-            t100_s  = None  # or _stretch_from_p(t100_cut, r_lo, r_hi) as a fallback
+        t50_s  = _stretch_from_p(r['t50'],  g_lo, g_hi) if r['t50']  is not None else None
+        r50_s  = _stretch_from_p(r['r50'],  g_lo, g_hi) if r['r50']  is not None else None
+        res50  = (t50_s  - r50_s) if (t50_s  is not None and r50_s  is not None) else None
 
-        # Reproductions (RAW → 50/100): use RAW's percentiles (like screenshot 2)
-        r2_50_s  = _stretch_from_p(raw_to_50,  r_lo, r_hi)
-        r2_100_s = _stretch_from_p(raw_to_100, r_lo, r_hi)
+        t100_s = _stretch_from_p(r['t100'], g_lo, g_hi) if r['t100'] is not None else None
+        r100_s = _stretch_from_p(r['r100'], g_lo, g_hi) if r['r100'] is not None else None
+        res100 = (t100_s - r100_s) if (t100_s is not None and r100_s is not None) else None
 
-        planes = (raw_s, t50_s, t100_s, r2_50_s, r2_100_s)
-        for j, arr in enumerate(planes):
-            ax = axes[grid_row, j]
-            ax.imshow(arr, cmap="viridis", origin="lower",
-                    interpolation="nearest", vmin=0, vmax=1)
+        for rr in (res25, res50, res100):
+            if rr is not None:
+                a = np.asarray(rr, float)
+                a = a[np.isfinite(a)]
+                if a.size:
+                    residual_vals.append(np.abs(a).ravel())  # for symmetric range
+
+        r['planes'] = [t25_s, r25_s, res25,
+                       t50_s, r50_s, res50,
+                       t100_s, r100_s, res100]
+
+    # shared norms
+    img_norm = mcolors.Normalize(vmin=0.0, vmax=1.0)
+    R = np.nanpercentile(np.concatenate(residual_vals), 99.5) if residual_vals else 1.0
+    res_norm = mcolors.Normalize(vmin=-R, vmax=R)  # signed residuals with viridis
+
+    RES_COLS = {2, 5, 8}
+
+    # -------- Draw --------
+    for r in rows:
+        gr = r['grid_row']
+        for j, arr in enumerate(r['planes']):
+            ax = axes[gr, j]
+            if arr is not None:
+                if j in RES_COLS:
+                    ax.imshow(arr, cmap="viridis", norm=res_norm,
+                              origin="lower", interpolation="nearest")
+                else:
+                    ax.imshow(arr, cmap="viridis", norm=img_norm,
+                              origin="lower", interpolation="nearest")
             ax.set_axis_off()
+        axes[gr, 0].text(-0.02, 0.5, r['name'], transform=axes[gr,0].transAxes,
+                         rotation=90, va='center', ha='right', fontsize=8)
 
-
-        # row label
-        ax0 = axes[grid_row, 0]
-        ax0.text(-0.02, 0.5, name, transform=ax0.transAxes, rotation=90,
-                va='center', ha='right', fontsize=8)
-
-    # spacer row: blank + labels “DE” and “NDE”
+    # spacer + labels
     for j in range(n_cols):
         axes[3, j].axis('off')
         axes[3, j].set_facecolor('white')
-    # big tags at the left of the blocks
+        axes[2, j].spines['bottom'].set_color('white'); axes[2, j].spines['bottom'].set_linewidth(3)
+        axes[4, j].spines['top'].set_color('white');    axes[4, j].spines['top'].set_linewidth(3)
     axes[1, 0].text(-0.20, 0.5, "DE",  transform=axes[1,0].transAxes,
                     va='center', ha='right', fontsize=13, fontweight='bold')
     axes[5, 0].text(-0.20, 0.5, "NDE", transform=axes[5,0].transAxes,
                     va='center', ha='right', fontsize=13, fontweight='bold')
-    # thin line across the spacer
-    for j in range(n_cols):
-        axes[3, j].set_facecolor('white')
-    # draw lines on the axes above and below the spacer
-    for j in range(n_cols):
-        axes[2, j].spines['bottom'].set_color('white')
-        axes[2, j].spines['bottom'].set_linewidth(3)
-        axes[4, j].spines['top'].set_color('white')
-        axes[4, j].spines['top'].set_linewidth(3)
 
-    outname = f"psz2_psfmatch_repro_cs{crop_size[-1]}_out{images.shape[-1]}_grid2.pdf"
+    outname = f"psz2_psfmatch_pairs25_50_100_with_residuals_global.pdf"
     plt.savefig(outname, dpi=300, bbox_inches="tight", pad_inches=0.02)
     plt.close(fig)
     print(f"Wrote {outname}")
@@ -286,23 +321,18 @@ def plot_galaxy_grid(images, filenames, labels, sigmas=(1.0, 3.0, 5.0)):
 if __name__ == "__main__": 
     result = load_galaxies(
         galaxy_classes=[50, 51],
+        versions=['T25kpc', 'T50kpc', 'T100kpc'],   # or include 'RAW' if you want it in the cube
         fold=5,
-        crop_size=crop_size,
-        downsample_size=(3,1,128,128),
+        crop_size=(3, 1, 512, 512),                 # same physical FOV for all versions
+        downsample_size=(3, 1, 128, 128),           # common output size
         sample_size=500,
-        REMOVEOUTLIERS=True,
-        BALANCE=False,
-        STRETCH=False,
-        percentile_lo=60,
-        percentile_hi=95,
-        AUGMENT=False,
-        NORMALISE=False,
-        NORMALISETOPM=False,
-        EXTRADATA=False,
-        PRINTFILENAMES=True,
+        USE_GLOBAL_NORMALISATION=False,             # <- leave off
+        NORMALISE=False, STRETCH=False,             # <- leave off
+        NORMALISETOPM=False, AUGMENT=False,
+        EXTRADATA=False, PRINTFILENAMES=True,
         train=False,
     )
     eval_imgs   = result[2]
     eval_labels = result[3]  # eval_labels lives at index 3
     eval_fns    = result[5]
-    plot_galaxy_grid(eval_imgs, eval_fns, eval_labels, sigmas=(1.0, 5.0, 10.0))
+    plot_galaxy_grid(eval_imgs, eval_fns, eval_labels)

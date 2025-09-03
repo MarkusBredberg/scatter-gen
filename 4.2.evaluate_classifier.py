@@ -10,9 +10,9 @@ from collections import defaultdict
 from sklearn.manifold import TSNE
 from torch.utils.data import TensorDataset, DataLoader
 import matplotlib.pyplot as plt
-from matplotlib import colormaps  # For newer Matplotlib versions
 import matplotlib.lines as mlines  # <-- For creating custom line legend entries
 from matplotlib.colors import LinearSegmentedColormap
+from matplotlib import colormaps  # For newer Matplotlib versions
 import seaborn as sns
 import os
 os.makedirs('./classifier/trained_models', exist_ok=True)
@@ -1160,70 +1160,39 @@ def old_plot_loss(
 
 class_descriptions = [cls['description'] for cls in classes if cls['tag'] in galaxy_classes]
 
-# ——— Compute averages over the last subset of each fold ———
-from collections import defaultdict
-import numpy as np
-
+# ---------------------- Rankings & summary ----------------------
+# We summarize for the last (largest) subset in the selected fold(s).
 metrics_last = defaultdict(lambda: defaultdict(list))
-for λ in lambda_values:
+
+for lam in valid_lambda_values:
     for fold in folds:
         subset = max(dataset_sizes[fold])
         for exp, lr, reg in itertools.product(range(num_experiments), learning_rates, regularization_params):
-            eval_key = f"{generators[0]}_{subset}_{fold}_{exp}_{lr}_{reg}_{λ}"
-            y_true_dict = metrics.get(f"{generators[0]}_all_true_labels_{subset}_{fold}_{exp}_{lr}_{reg}_{λ}", [])
-            y_pred_dict = metrics.get(f"{generators[0]}_all_pred_labels_{subset}_{fold}_{exp}_{lr}_{reg}_{λ}", [])
-            if not y_true_dict or not y_pred_dict:
-                continue
-            y_true = y_true_dict[0].get(eval_key, [])
-            y_pred = y_pred_dict[0].get(eval_key, [])
-            if not y_true or not y_pred:
-                continue
-            metrics_last[λ]["accuracy"].append(accuracy_score(y_true, y_pred))
-            metrics_last[λ]["precision"].append(precision_score(y_true, y_pred, average='macro', zero_division=0))
-            metrics_last[λ]["recall"].append(
-                recall_score(y_true, y_pred,
-                            average='binary' if is_binary else 'macro',
-                            pos_label=1 if is_binary else None,
-                            zero_division=0)
-            )
-            metrics_last[λ]["f1_score"].append(f1_score(y_true, y_pred, average='macro', zero_division=0))
-            
-            # For comparison also read in the metric values from the metrics dict
-            acc_list = metrics.get(f"{generators[0]}_accuracy_{subset}_{fold}_{exp}_{lr}_{reg}_{λ}", [])
-            prec_list = metrics.get(f"{generators[0]}_precision_{subset}_{fold}_{exp}_{lr}_{reg}_{λ}", [])
-            rec_list = metrics.get(f"{generators[0]}_recall_{subset}_{fold}_{exp}_{lr}_{reg}_{λ}", [])
-            f1_list = metrics.get(f"{generators[0]}_f1_score_{subset}_{fold}_{exp}_{lr}_{reg}_{λ}", [])
-            if acc_list:
-                metrics_last[λ]["accuracy"].append(acc_list[0])
-            if prec_list:   
-                metrics_last[λ]["precision"].append(prec_list[0])
-            if rec_list:
-                metrics_last[λ]["recall"].append(rec_list[0])
-            if f1_list:
-                metrics_last[λ]["f1_score"].append(f1_list[0])
+            for metric in ["accuracy", "precision", "recall", "f1_score"]:
+                k = f"{generators[0]}_{metric}_{subset}_{fold}_{exp}_{lr}_{reg}_{lam}"
+                if k in tot_metrics and tot_metrics[k]:
+                    metrics_last[lam][metric].append(tot_metrics[k][0])
 
-
-# ——— Rankings for each λ and metric ———
-for λ, stats in metrics_last.items():
-    print(f"\nRankings for λ = {λ}:")
-    for metric, vals in stats.items():
-        print(f"\n{metric.capitalize()} Rankings (sorted by highest value):")
-        # Sort the raw values, then enumerate
-        sorted_vals = sorted(vals, reverse=True)
-        for rank, v in enumerate(sorted_vals, start=1):
+# Pretty print rankings per λ
+for lam, stats in metrics_last.items():
+    print(f"\nRankings for λ = {lam}:\n")
+    for metric in ["accuracy", "precision", "recall", "f1_score"]:
+        vals = stats.get(metric, [])
+        print(f"{metric.capitalize()} Rankings (sorted by highest value):")
+        for rank, v in enumerate(sorted(vals, reverse=True), start=1):
             print(f"{rank}: {metric.capitalize()}: {v:.4f}")
+        print()
 
-# ——— Five-point averages for each λ ———
-for λ, stats in metrics_last.items():
-    print(f"\nLambda = {λ}")
-    for metric, vals in stats.items():
-        mean = np.mean(vals)
-        std  = np.std(vals)
-        print(f"{metric.capitalize()}: Mean = {mean:.4f}, Std = {std:.4f}")
+# Mean ± Std per λ
+for lam, stats in metrics_last.items():
+    print(f"Lambda = {lam}")
+    for metric in ["accuracy", "precision", "recall", "f1_score"]:
+        vals = np.array(stats.get(metric, []), dtype=float)
+        if vals.size:
+            print(f"{metric.capitalize()}: Mean = {vals.mean():.4f}, Std = {vals.std():.4f}")
+    print()
 
 print("\nTraining Times (aggregated):")
-from collections import defaultdict
-
 all_subset_sizes = {s for fs in dataset_sizes for s in fs}
 merged_times = defaultdict(list)
 
@@ -1396,7 +1365,9 @@ if any(lam > 0 for lam in lambda_values):
         )
 
         plot_overlap_image_grids(model, real_loader, gen_loader, device=device)
-#
+
+
+# ——— Make plots ———
 plot_loss(generators, history=history)
 #plot_roc_curves(metrics, generators)
 #plot_avg_roc_curves(metrics, generators, merge_map=merge_map)

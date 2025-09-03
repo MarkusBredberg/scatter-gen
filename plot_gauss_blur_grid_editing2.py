@@ -522,13 +522,14 @@ def plot_galaxy_grid(images, filenames, labels,
                         rotation=90, va='center', ha='right', fontsize=8)
 
     # two stacked colorbars (shared for all rows)
-    from matplotlib.cm import ScalarMappable
     cax_nonres = fig.add_axes([0.996, 0.55, 0.012, 0.38])
     cax_resid  = fig.add_axes([0.996, 0.07, 0.012, 0.38])
     fig.colorbar(ScalarMappable(norm=img_norm, cmap="viridis"), cax=cax_nonres,
                 label="stretched intensity (0–1)")
-    R_global = max(R_all) if R_all else 1.0
-    fig.colorbar(ScalarMappable(norm=TwoSlopeNorm(-R_global, 0.0, R_global), cmap=RES_CMAP),
+    valid_R = [float(r) for r in R_all if np.isfinite(r) and r > 0]
+    R_global = max(valid_R) if valid_R else 1.0
+    res_norm_global = TwoSlopeNorm(vmin=-R_global, vcenter=0.0, vmax=R_global)
+    fig.colorbar(ScalarMappable(norm=res_norm_global, cmap=RES_CMAP),
                 cax=cax_resid, label="Δ (stretched units)")
 
 
@@ -565,6 +566,4 @@ if __name__ == "__main__":
     eval_imgs   = result[2]
     eval_labels = result[3]  # eval_labels lives at index 3
     eval_fns    = result[5]
-    plot_galaxy_grid(eval_imgs, eval_fns, eval_labels, SKIP_CLIP_NORM=True)
-    
-    
+    plot_galaxy_grid(eval_imgs, eval_fns, eval_labels, SKIP_CLIP_NORM=False)
