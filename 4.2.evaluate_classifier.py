@@ -37,11 +37,13 @@ galaxy_classes = [50, 51] # e.g., [10, 11, 12, 13] for FRI, FRII, Compact, Bent
 learning_rates = [1e-3]
 regularization_params = [1e-3]
 lambda_values = [0]
-num_experiments = 5
+num_experiments = 100
+percentile_lo, percentile_hi = 30, 90
 folds = [5] # Number of folds for cross-validation
 generators = ['DDPM']
 classifier = ["TinyCNN", "Rustige", "SCNN", "CNNSqueezeNet", "DualCNNSqueezeNet", "CloudNet", "DANN", "ScatterNet", "ScatterDual", "ScatterSqueezeNet", "Binary", "ScatterResNet"][-3]
 print("Classifier:", classifier)
+crop_size = (1, 512, 512)  # Crop size for the images
 
 # -------------------------- NEW GAN CONFIGURATION --------------------------
 gan_epoch = 500           # e.g., epoch number to load from
@@ -94,10 +96,10 @@ elif galaxy_classes == [50, 51]:
     else:
         #dataset_sizes = [[12, 127, 1272], [12, 127, 1272], [12, 127, 1272], [12, 127, 1272], [12, 127, 1272], [12, 127, 1272]]
         #dataset_sizes = [[12, 124, 1248], [12, 124, 1248], [12, 124, 1248], [12, 124, 1248], [12, 124, 1248], [12, 124, 1248]]
-        #dataset_sizes = [[1264], [1264], [1264], [1264], [1264], [1264]]
+        dataset_sizes = [[1264], [1264], [1264], [1264], [1264], [1264]]
         #dataset_sizes = [[12, 126, 1264], [12, 126, 1264], [12, 126, 1264], [12, 126, 1264], [12, 126, 1264], [12, 126, 1264]]
         #dataset_sizes = [[14, 144, 1440], [14, 144, 1440], [14, 144, 1440], [14, 144, 1440], [14, 144, 1440], [14, 144, 1440]] 
-        dataset_sizes = [[1440], [1440], [1440], [1440], [1440], [1440]]
+        #dataset_sizes = [[1440], [1440], [1440], [1440], [1440], [1440]]
 elif galaxy_classes == [52, 53]: # RH vs RR
     dataset_sizes = [[2, 16, 168], [2, 16, 168], [2, 16, 168], [2, 16, 168], [2, 16, 168], [2, 16, 168]]
 elif galaxy_classes == [11, 12]:
@@ -189,10 +191,9 @@ for lambda_generate in lambda_values:
         learning_rates, regularization_params, range(num_experiments), generators, folds
     ):
         for subset_size in dataset_sizes[fold]:
-            metrics_read_path = (
-                f"{directory}{classifier}_{galaxy_classes}_{generator}_"
-                f"{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}_metrics_data.pkl"
-            )
+            #metrics_read_path = (f"{directory}{classifier}_{galaxy_classes}_{generator}_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}_metrics_data.pkl")
+            metrics_read_path = f"./classifier/4.1.runs/{galaxy_classes}_{generator}_lr{lr}_reg{reg}_lo{percentile_lo}_hi{percentile_hi}_"\
+                f"cs{crop_size[0]}x{crop_size[1]}_sz{subset_size}_f{fold}_e{experiment}_lam{lambda_generate}_metrics_data.pkl"
             try:
                 with open(metrics_read_path, 'rb') as f:
                     data = pickle.load(f)
@@ -211,16 +212,17 @@ for lambda_generate in lambda_values:
                 if not y_true or not y_pred:
                     continue  # nothing to aggregate for this combo
 
-                # use the number of target classes
-                is_binary = (len(galaxy_classes) == 2)
-
-                # ...
                 acc  = accuracy_score(y_true, y_pred)
-                prec = precision_score(y_true, y_pred, average='macro', zero_division=0)
-                rec  = (recall_score(y_true, y_pred, average='binary', pos_label=1, zero_division=0)
-                        if is_binary else
-                        recall_score(y_true, y_pred, average='macro', zero_division=0))
-                f1   = f1_score(y_true, y_pred, average='macro', zero_division=0)
+                if len(galaxy_classes) == 2:
+                    # for binary classification, pos_label=1 means the second class in sorted order
+                    positive_class = 1 if galaxy_classes[1] > galaxy_classes[0] else 0
+                    prec = precision_score(y_true, y_pred, pos_label=positive_class, average='binary', zero_division=0)
+                    rec  = recall_score(y_true, y_pred, pos_label=positive_class, average='binary', zero_division=0)
+                    f1   = f1_score(y_true, y_pred, pos_label=positive_class, average='binary', zero_division=0)
+                else:
+                    prec = precision_score(y_true, y_pred, average='macro', zero_division=0)
+                    rec  = recall_score(y_true, y_pred, average='macro', zero_division=0)
+                    f1   = f1_score(y_true, y_pred, average='macro', zero_division=0)
 
 
                 update_metrics(

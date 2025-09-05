@@ -307,7 +307,7 @@ def get_synthetic(
 ################################### DATA SELECTION FUNCTIONS #########################################
 ######################################################################################################
 
-def percentile_stretch(x, lo=80, hi=99):
+def percentile_stretch(x, lo=30, hi=99):
     """
     x: Tensor of shape (B, C, H, W)
     Returns: same shape, linearly rescaled so that the lo-th percentile → 0 and hi-th → 1
@@ -911,6 +911,47 @@ def remove_outliers(images, labels, threshold=0.1, peak_threshold=0.6, intensity
 #######################################################################################################
 ################################### DATA AUGMENTATION FUNCTIONS #######################################
 #######################################################################################################
+
+def plot_class_images(images, labels, filenames=None, set_name='train'):
+    # ensure labels are a plain list of ints
+    if isinstance(labels, torch.Tensor):
+        labels = labels.tolist()
+
+    # if images have more than one channel (C, H, W), only use the first channel
+    if isinstance(images, torch.Tensor) and images.ndim == 4:
+        images = [img[0] for img in images]
+    
+    desc_map = {c['tag']: c['description'] for c in get_classes()}
+    
+    for cls in sorted(set(labels)):
+        # collect up to 10 examples of this class
+        idxs = [i for i,l in enumerate(labels) if l == cls][:10]
+        if not idxs:
+            continue
+        
+        fig, axes = plt.subplots(2, 5, figsize=(10, 4))
+        fig.suptitle(f"{set_name} images for class {cls} – {desc_map.get(cls, '')}", fontsize=12)
+        
+        for ax, idx in zip(axes.flat, idxs):
+            img = images[idx]
+            arr = img.squeeze().cpu().numpy() if isinstance(img, torch.Tensor) else np.squeeze(img)
+            
+            # If multiple channels take the first channel
+            if arr.ndim == 3 and arr.shape[0] > 1:
+                arr = arr[0]
+            
+            ax.imshow(arr, cmap='viridis', origin='lower')
+            ax.axis('off')
+            if filenames and idx < len(filenames):
+                ax.set_title(filenames[idx], fontsize=8)
+        
+        # blank out any unused subplots
+        for ax in axes.flat[len(idxs):]:
+            ax.axis('off')
+        
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        plt.savefig(f"./classifier/{cls}_{set_name}_images.png", dpi=300)
+        plt.close(fig)
 
 
 def balance_classes(images, labels):
@@ -1991,7 +2032,7 @@ def load_PSZ2(path=root_path + "PSZ2/classified/",
               target_classes=[53],
               crop_size=(1, 256, 256),
               downsample_size=(1, 256, 256),
-              versions='T100kpcSUB',      # <-- replaced 'version' with 'versions'
+              versions='T100kpcSUB',     
               USE_GLOBAL_NORMALISATION=False,
               GLOBAL_NORM_MODE='flux',
               percentile_lo=1, percentile_hi=99,
@@ -2047,6 +2088,8 @@ def load_PSZ2(path=root_path + "PSZ2/classified/",
             # 25 kpc
             't25kpcsub':    'T25kpcSUB',
             '25kpcsub':     'T25kpcSUB',
+            't25S':         'T25kpcSUB',
+            '25kpcS':       'T25kpcSUB',
             't25kpc':       'T25kpc',
             't25':          'T25kpc',
             '25kpc':        'T25kpc',
@@ -2054,6 +2097,8 @@ def load_PSZ2(path=root_path + "PSZ2/classified/",
             # 50 kpc
             't50kpcsub':    'T50kpcSUB',
             '50kpcsub':     'T50kpcSUB',
+            't50S':        'T50kpcSUB',
+            '50kpcS':      'T50kpcSUB',
             't50kpc':       'T50kpc',
             't50':          'T50kpc',
             '50kpc':        'T50kpc',
@@ -2061,6 +2106,8 @@ def load_PSZ2(path=root_path + "PSZ2/classified/",
             # 100 kpc
             't100kpcsub':   'T100kpcSUB',
             '100kpcsub':    'T100kpcSUB',
+            't100S':        'T100kpcSUB',
+            '100kpcS':      'T100kpcSUB',
             't100kpc':      'T100kpc',
             't100':         'T100kpc',
             '100kpc':       'T100kpc',
@@ -2093,60 +2140,80 @@ def load_PSZ2(path=root_path + "PSZ2/classified/",
     classes_map = {c["tag"]: c["description"] for c in get_classes()}
 
     if CUBE:
-        # pick the requested version folders from `versions` (kept rest of logic identical)
         vf_list = _vf_list
-        #print(f"[load_PSZ2] CUBE mode: using versions {vf_list} (T={len(vf_list)})")
+        ref_version = 'RAW' if 'RAW' in {v.upper() for v in vf_list} else vf_list[0]
 
         def _list_fits_bases(version, class_folder):
-            folder = os.path.join(root_path, "PSZ2/classified", version, class_folder)
+            # use the function arg `path` so callers can override root
+            folder = os.path.join(path, version, class_folder)
             if not os.path.isdir(folder):
                 raise FileNotFoundError(f"Version folder missing: {folder}")
-            bases = {
-                os.path.splitext(fn)[0]
-                for fn in os.listdir(folder)
-                if fn.lower().endswith(".fits")
-            }
+            bases = {os.path.splitext(fn)[0] for fn in os.listdir(folder)
+                    if fn.lower().endswith(".fits")}
             if not bases:
                 raise FileNotFoundError(f"No FITS files found in {folder}")
-            return bases
+            return folder, bases
+
+        # canonical output size and reference crop size
+        ch_out, Ho, Wo = downsample_size
+        ref_ch, Hc_ref, Wc_ref = crop_size
 
         for cls in target_classes:
             class_folder = classes_map.get(cls)
             if class_folder is None:
                 continue
-            label = cls
+            label = cls  # keep original class ids (50, 51, ...)
 
-            # Require a common basename across *all* requested versions
-            base_sets = {vf: _list_fits_bases(vf, class_folder) for vf in vf_list}
-            base_names = sorted(set.intersection(*(s for s in base_sets.values())))
-            if not base_names:
-                raise FileNotFoundError(
-                    f"No common FITS basenames across versions {vf_list} for class {class_folder}"
-                )
+            # Build intersection of FITS basenames across requested versions for this class
+            folder_map = {}
+            base_sets = {}
+            for vf in vf_list:
+                folder, bases = _list_fits_bases(vf, class_folder)
+                folder_map[vf] = folder
+                base_sets[vf] = bases
 
-            # Load each base across all versions; error if any file is missing
-            for base in base_names:
+            common_bases = sorted(set.intersection(*base_sets.values()))
+            if not common_bases:
+                print(f"[load_PSZ2] No common basenames for class '{class_folder}' across {vf_list}. Skipping.")
+                continue
+
+            # Helper: pixel scale (deg/pix)
+            def _pixdeg(h):
+                if 'CDELT1' in h:
+                    return abs(h['CDELT1'])
+                cd11 = h.get('CD1_1'); cd12 = h.get('CD1_2', 0.0)
+                if cd11 is not None:
+                    return float(np.hypot(cd11, cd12))
+                raise KeyError("No CDELT* or CD* keywords in FITS header")
+
+            for base in common_bases:
+                # reference header to define physical crop
+                ref_path = os.path.join(folder_map[ref_version], f"{base}.fits")
+                ref_hdr  = fits.getheader(ref_path)
+                ref_pixdeg = _pixdeg(ref_hdr)
+
                 frames = []
                 for vf in vf_list:
-                    fits_path = os.path.join(root_path, "PSZ2/classified", vf, class_folder, f"{base}.fits")
-                    if not os.path.isfile(fits_path):
-                        raise FileNotFoundError(f"Missing FITS: {fits_path}")
+                    fpath = os.path.join(folder_map[vf], f"{base}.fits")
+                    hdr   = fits.getheader(fpath)
+                    arr   = np.squeeze(fits.getdata(fpath)).astype(np.float32)
+                    if arr.ndim == 3:
+                        arr = arr.mean(axis=0)  # collapse cubes if any
 
-                    arr = fits.getdata(fits_path).astype(np.float32)
-                    arr = np.squeeze(arr)
-                    if arr.ndim == 3:          # collapse cubes if necessary
-                        arr = arr.mean(axis=0)
-                    elif arr.ndim != 2:
-                        raise ValueError(f"Unexpected FITS shape {arr.shape} in {fits_path}")
+                    # scale crop to same physical FOV as reference
+                    s = ref_pixdeg / _pixdeg(hdr)   # >1 ⇒ coarser pixels ⇒ larger crop window
+                    Hc_v = max(1, int(round(Hc_ref * s)))
+                    Wc_v = max(1, int(round(Wc_ref * s)))
 
-                    frame = torch.from_numpy(arr).unsqueeze(0)  # [1,H,W]
-                    frame = apply_formatting(frame, crop_size, downsample_size)
-                    frames.append(frame)
+                    ten = torch.from_numpy(arr).unsqueeze(0)  # [1,H,W]
+                    frm = apply_formatting(ten, (1, Hc_v, Wc_v), (1, Ho, Wo))
+                    frames.append(frm)
 
-                cube = torch.stack(frames, dim=0)  # [T,1,H,W]
+                cube = torch.stack(frames, dim=0)  # [T,1,Ho,Wo] in vf_list order
                 images.append(cube)
                 labels.append(label)
                 filenames.append(base)
+
 
     else:
         # ---------- legacy single-version path (FITS-based) ----------
@@ -2348,8 +2415,8 @@ def load_MGCLS(path='/users/mbredber/data/MGCLS/classified_crops_1600/',  # Path
     return train_images, train_labels, eval_images, eval_labels
 
 
-def load_galaxies(galaxy_classes, path=None, versions=None, fold=None, island=None, crop_size=None, downsample_size=None, sample_size=None, 
-                  REMOVEOUTLIERS=True, BALANCE=False, AUGMENT=False, USE_GLOBAL_NORMALISATION=False, GLOBAL_NORM_MODE="percentile", STRETCH=False, percentile_lo=80, percentile_hi=99,
+def load_galaxies(galaxy_classes, path=None, versions=None, fold=None, island=None, crop_size=None, downsample_size=None, sample_size=None, DEBUG=False,
+                  REMOVEOUTLIERS=True, BALANCE=False, AUGMENT=False, USE_GLOBAL_NORMALISATION=False, GLOBAL_NORM_MODE="percentile", STRETCH=False, percentile_lo=30, percentile_hi=99,
                  NORMALISE=True, NORMALISETOPM=False, EXTRADATA=False, PRINTFILENAMES=False, SAVE_IMAGES=False, train=None):
     """
     Master loader that delegates to specific dataset loaders and returns zero-based labels.
@@ -2402,30 +2469,11 @@ def load_galaxies(galaxy_classes, path=None, versions=None, fold=None, island=No
         train_filenames = eval_filenames = None  # No filenames returned
     elif len(data) == 6:
         train_images, train_labels, eval_images, eval_labels, train_filenames, eval_filenames = data
-        # DEBUG PSZ2 split
-        #print(f"→ load_PSZ2 returned {len(data)} items")
-        
-        ## inspect a few IDs and the corresponding labels
-        #print("  train IDs:", train_filenames[:5])
-        #print("  train labels:", train_labels[:5])
-        #print("  eval IDs:", eval_filenames[:5])
-        #print("  eval labels:", eval_labels[:5])
-
-        # ensure no cluster appears in both
         overlap = set(train_filenames) & set(eval_filenames)
         assert not overlap, f"PSZ2 split error — these IDs are in both sets: {overlap}"
-        
     else:
         raise ValueError("Data loader did not return the expected number of outputs.")
-        
-    
-    # If images are list, converge them to tensors
-    #if isinstance(train_images, list):
-    #    train_images = torch.stack(train_images).clone().detach()
-    #    train_labels = torch.tensor(train_labels, dtype=torch.long)
-    #    eval_images  = torch.stack(eval_images).clone().detach()
-    #    eval_labels  = torch.tensor(eval_labels,  dtype=torch.long)
-    
+
     # Check for overlap between train and test sets
     train_hashes = {img_hash(img) for img in train_images}
     eval_hashes = {img_hash(img) for img in eval_images}
@@ -2442,287 +2490,9 @@ def load_galaxies(galaxy_classes, path=None, versions=None, fold=None, island=No
         train_images = torch.stack(train_images)
     if isinstance(eval_images, list):
         eval_images  = torch.stack(eval_images)
-        
-    if galaxy_classes[0] == 52 and galaxy_classes[1] == 53: # Plot some train and validation images for each class
-        # Plotting the training and evaluation images for each class
-        from matplotlib import gridspec
-        
-        unique_train_labels = sorted(set(train_labels))
-        unique_eval_labels  = sorted(set(eval_labels))
-        n_train_classes = len(unique_train_labels)
-        n_eval_classes  = len(unique_eval_labels)
-        n_cols = 4  # Number of columns in the grid
-        n_rows = max(n_train_classes, n_eval_classes) // n_cols + 1
-        # Plot 5 examples per class for train and eval, with row labels
-        n_examples = 5
-        train_classes = sorted(set(train_labels))
-        eval_classes  = sorted(set(eval_labels))
-        n_train = len(train_classes)
-        n_eval  = len(eval_classes)
-
-        fig, axes = plt.subplots(n_train + n_eval, n_examples,
-                                figsize=(n_examples * 3, (n_train + n_eval) * 2),
-                                constrained_layout=True)
-
-        # Plot train rows
-        for i, cls in enumerate(train_classes):
-            imgs = [img for img, lbl in zip(train_images, train_labels) if lbl == cls][:n_examples]
-            for j, img in enumerate(imgs):
-                ax = axes[i, j]
-                ax.imshow(img.squeeze(), cmap='gray', origin='lower')
-                ax.axis('off')
-            # Left-hand label for this row
-            axes[i, 0].text(-0.2, 0.5, f'Train\nClass {cls}',
-                            transform=axes[i, 0].transAxes,
-                            va='center', ha='right', fontsize=12)
-
-        # Plot eval rows
-        for k, cls in enumerate(eval_classes):
-            i = n_train + k
-            imgs = [img for img, lbl in zip(eval_images, eval_labels) if lbl == cls][:n_examples]
-            for j, img in enumerate(imgs):
-                ax = axes[i, j]
-                ax.imshow(img.squeeze(), cmap='gray', origin='lower')
-                ax.axis('off')
-            axes[i, 0].text(-0.2, 0.5, f'Eval\nClass {cls}',
-                            transform=axes[i, 0].transAxes,
-                            va='center', ha='right', fontsize=12)
-
-        plt.savefig(f"./classifier/{galaxy_classes[0]}_{galaxy_classes[1]}_5perclass_labeled.png", dpi=300)
-        plt.close(fig)
-        print(f"Saved training and evaluation images for classes {galaxy_classes} to ./classifier/{'_'.join(map(str, galaxy_classes))}_train_eval_images.png")
 
     if BALANCE:
         train_images, train_labels = balance_classes(train_images, train_labels) # Remove excess images from the largest class
-        
-    if STRETCH and not USE_GLOBAL_NORMALISATION:
-        train_class_ids = sorted(set(train_labels))
-        for class_id in train_class_ids:
-            train_idx   = next(i for i, lbl in enumerate(train_labels) if lbl == class_id)
-            source_name = train_filenames[train_idx]
-            cls_img     = train_images[train_idx]
-            #print(f"🔍 Using training source {source_name} for class {class_id} at index {train_idx}")
-            
-            # now load its FITS
-            fits_path = f"/users/mbredber/scratch/data/PSZ2/fits/{source_name}/{source_name}.fits"
-            fits_data = fits.getdata(fits_path).astype(float)
-            fits_img  = torch.from_numpy(fits_data)
-            
-            # Crop the FITS image to match the crop size
-            fits_img = apply_formatting(fits_img, crop_size=(crop_size[-3], crop_size[-2], crop_size[-1]), downsample_size=(downsample_size[-3], downsample_size[-2], downsample_size[-1]))
-            #check_tensor('CUTOUT', cls_img)
-            #check_tensor('FITS',   fits_img)
-
-            # 4) define your stretches and clipping ranges
-            clip_ranges = [(60,99.9), (70,99.5), (80,99)]
-            clip_thresholds = [0.02, 0.025, 0.03, 0.35]  # adjust or extend as you like
-            funcs = [
-                ('original', lambda x: x),
-                ('asinh',     lambda x: asinh_stretch(x, alpha=10)),
-                ('log',       lambda x: log_stretch(x, alpha=10)),
-            ]
-
-                # 5) loop over the *same* source for CUTOUT vs FITS
-            for img, suffix in [
-                (cls_img,  "CUTOUT"),
-                (fits_img, "FITS"),
-            ]:
-                # define rows and columns
-                clip_ranges_plot = [(0, 100)] + clip_ranges[:3]  # top row is no cutoff
-                funcs = [
-                    ('original', lambda x: x),
-                    ('log',      lambda x: log_stretch(x,  alpha=10)),
-                    ('asinh',    lambda x: asinh_stretch(x, alpha=10)),
-                ]
-                n_rows = len(clip_ranges_plot)
-                n_cols = len(funcs)
-
-                fig, axes = plt.subplots(
-                    n_rows, n_cols,
-                    figsize=(4 * n_cols, 4 * n_rows),
-                    gridspec_kw={ 'hspace': 0.3,  # shrink vertical gap
-                                  'wspace': 0.2 },# tighten horizontal gap
-                    constrained_layout=False
-                )
-                # make room on left for our y‑labels
-                fig.subplots_adjust(left=0.18)
-
-                # set column headers
-                for j, (name, _) in enumerate(funcs):
-                    axes[0, j].set_title(name)
-                    
-                #check_tensor(f'Properties of the {suffix} image before stretching', img)
-
-                # fill grid
-                for i, (lo, hi) in enumerate(clip_ranges_plot):
-                    for j, (_, fn) in enumerate(funcs):
-                        P   = percentile_stretch(img, lo=lo, hi=hi)
-                        out = fn(P)
-                        #check_tensor(f'Properties of the {suffix} image after stretching with {lo}-{hi} percentile, and {fn.__name__} function', out)
-                        arr = out.squeeze().cpu().numpy()
-
-                        ax = axes[i, j]
-                        # ensure arr is 2D (H,W) or color (H,W,3/4) before imshow
-                        if isinstance(arr, torch.Tensor):
-                            arr = arr.detach().cpu().numpy()
-
-                        if arr.ndim == 3:
-                            # Case: (C,H,W) or (T,H,W)
-                            if arr.shape[0] in (3, 4):
-                                # interpret as channels-first RGB(A) → move to (H,W,3/4)
-                                arr = np.moveaxis(arr, 0, -1)
-                            else:
-                                # e.g. (2,H,W): pick the first plane (or use arr.mean(0) if you prefer)
-                                arr = arr[0]
-
-                        im = ax.imshow(arr, cmap='viridis', origin='lower')
-
-                        if j == 0:
-                            ax.set_ylabel(f'pctile [{lo},{hi}]',
-                                        rotation=0, labelpad=40)
-                        # hide only ticks and spines, keep the ylabel
-                        ax.set_xticks([])  
-                        ax.set_yticks([])  
-                        for spine in ax.spines.values():  
-                            spine.set_visible(False)
-                        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-                        
-
-                fig.suptitle(source_name)
-                plt.savefig(f"./classifier/{class_id}_train_{source_name}_{suffix}_stretching.png", dpi=300)
-                plt.close(fig)
-                
-        # now do exactly the same thing for one example per class in the EVAL set
-        eval_class_ids = sorted(set(eval_labels))
-        for class_id in eval_class_ids:
-            # pick the first eval image of this class
-            eval_idx    = next(i for i, lbl in enumerate(eval_labels) if lbl == class_id)
-            source_name = eval_filenames[eval_idx]
-            cls_img     = eval_images[eval_idx]
-            #print(f"🔍 Using eval source {source_name} for class {class_id} at index {eval_idx}")
-
-            # load its FITS just like above
-            fits_path = f"/users/mbredber/scratch/data/PSZ2/fits/{source_name}/{source_name}.fits"
-            fits_data = fits.getdata(fits_path).astype(float)
-            fits_img  = torch.from_numpy(fits_data)
-            fits_img  = apply_formatting(
-                fits_img,
-                crop_size=(crop_size[-3], crop_size[-2], crop_size[-1]),
-                downsample_size=(downsample_size[-3], downsample_size[-2], downsample_size[-1])
-            )
-            #check_tensor('CUTOUT_eval', cls_img)
-            #check_tensor('FITS_eval',   fits_img)
-
-            # same clip‐ranges & funcs
-            clip_ranges_plot = [(0,100), (60,99.9), (70,99.8), (80,99.7)]
-            funcs = [
-                ('original', lambda x: x),
-                ('log',      lambda x: log_stretch(x,  alpha=10)),
-                ('asinh',    lambda x: asinh_stretch(x, alpha=10)),
-            ]
-            n_rows = len(clip_ranges_plot)
-            n_cols = len(funcs)
-
-            # loop over CUTOUT vs FITS just like for train
-            for img, suffix in [(cls_img, "CUTOUT"), (fits_img, "FITS")]:
-                fig, axes = plt.subplots(
-                    n_rows, n_cols,
-                    figsize=(4 * n_cols, 4 * n_rows),
-                    gridspec_kw={ 'hspace': 0.3,
-                                'wspace': 0.2 },
-                    constrained_layout=False
-                )
-                fig.subplots_adjust(left=0.18)
-
-                # set column headers
-                for j, (name, _) in enumerate(funcs):
-                    axes[0, j].set_title(name)
-
-                # fill grid
-                for i, (lo, hi) in enumerate(clip_ranges_plot):
-                    for j, (_, fn) in enumerate(funcs):
-                        P   = percentile_stretch(img, lo=lo, hi=hi)
-                        out = fn(P)
-                        arr = out.squeeze().cpu().numpy()
-
-                        ax = axes[i, j]
-                        
-                        if isinstance(arr, torch.Tensor):
-                            arr = arr.detach().cpu().numpy()
-
-                        if arr.ndim == 3:
-                            # Case: (C,H,W) or (T,H,W)
-                            if arr.shape[0] in (3, 4):
-                                # interpret as channels-first RGB(A) → move to (H,W,3/4)
-                                arr = np.moveaxis(arr, 0, -1)
-                            else:
-                                # e.g. (2,H,W): pick the first plane (or use arr.mean(0) if you prefer)
-                                arr = arr[0]
-
-                        im = ax.imshow(arr, cmap='viridis', origin='lower')
-
-                        if j == 0:
-                            ax.set_ylabel(
-                                f"pctile [{lo},{hi}]",
-                                rotation=0,
-                                va='center',
-                                ha='right',
-                                labelpad=30,
-                                fontsize=12
-                            )
-
-                        ax.set_xticks([])
-                        ax.set_yticks([])
-                        for spine in ax.spines.values():
-                            spine.set_visible(False)
-
-                        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-
-                # include suffix in the title & filename
-                fig.suptitle(f"eval {class_id} — {source_name} ({suffix})")
-                plt.savefig(f"./classifier/{class_id}_eval_{source_name}_{suffix}_stretching.png", dpi=300)
-                plt.close(fig)
-
-    def plot_class_images(images, labels, filenames=None, set_name='train'):
-        # ensure labels are a plain list of ints
-        if isinstance(labels, torch.Tensor):
-            labels = labels.tolist()
-
-        # if images have more than one channel (C, H, W), only use the first channel
-        if isinstance(images, torch.Tensor) and images.ndim == 4:
-            images = [img[0] for img in images]
-        
-        desc_map = {c['tag']: c['description'] for c in get_classes()}
-        
-        for cls in sorted(set(labels)):
-            # collect up to 10 examples of this class
-            idxs = [i for i,l in enumerate(labels) if l == cls][:10]
-            if not idxs:
-                continue
-            
-            fig, axes = plt.subplots(2, 5, figsize=(10, 4))
-            fig.suptitle(f"{set_name} images for class {cls} – {desc_map.get(cls, '')}", fontsize=12)
-            
-            for ax, idx in zip(axes.flat, idxs):
-                img = images[idx]
-                arr = img.squeeze().cpu().numpy() if isinstance(img, torch.Tensor) else np.squeeze(img)
-                
-                # If multiple channels take the first channel
-                if arr.ndim == 3 and arr.shape[0] > 1:
-                    arr = arr[0]
-                
-                ax.imshow(arr, cmap='viridis', origin='lower')
-                ax.axis('off')
-                if filenames and idx < len(filenames):
-                    ax.set_title(filenames[idx], fontsize=8)
-            
-            # blank out any unused subplots
-            for ax in axes.flat[len(idxs):]:
-                ax.axis('off')
-            
-            plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-            plt.savefig(f"./classifier/{cls}_{set_name}_images.png", dpi=300)
-            plt.close(fig)
             
     sample_indices = {}
     # Convert labels to a list if they are tensors
@@ -2738,8 +2508,12 @@ def load_galaxies(galaxy_classes, path=None, versions=None, fold=None, island=No
         idxs = [i for i, lbl in enumerate(eval_labels) if lbl == cls]
         sample_indices[cls] = sample_indices.get(cls, []) + idxs[:10]
         
-    plot_class_images(train_images, train_labels, train_filenames, set_name='train_1.before_normalisation')
-    plot_class_images(eval_images,  eval_labels,  eval_filenames,  set_name='eval_1.before_normalisation')
+    if DEBUG:
+        plot_class_images(train_images, train_labels, train_filenames, set_name='train_1.before_normalisation')
+        plot_class_images(eval_images,  eval_labels,  eval_filenames,  set_name='eval_1.before_normalisation')
+        check_tensor("train_images", train_images)
+        check_tensor("eval_images",  eval_images)
+
 
     if NORMALISE:
         if isinstance(train_images, list):
@@ -2749,8 +2523,12 @@ def load_galaxies(galaxy_classes, path=None, versions=None, fold=None, island=No
         all_images = torch.cat([train_images, eval_images], dim=0)
         #all_images = normalise_images(all_images, out_min=0, out_max=1)  
         if USE_GLOBAL_NORMALISATION: # Regular normalisation of all images to [0,1]
+            if DEBUG:
+                print("Applying global normalisation to [0,1]")
             all_images = normalise_images(all_images, out_min=0, out_max=1)
         else:  # Percentile stretch to [0,1]
+            if DEBUG:
+                print(f"Applying percentile stretch to [{percentile_lo},{percentile_hi}]%")
             
             def per_image_percentile_stretch(x, lo=80, hi=99):
                 # x: [B, C, H, W]; returns same shape
@@ -2768,45 +2546,33 @@ def load_galaxies(galaxy_classes, path=None, versions=None, fold=None, island=No
                     all_images[:, t] = per_image_percentile_stretch(all_images[:, t], percentile_lo, percentile_hi)
             else:                      # [B, C, H, W]
                 all_images = per_image_percentile_stretch(all_images, percentile_lo, percentile_hi)
-
-            
-            #if len(all_images.shape) == 5:  # (B, T, C, H, W)
-            #    #print("Applying stretch separately to each T in shape:", all_images.shape)
-            #    stretched = []
-            #    for t in range(all_images.shape[1]):
-            #        all_images_t = all_images[:, t]  # shape: (B, C, H, W)
-            #        stretched_t = percentile_stretch(all_images_t, lo=percentile_lo, hi=percentile_hi)  # Percentile stretch over each T
-            #        stretched.append(stretched_t.unsqueeze(1))  # keep T dim
-            #    all_images = torch.cat(stretched, dim=1)   
-            #else:
-            #    all_images = percentile_stretch(all_images, lo=percentile_lo, hi=percentile_hi) # Percentile stretch over all images
-        #all_images = torch.stack([percentile_stretch(img, lo=60, hi=99) for img in all_images]) # Individual percentile stretch
         train_images = all_images[:len(train_images)]
         eval_images  = all_images[len(train_images):]
        
     if NORMALISETOPM:
+        if DEBUG:
+            print("Applying normalise to ±1")
         all_images = torch.cat([train_images, eval_images], dim=0)
         all_images = normalise_images(all_images, out_min=-1, out_max=1)
         train_images = all_images[:len(train_images)]
         eval_images  = all_images[len(train_images):]
-        
-    plot_class_images(train_images, train_labels, train_filenames, set_name='train_2.after_normalisation')
-    plot_class_images(eval_images,  eval_labels,  eval_filenames,  set_name='eval_2.after_normalisation')
-
+    
     if STRETCH:
-        # Asinh stretch after percentile stretch
+        if DEBUG:
+            print("Applying asinh stretch")
+        # Concatenate so train/eval get the exact same mapping
+        alpha = 10.0
         all_images = torch.cat([train_images, eval_images], dim=0)
-        images = np.stack([img.squeeze().numpy() for img in all_images], axis=0)
-        pct = torch.from_numpy(images).float()     
-        images = asinh_stretch(pct, alpha=10)                                # apply asinh
-        #images = log_stretch(pct, alpha=10)                                  # apply log stretch
-        train_images = images[:len(train_images)]
-        eval_images  = images[len(train_images):]
-        
-    plot_class_images(train_images, train_labels, train_filenames, set_name='train_3.after_stretching')
-    plot_class_images(eval_images,  eval_labels,  eval_filenames,  set_name='eval_3.after_stretching')
 
-        
+        # Asinh stretch (elementwise), preserves shape/device/dtype
+        stretched = torch.asinh(all_images * alpha) / math.asinh(alpha)
+
+        # Split back
+        n_tr = train_images.shape[0]
+        train_images = stretched[:n_tr]
+        eval_images  = stretched[n_tr:]
+
+    # Always redistribute excess images for the test data, for fair evaluation
     classes_present = torch.unique(torch.cat([torch.tensor(train_labels), torch.tensor(eval_labels)])).tolist()
     train_images, train_labels, train_filenames, eval_images, eval_labels, eval_filenames = redistribute_excess(train_images, train_labels, eval_images, eval_labels, classes_present, train_filenames, eval_filenames)
     
@@ -2823,6 +2589,8 @@ def load_galaxies(galaxy_classes, path=None, versions=None, fold=None, island=No
 
         
     if EXTRADATA and not PRINTFILENAMES:
+        if DEBUG:
+            print("Loading PSZ2 metadata")
         meta_df = pd.read_csv(os.path.join(root_path, "PSZ2/cluster_source_data.csv"))
         print("PSZ2 metadata columns:", meta_df.columns.tolist())
         meta_df.rename(columns={"slug": "base"}, inplace=True)
@@ -2833,6 +2601,8 @@ def load_galaxies(galaxy_classes, path=None, versions=None, fold=None, island=No
         eval_data  = [meta_df.loc[base].values for base in eval_filenames]
         
     if AUGMENT:
+        if DEBUG:
+            print("Applying data augmentation…")
         train_images, train_labels = augment_images(train_images, train_labels, ST_augmentation=False)
         if not (galaxy_classes[0] == 52 and galaxy_classes[1] == 53): 
             eval_images, eval_labels = augment_images(eval_images, eval_labels, ST_augmentation=False) # Only augment if not RR and RH

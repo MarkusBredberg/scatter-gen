@@ -103,7 +103,13 @@ def plot_image_grid(images, num_images=36, save_path="grid.png"):
         # select the cube
         img = images[idx].cpu().numpy()
         # if it’s C×H×W, average down to H×W for display
-        ax.imshow(first_channel(images[idx]), cmap='viridis')
+        im = images[idx]
+        if torch.is_tensor(im):
+            im = im.detach().cpu().numpy()
+        while im.ndim > 2:
+            im = im[0]
+        ax.imshow(im, cmap='viridis')
+
         ax.axis('off')
 
 

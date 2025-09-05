@@ -26,7 +26,7 @@ from sklearn.metrics import confusion_matrix
 import seaborn as sns
 import matplotlib 
 import matplotlib.pyplot as plt
-import sys, os, glob
+import sys, os, glob, re
 
 SEED = 42  # Set a seed for reproducibility
 def set_seed(seed):
@@ -83,7 +83,7 @@ classifier        = ["TinyCNN",       # Very Simple CNN
 param_grid = {
     'lr':            [1e-4, 1e-3],
     'reg':           [1e-4, 1e-3],
-    'label_smoothing':[0.0],
+    'label_smoothing':[0.1],
     'J':             [2],
     'L':             [12],
     'order':         [2],
@@ -91,11 +91,12 @@ param_grid = {
     'percentile_hi': [80, 90, 99], 
     'crop_size':     [(512,512)],
     'downsample_size':[(128,128)],
-    'versions':       ['rt25kpc']  # 'raw', 'T50kpc', ad hoc tapering: e.g. 'rt50'  strings in list → product() iterates them individually
+    'versions':       ['T100kpcSUB']  # 'raw', 'T50kpc', ad hoc tapering: e.g. 'rt50'  strings in list → product() iterates them individually
 } #'versions': [('raw', 'rt50')]  # tuple signals “stack these”
 
-FLUX_CLIPPING = False  # Clip the flux of the images
-STRETCH = True  # Stretch the images with mathematical morphology
+STRETCH = True  # Arcsinh stretch
+USE_GLOBAL_NORMALISATION = False           # single on/off switch . False - image-by-image normalisation 
+GLOBAL_NORM_MODE = "percentile"           # "percentile" or "flux"
 ES, patience = True, 10  # Use early stopping
 SCHEDULER = False  # Use a learning rate scheduler
 SHOWIMGS = False  # Show some generated images for each class (Tool for control)
@@ -149,11 +150,14 @@ base_cls = min(galaxy_classes)
 if torch.cuda.is_available():
     DEVICE = "cuda"
     num_epochs = num_epochs_cuda
-    print(f"CUDA is available. Setting epochs to {num_epochs}.")
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    DEVICE = "mps"   # Apple silicon fallback if relevant
+    num_epochs = num_epochs_cpu
 else:
     DEVICE = "cpu"
     num_epochs = num_epochs_cpu
-    print(f"CUDA is not available. Setting epochs to {num_epochs}.")    
+print(f"{DEVICE.upper()} is available. Setting epochs to {num_epochs}.")
+
 
 ARCSEC = np.deg2rad(1/3600.0)
 PSZ2_ROOT = "/users/mbredber/scratch/data/PSZ2"  # FITS root used below
@@ -261,7 +265,6 @@ def _append_rt_versions(imgs, fns, gen_versions, labels=None):
 
     return imgs_out, labels_kept, fns_kept, info
 
-
 def _first(pattern: str):
     hits = sorted(glob.glob(pattern))
     return hits[0] if hits else None
@@ -292,30 +295,83 @@ def _cov_from_beam(bmaj_as, bmin_as, pa_deg):
     S = np.diag([sx*sx, sy*sy])
     return R @ S @ R.T
 
-def _kernel_from_headers(raw_hdr, targ_hdr, pixscale_arcsec):
-    # if target missing or already broader → return delta kernel (no blur)
+def _kernel_from_headers(raw_hdr, targ_hdr, _pixscale_arcsec_unused=None):
+    """
+    Build the Gaussian2DKernel that converts the RAW beam into the TARGET beam,
+    using the full WCS CD/PC matrix (handles rotation & anisotropy). Returns
+    None if no additional blur is needed.
+    """
     if targ_hdr is None:
         return None
-    bmaj_r = float(raw_hdr['BMAJ']*3600.0);  bmin_r = float(raw_hdr['BMIN']*3600.0);  pa_r = float(raw_hdr.get('BPA', 0.0))
-    bmaj_t = float(targ_hdr['BMAJ']*3600.0); bmin_t = float(targ_hdr['BMIN']*3600.0); pa_t = float(targ_hdr.get('BPA', pa_r))
-    C_raw = _cov_from_beam(bmaj_r, bmin_r, pa_r)
-    C_tgt = _cov_from_beam(bmaj_t, bmin_t, pa_t)
-    C_ker = C_tgt - C_raw  # in radians^2
-    # clip tiny negatives from numerical roundoff
-    w, V = np.linalg.eigh(C_ker)
-    w = np.clip(w, 0.0, None)
-    C_ker = (V * w) @ V.T
 
-    # convert covariance to **pixels** of the downsampled arrays we operate on
-    pixrad = pixscale_arcsec * ARCSEC
-    C_pix = C_ker / (pixrad**2)
+    def _beam_cov_matrix(bmaj_as, bmin_as, pa_deg):
+        ARCSEC = np.deg2rad(1/3600.0)
+        sx = (bmaj_as*ARCSEC) / (2*np.sqrt(2*np.log(2)))
+        sy = (bmin_as*ARCSEC) / (2*np.sqrt(2*np.log(2)))
+        th = np.deg2rad(pa_deg)
+        R = np.array([[np.cos(th), -np.sin(th)],
+                      [np.sin(th),  np.cos(th)]], dtype=float)
+        S = np.diag([sx*sx, sy*sy])
+        return R @ S @ R.T
+
+    def _cd_matrix_rad(hdr):
+        # Return 2×2 CD in radians per pixel (supports CD or PC+CDELT)
+        if 'CD1_1' in hdr:
+            CD = np.array([[hdr['CD1_1'], hdr.get('CD1_2', 0.0)],
+                           [hdr.get('CD2_1', 0.0), hdr['CD2_2']]], dtype=float)
+        else:
+            pc11 = hdr.get('PC1_1', 1.0); pc12 = hdr.get('PC1_2', 0.0)
+            pc21 = hdr.get('PC2_1', 0.0); pc22 = hdr.get('PC2_2', 1.0)
+            cdelt1 = hdr.get('CDELT1', 1.0); cdelt2 = hdr.get('CDELT2', 1.0)
+            CD = np.array([[pc11, pc12],[pc21, pc22]], dtype=float) @ np.diag([cdelt1, cdelt2])
+        return CD * (np.pi/180.0)
+
+    # Beams in arcsec (+ PA in deg)
+    bmaj_r = float(raw_hdr['BMAJ'])*3600.0
+    bmin_r = float(raw_hdr['BMIN'])*3600.0
+    pa_r   = float(raw_hdr.get('BPA', 0.0))
+
+    bmaj_t = float(targ_hdr['BMAJ'])*3600.0
+    bmin_t = float(targ_hdr['BMIN'])*3600.0
+    pa_t   = float(targ_hdr.get('BPA', pa_r))
+
+    # Covariances in radians^2 (world coords)
+    C_raw = _beam_cov_matrix(bmaj_r, bmin_r, pa_r)
+    C_tgt = _beam_cov_matrix(bmaj_t, bmin_t, pa_t)
+
+    # Desired kernel covariance: C_ker = C_tgt - C_raw
+    C_ker = C_tgt - C_raw
+    w, V = np.linalg.eigh(C_ker)
+    w = np.clip(w, 0.0, None)        # numerical guard
+    C_ker = (V * w) @ V.T
+    if not np.any(w > 0):
+        return None  # nothing to blur
+
+    # Transform to pixel coords on the RAW grid: C_pix = J^{-1} C_ker J^{-T}
+    J = _cd_matrix_rad(raw_hdr)
+    Jinv = np.linalg.inv(J)
+    C_pix = Jinv @ C_ker @ Jinv.T
+
+    # Eigen-decompose in pixels
     w_pix, V_pix = np.linalg.eigh(C_pix)
-    sx_pix = np.sqrt(max(w_pix[1], 0.0))
-    sy_pix = np.sqrt(max(w_pix[0], 0.0))
-    theta  = np.arctan2(V_pix[1,1], V_pix[0,1])  # PA of major axis
-    if sx_pix == 0 and sy_pix == 0:
+    w_pix = np.clip(w_pix, 0.0, None)
+    if not np.any(w_pix > 0):
         return None
+    sx_pix = float(np.sqrt(w_pix[1]))  # major
+    sy_pix = float(np.sqrt(w_pix[0]))  # minor
+    theta  = float(np.arctan2(V_pix[1,1], V_pix[0,1]))
+
+    if sx_pix == 0.0 and sy_pix == 0.0:
+        return None
+
     return Gaussian2DKernel(x_stddev=sx_pix, y_stddev=sy_pix, theta=theta)
+
+def _beam_solid_angle_sr(hdr):
+    """Gaussian beam solid angle in steradians; BMAJ/BMIN in degrees."""
+    bmaj = float(hdr['BMAJ']) * (np.pi/180.0)
+    bmin = float(hdr['BMIN']) * (np.pi/180.0)
+    return (np.pi / (4.0*np.log(2.0))) * bmaj * bmin
+
 
 @lru_cache(maxsize=None)
 def _headers_for_name(base_name: str):
@@ -349,7 +405,7 @@ def _headers_for_name(base_name: str):
     t50_hdr  = fits.getheader(t50_path)  if t50_path  else None
     t100_hdr = fits.getheader(t100_path) if t100_path else None
     pix_native = _pixscale_arcsec(raw_hdr)
-    return raw_hdr, t50_hdr, t100_hdr, t25_hdr, pix_native, raw_path
+    return raw_hdr, t25_hdr, t50_hdr, t100_hdr, pix_native, raw_path
 
 
 def plot_raw_vs_fake_taper(raw_imgs, tapered_imgs, filenames, taper_mode,
@@ -431,6 +487,7 @@ def _per_image_percentile_stretch(x2d, lo=60, hi=95):
     y = (t - pl) / (ph - pl + 1e-6)
     return y.clamp(0, 1)
 
+
 def apply_taper_to_tensor(
     imgs, mode, filenames,
     crop_size=(1,512,512), downsample_size=(1,128,128),
@@ -440,9 +497,9 @@ def apply_taper_to_tensor(
     debug_dir=None
 ):
     mode = str(mode).lower()
-    want = {'rt25':'t25','rt50':'t50','rt100':'t100'}.get(mode)
-    if want is None:
-        # no tapering requested
+    m = re.fullmatch(r'rt(\d+)', mode)
+    want_kpc = int(m.group(1)) if m else None
+    if want_kpc is None:
         keep_mask = torch.ones(len(filenames), dtype=torch.bool)
         return (imgs if imgs.dim()==4 else imgs.unsqueeze(1)), keep_mask, list(map(str, filenames)), []
 
@@ -452,58 +509,93 @@ def apply_taper_to_tensor(
 
     out, kept_fns, kept_flags, skipped = [], [], [], []
     for base in map(str, filenames):
-        raw_hdr, t50_hdr, t100_hdr, pix_native_as, raw_path = _headers_for_name(base)
+        # NOTE: your _headers_for_name returns in this order:
+        raw_hdr, t25_hdr, t50_hdr, t100_hdr, pix_native_as, raw_path = _headers_for_name(base)
 
-        # Select target header based on the requested taper mode
-        targ_hdr = None
-        if want == 't25':
-            t25_path = (
-                _first(f"{PSZ2_ROOT}/fits/{base}/{base}T25kpc*.fits")
-                or _first(f"{PSZ2_ROOT}/classified/T25kpc/*/{base}.fits")
-                or _first(f"{PSZ2_ROOT}/classified/T25kpcSUB/*/{base}.fits")
-            )
-            targ_hdr = fits.getheader(t25_path) if t25_path else None
-        elif want == 't50':
-            targ_hdr = t50_hdr
-        elif want == 't100':
-            targ_hdr = t100_hdr
+        # Choose (or synthesize) the target header
+        if   want_kpc == 25:   targ_hdr = t25_hdr
+        elif want_kpc == 50:   targ_hdr = t50_hdr
+        elif want_kpc == 100:  targ_hdr = t100_hdr
+        else:
+            # Off-grid (e.g. rt60): build a synthetic target by interpolating the beam
+            # between the nearest fixed tapers that exist. Falls back to nearest neighbour.
+            def _interp_hdr(k_lo, h_lo, k_hi, h_hi, k_want):
+                if h_lo is None and h_hi is None:
+                    return None
+                if h_lo is None or h_hi is None:
+                    return (h_lo or h_hi).copy()
+                w = (k_want - k_lo) / float(k_hi - k_lo)
+                out = h_lo.copy()
+                for key in ("BMAJ", "BMIN"):
+                    v_lo = float(h_lo[key])
+                    v_hi = float(h_hi[key])
+                    out[key] = v_lo * (1.0 - w) + v_hi * w
+                # Use BPA from the closer endpoint when available
+                bpa_lo = float(h_lo.get("BPA", h_hi.get("BPA", 0.0)))
+                bpa_hi = float(h_hi.get("BPA", h_lo.get("BPA", 0.0)))
+                out["BPA"] = bpa_lo if (k_want - k_lo) <= (k_hi - k_want) else bpa_hi
+                return out
 
-        # existing guard:
-        if targ_hdr is None:
-            skipped.append(base); kept_flags.append(False); continue
+            if want_kpc < 50:
+                targ_hdr = _interp_hdr(25, t25_hdr, 50, t50_hdr, want_kpc)
+            elif want_kpc < 100:
+                targ_hdr = _interp_hdr(50, t50_hdr, 100, t100_hdr, want_kpc)
+            else:
+                # ≥100 kpc: extrapolate from (50,100) if both exist, else nearest
+                targ_hdr = _interp_hdr(50, t50_hdr, 100, t100_hdr, want_kpc)
 
-        # 1) load RAW
+
+        # —— enforce parity with fixed sets ——
+        if want_kpc in (25, 50, 100):
+            # exact parity: require that exact fixed header exists
+            if targ_hdr is None:
+                skipped.append(base); kept_flags.append(False); continue
+        else:
+            # off-grid: require that the source *has* a redshift (at least one fixed header present)
+            if (t25_hdr is None) and (t50_hdr is None) and (t100_hdr is None):
+                skipped.append(base); kept_flags.append(False); continue
+            if targ_hdr is None:
+                # could not synthesize even though some fixed headers exist → skip
+                skipped.append(base); kept_flags.append(False); continue
+
+        # 1) Load RAW
         raw_native = np.squeeze(fits.getdata(raw_path)).astype(float)
         raw_native = np.nan_to_num(raw_native, copy=False)
 
-        # 2) Compute image-plane PSF kernel
+        # 2) PSF kernel; if it degenerates, skip (no raw-through)
         ker = _kernel_from_headers(raw_hdr, targ_hdr, pix_native_as)
-        if ker is not None:
-            matched = convolve_fft(raw_native, ker, boundary='fill', fill_value=0.0,
-                                   nan_treatment='interpolate', normalize_kernel=True)
-            matched = np.nan_to_num(matched, copy=False)
+        if ker is None:
+            # No extra blur needed — do NOT drop; just use raw map.
+            matched = raw_native.copy()
         else:
-            # If kernel collapses numerically, also skip to avoid raw-through
-            skipped.append(base)
-            kept_flags.append(False)
-            continue
+            matched = convolve_fft(
+                raw_native, ker, boundary='fill', fill_value=np.nan,
+                nan_treatment='interpolate', normalize_kernel=True
+            )
+
+        # Convert Jy/beam_native → Jy/beam_target
+        try:
+            omega_raw = _beam_solid_angle_sr(raw_hdr)
+            omega_tgt = _beam_solid_angle_sr(targ_hdr)
+            matched = matched * (omega_tgt / omega_raw)
+        except Exception:
+            pass
+
+        matched = np.nan_to_num(matched, copy=False)
 
         # 3) center-crop + resize
-        t = torch.from_numpy(matched).float().unsqueeze(0)  # [1,H,W]
+        t = torch.from_numpy(matched).float().unsqueeze(0)
         formatted = apply_formatting(t, crop_size=(1, crop_size[-2], crop_size[-1]),
                                      downsample_size=(1, Hout, Wout)).squeeze(0)
 
         # 4) percentile stretch
-        if do_stretch:
-            stretched = _per_image_percentile_stretch(formatted.squeeze(0), percentile_lo, percentile_hi).unsqueeze(0)
-        else:
-            stretched = formatted
+        stretched = _per_image_percentile_stretch(formatted.squeeze(0), percentile_lo, percentile_hi).unsqueeze(0) if do_stretch else formatted
 
-        # 5) asinh (if mirroring loader)
+        # 5) asinh
         if use_asinh:
             stretched = torch.asinh(10.0 * stretched) / math.asinh(10.0)
 
-        # 6) noise-match to reference σ (background only)
+        # 6) optional noise-match
         if ref_sigma_map is not None and base in ref_sigma_map:
             mask = _background_ring_mask(Hout, Wout, inner=bg_inner)
             sig_fake = _robust_sigma(stretched.squeeze(0)[mask])
@@ -519,23 +611,18 @@ def apply_taper_to_tensor(
         kept_fns.append(base)
         kept_flags.append(True)
 
-        # 7) optional quick diagnostics
         if debug_dir:
             os.makedirs(debug_dir, exist_ok=True)
             fig, ax = plt.subplots(1,2, figsize=(6,3))
-            ax[0].imshow(formatted.squeeze(0), cmap='viridis', origin='lower')
-            ax[0].set_title('PSF-matched'); ax[0].axis('off')
-            ax[1].imshow(stretched.squeeze(0), cmap='viridis', origin='lower')
-            ax[1].set_title('final'); ax[1].axis('off')
+            ax[0].imshow(formatted.squeeze(0), cmap='viridis', origin='lower'); ax[0].axis('off'); ax[0].set_title('PSF-matched')
+            ax[1].imshow(stretched.squeeze(0), cmap='viridis', origin='lower'); ax[1].axis('off'); ax[1].set_title('final')
             fig.suptitle(base); fig.tight_layout()
-            fig.savefig(os.path.join(debug_dir, f"{base}_{want}.png"), dpi=140)
+            fig.savefig(os.path.join(debug_dir, f"{base}_rt{want_kpc}.png"), dpi=140)
             plt.close(fig)
 
     keep_mask = torch.tensor(kept_flags, dtype=torch.bool)
-    out = torch.stack(out, dim=0).to(device=device, dtype=dtype) if out else \
-          torch.empty((0,1,Hout,Wout), device=device, dtype=dtype)
+    out = torch.stack(out, dim=0).to(device=device, dtype=dtype) if out else torch.empty((0,1,Hout,Wout), device=device, dtype=dtype)
     return out, keep_mask, kept_fns, skipped
-
 
 
 
@@ -672,9 +759,9 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
     
     print(f"\n▶ Experiment: g_classes={galaxy_classes}, lr={lr}, reg={reg}, ls={ls}, "
         f"J={J}, L={L}, crop={crop_size}, down={downsample_size}, ver={versions}, "
-        f"lo={percentile_lo}, hi={percentile_hi}, flux_clipping={FLUX_CLIPPING}, "
-        f"classifier={classifier} ◀\n")
-    
+        f"lo={percentile_lo}, hi={percentile_hi}, classifier={classifier}, "
+        f"global_norm={USE_GLOBAL_NORMALISATION}, norm_mode={GLOBAL_NORM_MODE} ◀\n")
+
     if any (cls in galaxy_classes for cls in [10, 11, 12, 13]):
         crop_size = (128, 128)  # Crop size for the images
         downsample_size = (128, 128)  # Downsample size for the images
@@ -694,14 +781,40 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
     def _split_versions(v):
         v = v if isinstance(v, (list, tuple)) else [v]
         v = [str(x).lower() for x in v]
-        gen = [x for x in v if x in ('rt25', 'rt50', 'rt100')]
-        load = [x for x in v if x not in gen]
+        gen, load = [], []
+        for x in v:
+            m = re.fullmatch(r'rt(\d+)(?:kpc)?', x)
+            if m:
+                gen.append(f"rt{m.group(1)}")
+            else:
+                load.append(x)
         return load, gen
 
     _load_versions, _gen_versions = _split_versions(versions)
-    _versions_to_load = _load_versions if _load_versions else ['raw']   # or ['RAW'] if your loader uses that
-    print(f"_versions_to_load={_versions_to_load}, _gen_versions={_gen_versions}")
 
+    # NEW: align RTxx exactly to the fixed uv–tapered set Txxkpc by using that
+    ALIGN_RT_WITH_FIXED = True
+    if ALIGN_RT_WITH_FIXED and _gen_versions:
+        def _rt_anchor(g):
+            m = re.fullmatch(r'rt(\d+)', g)
+            if not m:
+                return None
+            k = int(m.group(1))
+            # nearest fixed anchor among 25/50/100 kpc (midpoints at 37.5 and 75)
+            if k < 38:
+                anchor = 25
+            elif k < 75:
+                anchor = 50
+            else:
+                anchor = 100
+            return f"T{anchor}kpc"
+        anchors = [a for a in (_rt_anchor(g) for g in _gen_versions) if a]
+        _versions_to_load = [anchors[0]] if anchors else (_load_versions if _load_versions else ['raw'])
+    else:
+        _versions_to_load = _load_versions if _load_versions else ['raw']
+
+
+    print(f"_versions_to_load={_versions_to_load}, _gen_versions={_gen_versions}")
 
     REPLACE_WITH_RT = (
         (isinstance(versions, str) and versions.lower().startswith('rt')) or
@@ -791,6 +904,8 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                     AUGMENT=not LATE_AUG,
                     NORMALISE=NORMALISEIMGS,
                     NORMALISETOPM=NORMALISEIMGSTOPM,
+                    USE_GLOBAL_NORMALISATION=USE_GLOBAL_NORMALISATION,
+                    GLOBAL_NORM_MODE=GLOBAL_NORM_MODE,
                     PRINTFILENAMES=PRINTFILENAMES,
                     train=False)
 
@@ -815,6 +930,11 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                 raise RuntimeError("versions includes rt*, but filenames were not returned. Set PRINTFILENAMES=True.")
             test_images, test_labels, test_fns, info_test = _append_rt_versions(test_images, test_fns, _gen_versions, labels=test_labels)
             print(f"[TEST] dropped {info_test['removed_total']} (kept {info_test['kept']}/{info_test['initial']})")
+            assert info_test['removed_total'] == 0, (
+                f"RT alignment error (TEST): expected 0 drops with {_versions_to_load} "
+                f"as anchor, but dropped {info_test['removed_total']} out of {info_test['initial']}."
+            )
+
             if REPLACE_WITH_RT:
                 test_images = test_images[:, 1:2]  # keep only the runtime-tapered plane
                 print(f"[TEST] after replacing with RT: {test_images.size(0)} images")
@@ -825,13 +945,13 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
 
 
         # ——— Data sanity checks ———
-        for i, cls in enumerate(galaxy_classes):
-            cls_mask = (train_labels == i)
-            cls_images = train_images[cls_mask]
-            check_tensor(f"Train images for class {cls} (idx={i})", cls_images)
-            cls_mask = (test_labels == i)
-            cls_images = test_images[cls_mask]
-            check_tensor(f"Test images for class {cls} (idx={i})", cls_images)
+        #for i, cls in enumerate(galaxy_classes):
+        #    cls_mask = (train_labels == i)
+        #    cls_images = train_images[cls_mask]
+        #    check_tensor(f"Train images for class {cls} (idx={i})", cls_images)
+        #    cls_mask = (test_labels == i)
+        #    cls_images = test_images[cls_mask]
+        #    check_tensor(f"Test images for class {cls} (idx={i})", cls_images)
 
         import hashlib
 
@@ -874,8 +994,13 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                 else:
                     test_dataset = TensorDataset(test_images, test_scat_coeffs, test_labels)
 
-        else: 
+        else:
+            if test_images.dim() == 5:
+                test_images = fold_T_axis(test_images)  # [B,T,1,H,W] -> [B,T,H,W]
+            mock_tensor = torch.zeros_like(test_images)
+            assert test_images.dim() == 4, f"test_images should be [B,C,H,W], got {tuple(test_images.shape)}"
             test_dataset = TensorDataset(test_images, mock_tensor, test_labels)
+
                                 
         test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=custom_collate, drop_last=False)
 
@@ -910,6 +1035,8 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                     AUGMENT=False,   
                     NORMALISE=NORMALISEIMGS,
                     NORMALISETOPM=NORMALISEIMGSTOPM,
+                    USE_GLOBAL_NORMALISATION=USE_GLOBAL_NORMALISATION,
+                    GLOBAL_NORM_MODE=GLOBAL_NORM_MODE,
                     train=True)
                 
                 if len(_out) == 4:
@@ -941,6 +1068,8 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                     AUGMENT=not LATE_AUG,
                     NORMALISE=NORMALISEIMGS,
                     NORMALISETOPM=NORMALISEIMGSTOPM,
+                    USE_GLOBAL_NORMALISATION=USE_GLOBAL_NORMALISATION,
+                    GLOBAL_NORM_MODE=GLOBAL_NORM_MODE,
                     PRINTFILENAMES=PRINTFILENAMES,
                     train=True)
 
@@ -965,10 +1094,19 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                         if train_fns is None or valid_fns is None:
                             raise RuntimeError("versions includes rt*, but train/valid filenames were not returned.")
                         
+                        # TRAIN/VALID sets
                         train_images, train_labels, train_fns, info_tr = _append_rt_versions(train_images, train_fns, _gen_versions, labels=train_labels)
                         valid_images, valid_labels, valid_fns, info_va = _append_rt_versions(valid_images, valid_fns, _gen_versions, labels=valid_labels)
                         print(f"[TRAIN] dropped {info_tr['removed_total']} (kept {info_tr['kept']}/{info_tr['initial']})")
                         print(f"[VALID] dropped {info_va['removed_total']} (kept {info_va['kept']}/{info_va['initial']})")
+                        assert info_tr['removed_total'] == 0, (
+                            f"RT alignment error (TRAIN): expected 0 drops with {_versions_to_load} "
+                            f"as anchor, but dropped {info_tr['removed_total']} out of {info_tr['initial']}."
+                        )
+                        assert info_va['removed_total'] == 0, (
+                            f"RT alignment error (VALID): expected 0 drops with {_versions_to_load} "
+                            f"as anchor, but dropped {info_va['removed_total']} out of {info_va['initial']}."
+                        )
                         
                         if REPLACE_WITH_RT:
                             train_images = train_images[:, 1:2]
@@ -1337,6 +1475,12 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                             train_dataset = TensorDataset(train_images, train_scat_coeffs, train_labels)
                             valid_dataset = TensorDataset(valid_images, valid_scat_coeffs, valid_labels)
             else:
+                if train_images.dim() == 5:
+                    train_images = fold_T_axis(train_images)   # [B,T,1,H,W] -> [B,T,H,W]
+                    valid_images = fold_T_axis(valid_images)
+                    # test_images was folded earlier
+                for x,name in [(train_images,"train"), (valid_images,"valid")]:
+                    assert x.dim() == 4, f"{name}_images should be [B,C,H,W], got {tuple(x.shape)}"
                 mock_train = torch.zeros_like(train_images)
                 mock_valid = torch.zeros_like(valid_images)
                 train_dataset = TensorDataset(train_images, mock_train, train_labels)
@@ -1638,9 +1782,17 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                                         plt.close()
 
                             accuracy = accuracy_score(all_true_labels[key], all_pred_labels[key])
-                            precision = precision_score(all_true_labels[key], all_pred_labels[key], average='macro', zero_division=0)
-                            recall = recall_score(all_true_labels[key], all_pred_labels[key], average='macro', zero_division=0)
-                            f1 = f1_score(all_true_labels[key], all_pred_labels[key], average='macro', zero_division=0)
+                            if len(galaxy_classes) == 2:
+                                # For binary classification, pos_label=1 corresponds to the second class in sorted order
+                                positive_class = 1 if 1 in np.unique(all_true_labels[key]) else 0
+                                precision = precision_score(all_true_labels[key], all_pred_labels[key], pos_label=positive_class, average='binary', zero_division=0)
+                                recall = recall_score(all_true_labels[key], all_pred_labels[key], pos_label=positive_class, average='binary', zero_division=0)
+                                f1 = f1_score(all_true_labels[key], all_pred_labels[key], pos_label=positive_class, average='binary', zero_division=0)
+                            else:
+                                # For multi-class, use macro averaging
+                                precision = precision_score(all_true_labels[key], all_pred_labels[key], average='macro', zero_division=0)
+                                recall = recall_score(all_true_labels[key], all_pred_labels[key], average='macro', zero_division=0)
+                                f1 = f1_score(all_true_labels[key], all_pred_labels[key], average='macro', zero_division=0)
 
                             update_metrics(metrics, gen_model_name, subset_size, fold, experiment, lr, reg, accuracy, precision, recall, f1, lambda_generate, crop_size, downsample_size, ver_key)
 
@@ -1691,7 +1843,7 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                     mean_prec = float(np.mean(metrics[f"{base}_precision"])) if metrics[f"{base}_precision"] else float('nan')
                     mean_rec = float(np.mean(metrics[f"{base}_recall"])) if metrics[f"{base}_recall"] else float('nan')
                     mean_f1 = float(np.mean(metrics[f"{base}_f1_score"])) if metrics[f"{base}_f1_score"] else float('nan')
-                    print(f"Fold {fold}, Subset Size {subset_size}, Classifier {classifier_name}, AVERAGE over {num_experiments} experiments — Accuracy: {mean_acc:.4f}, Precision: {mean_prec:.4f}, Recall: {mean_rec:.4f}, F1 Score: {mean_f1:.4f}")
+                    print(f"AVERAGE over {num_experiments} experiments — Accuracy: {mean_acc:.4f}, Precision: {mean_prec:.4f}, Recall: {mean_rec:.4f}, F1 Score: {mean_f1:.4f}")
                     end_time = time.time()
                     elapsed_time = end_time - start_time
                     #training_times[subset_size][fold].append(elapsed_time)
@@ -1762,18 +1914,6 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
         summary_path = f'./classifier/trained_models/{classifier}_{gen_model_names[0]}_summary_metrics.pkl'
         with open(summary_path, "wb") as f:
             pickle.dump(_clean, f)
-        print(f"Summary metrics written to {summary_path}")         
+        print(f"Summary metrics written to {summary_path}") 
 
-# ——— Rank configurations by mean accuracy across experiments ———
-rankings = []
-for key, vals in metrics.items():
-    if key.endswith("_accuracy"):
-        mean_acc = float(np.mean(vals)) if vals else float("nan")
-        cfg = key[:-len("_accuracy")]           # drop the suffix
-        rankings.append((mean_acc, cfg))
 
-rankings.sort(key=lambda x: x[0], reverse=True)
-
-print("\nRanked configurations by mean accuracy:")
-for mean_acc, cfg in rankings:
-    print(f"acc={mean_acc:.4f} — {cfg}")

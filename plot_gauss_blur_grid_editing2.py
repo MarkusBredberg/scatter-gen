@@ -9,16 +9,55 @@ import matplotlib.pyplot as plt
 from matplotlib import colors as mcolors
 from matplotlib.colors import TwoSlopeNorm
 from matplotlib.cm import ScalarMappable
+from matplotlib.patches import Ellipse
 from astropy.io import fits
 from astropy.convolution import convolve_fft, Gaussian2DKernel
 import os, glob
 import torch
-
-
+from astropy.wcs import WCS
+try:
+    from reproject import reproject_interp
+    HAVE_REPROJECT = True
+except Exception:
+    HAVE_REPROJECT = False
+print(f"HAVE_REPROJECT={HAVE_REPROJECT}")
+    
 print("Loading scatter_galaxies/plot_gauss_blur_grid_editing.py...")
 
 ARCSEC = np.deg2rad(1/3600)
-crop_size = (3, 1, 512, 512)  # (T, C, H, W) for 3 channels, 512x512 images
+crop_size = (1, 512, 512)  # (T, C, H, W) for 3 channels, 512x512 images
+
+def reproject_like(arr, src_hdr, dst_hdr):
+    if arr is None or src_hdr is None or dst_hdr is None:
+        return None
+
+    # 2-D celestial WCS only
+    try:
+        w_src = WCS(src_hdr).celestial
+        w_dst = WCS(dst_hdr).celestial
+    except Exception:
+        w_src = w_dst = None
+
+    if HAVE_REPROJECT and (w_src is not None) and (w_dst is not None):
+        ny_out = int(dst_hdr['NAXIS2'])
+        nx_out = int(dst_hdr['NAXIS1'])
+        reproj, _ = reproject_interp((arr, w_src), w_dst,
+                                     shape_out=(ny_out, nx_out),
+                                     order='bilinear')
+        return reproj.astype(float)
+
+    # Fallback: center-alignment translation
+    from scipy.ndimage import shift as _shift
+    if (w_src is None) or (w_dst is None):
+        return arr.astype(float)
+
+    ny, nx = arr.shape
+    (ra, dec) = w_src.wcs_pix2world([[nx/2.0, ny/2.0]], 0)[0]
+    (x_dst, y_dst) = w_dst.wcs_world2pix([[ra, dec]], 0)[0]
+    dx = (float(dst_hdr['NAXIS1'])/2.0) - x_dst
+    dy = (float(dst_hdr['NAXIS2'])/2.0) - y_dst
+    return _shift(arr, shift=(dy, dx), order=1, mode="nearest").astype(float)
+
 
 def _stretch_from_p(arr, p_lo, p_hi, clip=False):
     if arr is None:
@@ -47,6 +86,17 @@ def _nanrms(a, b):
     d = a[m] - b[m]
     return float(np.sqrt(np.mean(d*d)))
 
+def xcorr_shift(a, b):
+    """Integer-pixel shift (dy, dx) that best aligns a to b via FFT x-corr."""
+    A = np.fft.fftn(np.nan_to_num(a))
+    B = np.fft.fftn(np.nan_to_num(b))
+    cc = np.fft.ifftn(A * np.conj(B))
+    ij = np.unravel_index(np.argmax(np.abs(cc)), cc.shape)
+    dy = ij[0] if ij[0] <= a.shape[0]//2 else ij[0] - a.shape[0]
+    dx = ij[1] if ij[1] <= a.shape[1]//2 else ij[1] - a.shape[1]
+    return float(dy), float(dx)
+
+
 def _fits_path_triplet(base_dir, real_base):
     raw_path  = f"{base_dir}/{real_base}.fits"
     t25_path  = _first(f"{base_dir}/{real_base}T25kpc*.fits")
@@ -54,7 +104,7 @@ def _fits_path_triplet(base_dir, real_base):
     t100_path = _first(f"{base_dir}/{real_base}T100kpc*.fits")
     return raw_path, t25_path, t50_path, t100_path
 
-def _load_fits_arrays_scaled(name, crop_ch=1, out_hw=(128,128)):
+def _load_fits_arrays_scaled_old(name, crop_ch=1, out_hw=(128,128)):
     base_dir = _first(f"{ROOT}/fits/{name}*") or f"{ROOT}/fits/{name}"
     raw_path = _first(f"{base_dir}/{os.path.basename(base_dir)}*.fits")
     if raw_path is None:
@@ -113,7 +163,7 @@ def _load_fits_arrays_scaled(name, crop_ch=1, out_hw=(128,128)):
             raw_hdr, t25_hdr, t50_hdr, t100_hdr, pix_eff_arcsec)
 
 
-def _load_fits_arrays_scaled_old(name, crop_ch=1, out_hw=(128,128)):
+def _load_fits_arrays_scaled(name, crop_ch=1, out_hw=(128,128)):
     base_dir = _first(f"{ROOT}/fits/{name}*") or f"{ROOT}/fits/{name}"
     raw_path = _first(f"{base_dir}/{os.path.basename(base_dir)}*.fits")
     if raw_path is None:
@@ -146,16 +196,32 @@ def _load_fits_arrays_scaled_old(name, crop_ch=1, out_hw=(128,128)):
         ten = apply_formatting(ten, (ch, Hc, Wc), (ch, outH, outW)).squeeze(0).numpy()
         return ten
 
-    raw_cut  = _fmt(raw_arr,  raw_hdr)
-    t25_cut  = _fmt(t25_arr,  t25_hdr)
-    t50_cut  = _fmt(t50_arr,  t50_hdr)
-    t100_cut = _fmt(t100_arr, t100_hdr)
+    # 1) Reproject each T image onto the RAW grid
+    t25_on_raw  = reproject_like(t25_arr,  t25_hdr,  raw_hdr)  if t25_hdr  is not None else None
+    t50_on_raw  = reproject_like(t50_arr,  t50_hdr,  raw_hdr)  if t50_hdr  is not None else None
+    t100_on_raw = reproject_like(t100_arr, t100_hdr, raw_hdr)  if t100_hdr is not None else None
 
+    # 2) Convolve RAW on its native grid and convert units to Jy/beam_target
+    r2_25_native  = convolve_to_target_native(raw_arr, raw_hdr, t25_hdr)  if t25_hdr  is not None else None
+    r2_50_native  = convolve_to_target_native(raw_arr, raw_hdr, t50_hdr)  if t50_hdr  is not None else None
+    r2_100_native = convolve_to_target_native(raw_arr, raw_hdr, t100_hdr) if t100_hdr is not None else None
+
+    # 3) Downsample everything from the SAME (RAW) grid to the display grid
+    raw_cut   = _fmt(raw_arr,       raw_hdr)
+    t25_cut   = _fmt(t25_on_raw,    raw_hdr)   if t25_on_raw   is not None else None
+    t50_cut   = _fmt(t50_on_raw,    raw_hdr)   if t50_on_raw   is not None else None
+    t100_cut  = _fmt(t100_on_raw,   raw_hdr)   if t100_on_raw  is not None else None
+    rt25_cut  = _fmt(r2_25_native,  raw_hdr)   if r2_25_native is not None else None
+    rt50_cut  = _fmt(r2_50_native,  raw_hdr)   if r2_50_native is not None else None
+    rt100_cut = _fmt(r2_100_native, raw_hdr)   if r2_100_native is not None else None
+    
     ds_factor = (int(round(Hc_raw)) / outH)
     pix_eff_arcsec = pix_native * ds_factor
 
-    return raw_cut, t25_cut, t50_cut, t100_cut, raw_hdr, t25_hdr, t50_hdr, t100_hdr, pix_eff_arcsec
-
+    return (raw_cut, t25_cut, t50_cut, t100_cut,
+            rt25_cut, rt50_cut, rt100_cut,
+            raw_hdr, t25_hdr, t50_hdr, t100_hdr, pix_eff_arcsec)
+    
 def fwhm_to_sigma_rad(fwhm_arcsec):
     return (fwhm_arcsec*ARCSEC) / (2*np.sqrt(2*np.log(2)))
 
@@ -184,17 +250,47 @@ def kernel_from_beams(raw_hdr, targ_hdr, pixscale_arcsec):
     w = np.clip(w, 0.0, None)
     C_ker = (V * w) @ V.T
 
-    # convert to pixel units
-    pixrad = (pixscale_arcsec*ARCSEC)
-    C_pix = C_ker / (pixrad**2)
+    # convert to pixel units using the full WCS Jacobian (handles rotation & anisotropy)
+    def _cd_matrix_rad(hdr):
+        if 'CD1_1' in hdr:
+            CD = np.array([[hdr['CD1_1'], hdr.get('CD1_2', 0.0)],
+                        [hdr.get('CD2_1', 0.0), hdr['CD2_2']]], dtype=float)
+        else:
+            pc11 = hdr.get('PC1_1', 1.0); pc12 = hdr.get('PC1_2', 0.0)
+            pc21 = hdr.get('PC2_1', 0.0); pc22 = hdr.get('PC2_2', 1.0)
+            CDELT1 = hdr.get('CDELT1', 1.0); CDELT2 = hdr.get('CDELT2', 1.0)
+            CD = np.array([[pc11, pc12],[pc21, pc22]], dtype=float) @ np.diag([CDELT1, CDELT2])
+        return CD * (np.pi/180.0)  # radians per pixel
 
-    # turn back into Gaussian2DKernel params
-    w_pix, V_pix = np.linalg.eigh(C_pix)
-    sx_pix, sy_pix = np.sqrt(np.maximum(w_pix[1], 0.0)), np.sqrt(np.maximum(w_pix[0], 0.0))  # w[1]≥w[0]
-    theta = np.arctan2(V_pix[1,1], V_pix[0,1])  # PA of major axis
+    J = _cd_matrix_rad(raw_hdr)           # d(world)/d(pixel)
+    Jinv = np.linalg.inv(J)
+    C_pix = Jinv @ C_ker @ Jinv.T         # covariance in pixel coords
 
-    # if target <= native in any direction, sx_pix or sy_pix can be 0; kernel becomes delta (no blur)
-    return Gaussian2DKernel(x_stddev=sx_pix, y_stddev=sy_pix, theta=theta)
+    w_pix, V_pix = np.linalg.eigh(C_pix)  # eigenvalues sorted ascending
+    w_pix = np.clip(w_pix, 0.0, None)
+    sx_pix, sy_pix = np.sqrt(w_pix[1]), np.sqrt(w_pix[0])  # major then minor
+    theta = np.arctan2(V_pix[1,1], V_pix[0,1])
+
+    return Gaussian2DKernel(x_stddev=float(sx_pix), y_stddev=float(sy_pix), theta=float(theta))
+
+
+def _maybe_draw_beam(ax, j, r):
+    try:
+        hdr = r.get('hdr25') if j in (0,1) else r.get('hdr50') if j in (3,4) else r.get('hdr100') if j in (6,7) else None
+        if hdr is None or r.get('pix_eff') is None:
+            return
+        bmaj_as = float(hdr['BMAJ']) * 3600.0
+        bmin_as = float(hdr['BMIN']) * 3600.0
+        pa_deg  = float(hdr.get('BPA', 0.0))
+        maj_px  = bmaj_as / float(r['pix_eff'])
+        min_px  = bmin_as / float(r['pix_eff'])
+        x0, x1 = ax.get_xlim(); y0, y1 = ax.get_ylim()
+        cx = x0 + 0.12*(x1 - x0); cy = y0 + 0.12*(y1 - y0)
+        e1 = Ellipse((cx, cy), width=maj_px, height=min_px, angle=-pa_deg, fill=False, lw=1.4, ec='w', alpha=0.9)
+        e2 = Ellipse((cx, cy), width=maj_px, height=min_px, angle=-pa_deg, fill=False, lw=2.2, ec='k', alpha=0.3)
+        ax.add_patch(e2); ax.add_patch(e1)
+    except Exception:
+        pass
 
 def _beam_solid_angle_sr(hdr):
     """Return Gaussian beam solid angle in steradians from FITS header (BMAJ/BMIN in deg)."""
@@ -242,7 +338,6 @@ def convolve_to_target_native(raw_arr, raw_hdr, target_hdr):
         pass
     return out_native
 
-
 def _first(pattern):
     hits = sorted(glob.glob(pattern))
     return hits[0] if hits else None
@@ -283,10 +378,11 @@ def load_headers(base, ds_factor=1.0):
 def plot_galaxy_grid(images, filenames, labels,
                      lo=60, hi=95, RES_PCT=99,
                      RES_CMAP     = "RdBu_r",
-                     SKIP_CLIP_NORM=False):
+                     SKIP_CLIP_NORM=False,
+                     SCALE_SEPARATE=False):
     """
     Layout (9 columns):
-      T25, RAW→25, |res|25,  T50, RAW→50, |res|50,  T100, RAW→100, |res|100
+      T25, RAW→25, res25,  T50, RAW→50, res50,  T100, RAW→100, res100
 
     When SKIP_CLIP_NORM=True:
       • No percentile clipping or normalisation anywhere.
@@ -294,7 +390,7 @@ def plot_galaxy_grid(images, filenames, labels,
 
     When SKIP_CLIP_NORM=False (default):
       • Per-row percentile clip (lo,hi) shared by that row's T and RAW→T panels.
-      • Residuals use a per-row max given by RES_PCT of |res|.
+      • Residuals use a per-row max given by RES_PCT of res.
     """
     # pick 3 per class (DE first)
     de_idx  = [i for i, y in enumerate(labels) if int(y) == 50][:3]
@@ -320,9 +416,9 @@ def plot_galaxy_grid(images, filenames, labels,
         constrained_layout=False
     )
     col_titles = [
-        "T25 kpc", "RAW → 25 kpc", "│res│ 25 kpc",
-        "T50 kpc", "RAW → 50 kpc", "│res│ 50 kpc",
-        "T100 kpc", "RAW → 100 kpc", "│res│ 100 kpc",
+        "T25 kpc", "RAW → 25 kpc", "res 25 kpc",
+        "T50 kpc", "RAW → 50 kpc", "res 50 kpc",
+        "T100 kpc", "RAW → 100 kpc", "res 100 kpc",
     ]
     for ax, t in zip(axes[0], col_titles): ax.set_title(t, fontsize=12, pad=6)
 
@@ -350,8 +446,18 @@ def plot_galaxy_grid(images, filenames, labels,
         rows.append(dict(
             name=name, grid_row=grid_row,
             t25=t25_cut, t50=t50_cut, t100=t100_cut,
-            rt25=rt25_cut, rt50=rt50_cut, rt100=rt100_cut
+            rt25=rt25_cut, rt50=rt50_cut, rt100=rt100_cut,
+            hdr25=t25_hdr, hdr50=t50_hdr, hdr100=t100_hdr,
+            pix_eff=pix_eff
         ))
+        
+        # --- Registration sanity check on the display grid (T vs RT) ---
+        for tgt, T, RT in [(25, t25_cut, rt25_cut),
+                        (50, t50_cut, rt50_cut),
+                        (100, t100_cut, rt100_cut)]:
+            if T is not None and RT is not None:
+                dy, dx = xcorr_shift(T, RT)
+                print(f"{name}  T{tgt} vs RT{tgt}: estimated shift dy={dy:.2f}, dx={dx:.2f} px")
 
         for r in rows:
             name = r['name']
@@ -362,8 +468,7 @@ def plot_galaxy_grid(images, filenames, labels,
                     continue
                 sT, sR = _summ(T), _summ(RT)
                 rms = _nanrms(T, RT)
-                print("RdBu_r"
-                    f"Row {name}  T{tgt}kpc vs RT{tgt}kpc  |  "
+                print(f"Row {name}  T{tgt}kpc vs RT{tgt}kpc  |  "
                     f"T[min={sT['min']:.3g}, max={sT['max']:.3g}, mean={sT['mean']:.3g}, std={sT['std']:.3g}]  ||  "
                     f"RT[min={sR['min']:.3g}, max={sR['max']:.3g}, mean={sR['mean']:.3g}, std={sR['std']:.3g}]  |  "
                     f"RMSΔ={rms:.3g}"
@@ -430,6 +535,7 @@ def plot_galaxy_grid(images, filenames, labels,
                         ax.imshow(arr, cmap=RES_CMAP, norm=resid_norm, origin="lower", interpolation="nearest")
                     else:
                         ax.imshow(arr, cmap="viridis", vmin=vmin, vmax=vmax, origin="lower", interpolation="nearest")
+                        _maybe_draw_beam(ax, j, r)
                 ax.set_axis_off()
 
         # two stacked colorbars (non-resid, resid)
@@ -478,13 +584,29 @@ def plot_galaxy_grid(images, filenames, labels,
         else:
             lo_i, hi_i = 0.0, 1.0
 
-        # Clip+stretch to [0,1]
-        t25_s   = _stretch_from_p(r['t25'],   lo_i, hi_i, clip=True)  if r['t25']   is not None else None
-        rt25_s  = _stretch_from_p(r['rt25'],  lo_i, hi_i, clip=True)  if r['rt25']  is not None else None
-        t50_s   = _stretch_from_p(r['t50'],   lo_i, hi_i, clip=True)  if r['t50']   is not None else None
-        rt50_s  = _stretch_from_p(r['rt50'],  lo_i, hi_i, clip=True)  if r['rt50']  is not None else None
-        t100_s  = _stretch_from_p(r['t100'],  lo_i, hi_i, clip=True)  if r['t100']  is not None else None
-        rt100_s = _stretch_from_p(r['rt100'], lo_i, hi_i, clip=True)  if r['rt100'] is not None else None
+        def _stretch_panel(arr):
+            if arr is None:
+                return None
+            plo, phi = _nanpct(arr, lo=lo, hi=hi)
+            if not np.isfinite(phi - plo) or phi <= plo:
+                plo, phi = np.nanmin(arr), np.nanmax(arr)
+            return _stretch_from_p(arr, plo, phi, clip=True)
+
+        if not SCALE_SEPARATE:
+            t25_s   = _stretch_from_p(r['t25'],   lo_i, hi_i, clip=True)  if r['t25']   is not None else None
+            rt25_s  = _stretch_from_p(r['rt25'],  lo_i, hi_i, clip=True)  if r['rt25']  is not None else None
+            t50_s   = _stretch_from_p(r['t50'],   lo_i, hi_i, clip=True)  if r['t50']   is not None else None
+            rt50_s  = _stretch_from_p(r['rt50'],  lo_i, hi_i, clip=True)  if r['rt50']  is not None else None
+            t100_s  = _stretch_from_p(r['t100'],  lo_i, hi_i, clip=True)  if r['t100']  is not None else None
+            rt100_s = _stretch_from_p(r['rt100'], lo_i, hi_i, clip=True)  if r['rt100'] is not None else None
+        else:
+            t25_s   = _stretch_panel(r['t25'])
+            rt25_s  = _stretch_panel(r['rt25'])
+            t50_s   = _stretch_panel(r['t50'])
+            rt50_s  = _stretch_panel(r['rt50'])
+            t100_s  = _stretch_panel(r['t100'])
+            rt100_s = _stretch_panel(r['rt100'])
+
 
         # SIGNED residuals, in the same stretched space
         res25   = (t25_s  - rt25_s)   if (t25_s  is not None and rt25_s  is not None) else None
@@ -512,11 +634,11 @@ def plot_galaxy_grid(images, filenames, labels,
             ax = axes[gr, j]
             if arr is not None:
                 if j in RES_COLS:
-                    ax.imshow(arr, cmap=RES_CMAP, norm=r['res_norm'],
-                            origin="lower", interpolation="nearest")
+                    ax.imshow(arr, cmap=RES_CMAP, norm=r['res_norm'], origin="lower", interpolation="nearest")
                 else:
-                    ax.imshow(arr, cmap="viridis", norm=img_norm,
-                            origin="lower", interpolation="nearest")
+                    ax.imshow(arr, cmap="viridis", norm=img_norm, origin="lower", interpolation="nearest")
+                    _maybe_draw_beam(ax, j, r)
+
             ax.set_axis_off()
         axes[gr, 0].text(-0.02, 0.5, r['name'], transform=axes[gr,0].transAxes,
                         rotation=90, va='center', ha='right', fontsize=8)
@@ -566,4 +688,4 @@ if __name__ == "__main__":
     eval_imgs   = result[2]
     eval_labels = result[3]  # eval_labels lives at index 3
     eval_fns    = result[5]
-    plot_galaxy_grid(eval_imgs, eval_fns, eval_labels, SKIP_CLIP_NORM=False)
+    plot_galaxy_grid(eval_imgs, eval_fns, eval_labels, lo=60, hi=95, SKIP_CLIP_NORM=False, SCALE_SEPARATE=False)
