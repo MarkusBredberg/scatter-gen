@@ -320,6 +320,8 @@ def compute_scattering_coeffs(images, scattering=Scattering2D(J=3, L=8, shape=(1
             # Squeeze out the singleton dimension at index 1 if present.
             if batch_scat.shape[1] == 1:
                 batch_scat = batch_scat.squeeze(1)  # becomes [B, C, H, W]
+            if not batch_scat.is_contiguous():
+                batch_scat = batch_scat.contiguous()
             scat_coeffs_list.append(batch_scat.cpu())
         scat_coeffs = torch.cat(scat_coeffs_list, dim=0)
     return scat_coeffs

@@ -72,17 +72,17 @@ classifier = ["TinyCNN", # Very Simple CNN
 gen_model_names = ['DDPM'] #['ST', 'DDPM', 'wGAN', 'GAN', 'Dual', 'CNN', 'STMLP', 'lavgSTMLP', 'ldiffSTMLP'] # Specify the generative model_name
 label_smoothing = 0.1  # Label smoothing for the classifier
 num_experiments = 100
-learning_rates = [1e-3]  # Learning rates
-regularization_params = [1e-3]  # Regularisation parameters
+learning_rates = [1e-4]  # Learning rates
+regularization_params = [1e-4]  # Regularisation parameters
 percentile_lo = 30 # Percentile stretch lower bound
 percentile_hi = 90  # Percentile stretch upper bound
-versions = ['rt50']  # any mix of loadable and runtime-tapered planes. 'rt50' or 'rt100' for tapering. Square brackets for stacking
+versions = [('raw', 'rt50')]  # any mix of loadable and runtime-tapered planes. 'rt50' or 'rt100' for tapering. Square brackets for stacking
 folds = [5] # 0-4 for 5-fold cross validation, 5 for only one training
 lambda_values = [0]  # Ratio between generated images and original images per class. 8 is reserfved for TRAINONGENERATED
 num_epochs_cuda = 200
 num_epochs_cpu = 100
 
-STRETCH = True  # Arcsinh stretch    # TEST WITH AND WITHOUT STRETCH
+STRETCH = True  # Arcsinh stretch
 USE_GLOBAL_NORMALISATION = False           # single on/off switch . False - image-by-image normalisation 
 GLOBAL_NORM_MODE = "percentile"           # "percentile" or "flux". Becomes "none" if USE_GLOBAL_NORMALISATION is False
 ES, patience = True, 10  # Use early stopping
@@ -166,10 +166,19 @@ PSZ2_ROOT = "/users/mbredber/scratch/data/PSZ2"  # FITS root used below
 
 # parse versions
 def _split_versions(v):
-    v = v if isinstance(v, (list, tuple)) else [v]
-    v = [str(x).lower() for x in v]
-    gen, load = [], []
+    # Accept scalars, lists, tuples, and nested combos. Return (load, gen).
+    if not isinstance(v, (list, tuple)):
+        v = [v]
+    flat = []
     for x in v:
+        if isinstance(x, (list, tuple)):
+            flat.extend(x)
+        else:
+            flat.append(x)
+    flat = [str(x).strip().lower() for x in flat]
+
+    load, gen = [], []
+    for x in flat:
         m = re.fullmatch(r'rt(\d+)(?:kpc)?', x)
         if m:
             gen.append(f"rt{m.group(1)}")
@@ -193,6 +202,12 @@ else:
     _versions_to_load = _load_versions if _load_versions else ['raw']
 
 print(f"_versions_to_load={_versions_to_load}, _gen_versions={_gen_versions}")
+
+def _is_fixed_anchor(vlist):
+    vlist = [str(v).lower() for v in vlist]
+    return any(v.startswith("t") and v.endswith("kpc") for v in vlist)
+
+FIXED_ANCHOR = _is_fixed_anchor(_versions_to_load)
 
 REPLACE_WITH_RT = (
     (isinstance(versions, str) and versions.lower().startswith('rt')) or
@@ -301,7 +316,7 @@ def _append_rt_versions(imgs, fns, gen_versions, labels=None):
             crop_size=crop_size,
             downsample_size=downsample_size,
             percentile_lo=percentile_lo, percentile_hi=percentile_hi,
-            do_stretch=STRETCH
+            do_stretch=STRETCH, require_fixed_header=FIXED_ANCHOR
         )
         kept_sets[gv] = set(kept_fns)
         removed_by_version[gv] = len(skipped)
@@ -584,6 +599,7 @@ def apply_taper_to_tensor(
     crop_size=(1,512,512), downsample_size=(1,128,128),
     percentile_lo=60, percentile_hi=95,
     do_stretch=True, use_asinh=True,
+    require_fixed_header=False,
     ref_sigma_map=None, bg_inner=64,
     debug_dir=None
 ):
@@ -608,23 +624,46 @@ def apply_taper_to_tensor(
         elif want_kpc == 50:   targ_hdr = t50_hdr
         elif want_kpc == 100:  targ_hdr = t100_hdr
         else:
-            # off-grid: try exact file first, then synthesize
-            targ_hdr = _taper_header_for_size(base, want_kpc)
-            if targ_hdr is None:
-                targ_hdr = _synthesize_targ_hdr(want_kpc, t25_hdr, t50_hdr, t100_hdr)
+            # Off-grid (e.g. rt60): build a synthetic target by interpolating the beam
+            # between the nearest fixed tapers that exist. Falls back to nearest neighbour.
+            def _interp_hdr(k_lo, h_lo, k_hi, h_hi, k_want):
+                if h_lo is None and h_hi is None:
+                    return None
+                if h_lo is None or h_hi is None:
+                    return (h_lo or h_hi).copy()
+                w = (k_want - k_lo) / float(k_hi - k_lo)
+                out = h_lo.copy()
+                for key in ("BMAJ", "BMIN"):
+                    v_lo = float(h_lo[key])
+                    v_hi = float(h_hi[key])
+                    out[key] = v_lo * (1.0 - w) + v_hi * w
+                # Use BPA from the closer endpoint when available
+                bpa_lo = float(h_lo.get("BPA", h_hi.get("BPA", 0.0)))
+                bpa_hi = float(h_hi.get("BPA", h_lo.get("BPA", 0.0)))
+                out["BPA"] = bpa_lo if (k_want - k_lo) <= (k_hi - k_want) else bpa_hi
+                return out
 
-        # —— enforce parity with fixed sets ——
-        if want_kpc in (25, 50, 100):
-            # exact parity: require that exact fixed header exists
-            if targ_hdr is None:
-                skipped.append(base); kept_flags.append(False); continue
-        else:
-            # off-grid: require that the source *has* a redshift (at least one fixed header present)
-            if (t25_hdr is None) and (t50_hdr is None) and (t100_hdr is None):
-                skipped.append(base); kept_flags.append(False); continue
-            if targ_hdr is None:
-                # could not synthesize even though some fixed headers exist → skip
-                skipped.append(base); kept_flags.append(False); continue
+            if want_kpc < 50:
+                targ_hdr = _interp_hdr(25, t25_hdr, 50, t50_hdr, want_kpc)
+            elif want_kpc < 100:
+                targ_hdr = _interp_hdr(50, t50_hdr, 100, t100_hdr, want_kpc)
+            else:
+                # ≥100 kpc: extrapolate from (50,100) if both exist, else nearest
+                targ_hdr = _interp_hdr(50, t50_hdr, 100, t100_hdr, want_kpc)
+
+        # Try to synthesize a target header if the exact fixed one is missing
+        if targ_hdr is None:
+            try:
+                targ_hdr = _synthetic_taper_header(raw_hdr, t25_hdr, t50_hdr, t100_hdr, want_kpc)
+            except Exception:
+                targ_hdr = None
+
+        # Parity enforcement only when the loader is anchored on a fixed set
+        if require_fixed_header and want_kpc in (25, 50, 100) and targ_hdr is None:
+            skipped.append(base); kept_flags.append(False); continue
+        # Otherwise, at least one fixed header must exist to calibrate; if none exist, skip
+        if (t25_hdr is None) and (t50_hdr is None) and (t100_hdr is None) and targ_hdr is None:
+            skipped.append(base); kept_flags.append(False); continue
 
         # 1) Load RAW
         raw_native = np.squeeze(fits.getdata(raw_path)).astype(float)
@@ -745,7 +784,6 @@ def initialize_metrics(metrics,
     metrics.setdefault(f"{key_base}_precision", [])
     metrics.setdefault(f"{key_base}_recall", [])
     metrics.setdefault(f"{key_base}_f1_score", [])
-
     metrics[f"{key_base}_f1_score"]   = []
 
 def update_metrics(metrics,
@@ -769,7 +807,7 @@ def update_metrics(metrics,
     metrics.setdefault(f"{key_base}_precision", []).append(precision)
     metrics.setdefault(f"{key_base}_recall", []).append(recall)
     metrics.setdefault(f"{key_base}_f1_score", []).append(f1)
-    
+
 
 def initialize_history(history, model_name, subset_size, fold, experiment, lr, reg, lambda_generate):
     if model_name not in history:
@@ -875,10 +913,13 @@ for gen_model_name in gen_model_names:
             raise RuntimeError("versions includes rt*, but filenames were not returned. Set PRINTFILENAMES=True.")
         test_images, test_labels, test_fns, info_test = _append_rt_versions(test_images, test_fns, _gen_versions, labels=test_labels)
         print(f"[TEST] dropped {info_test['removed_total']} (kept {info_test['kept']}/{info_test['initial']})")
-        assert info_test['removed_total'] == 0, (
-            f"RT alignment error (TEST): expected 0 drops with {_versions_to_load} "
-            f"as anchor, but dropped {info_test['removed_total']} out of {info_test['initial']}."
-        )
+        if FIXED_ANCHOR and info_test['removed_total'] != 0:
+            raise AssertionError(
+                       f"RT alignment error (TEST): expected 0 drops with {_versions_to_load} "
+                       f"as anchor, but dropped {info_test['removed_total']} out of {info_test['initial']}."
+                   )
+        elif info_test['removed_total'] != 0:
+            print(f"[TEST][warn] dropped {info_test['removed_total']} because no T* header; continuing (RAW anchor).")
 
         if REPLACE_WITH_RT:
             test_images = test_images[:, 1:2]  # keep only the runtime-tapered plane
@@ -1044,14 +1085,14 @@ for gen_model_name in gen_model_names:
                     valid_images, valid_labels, valid_fns, info_va = _append_rt_versions(valid_images, valid_fns, _gen_versions, labels=valid_labels)
                     print(f"[TRAIN] dropped {info_tr['removed_total']} (kept {info_tr['kept']}/{info_tr['initial']})")
                     print(f"[VALID] dropped {info_va['removed_total']} (kept {info_va['kept']}/{info_va['initial']})")
-                    assert info_tr['removed_total'] == 0, (
-                        f"RT alignment error (TRAIN): expected 0 drops with {_versions_to_load} "
-                        f"as anchor, but dropped {info_tr['removed_total']} out of {info_tr['initial']}."
-                    )
-                    assert info_va['removed_total'] == 0, (
-                        f"RT alignment error (VALID): expected 0 drops with {_versions_to_load} "
-                        f"as anchor, but dropped {info_va['removed_total']} out of {info_va['initial']}."
-                    )
+                    if FIXED_ANCHOR and info_tr['removed_total'] != 0:
+                        raise AssertionError(f"RT alignment error (TRAIN): expected 0 drops with {_versions_to_load} as anchor, but dropped {info_tr['removed_total']} out of {info_tr['initial']}.")
+                    elif info_tr['removed_total'] != 0:
+                        print(f"[TRAIN][warn] dropped {info_tr['removed_total']} (RAW anchor).")
+                    if FIXED_ANCHOR and info_va['removed_total'] != 0:
+                        raise AssertionError(f"RT alignment error (VALID): expected 0 drops with {_versions_to_load} as anchor, but dropped {info_va['removed_total']} out of {info_va['initial']}.")
+                    elif info_va['removed_total'] != 0:
+                        print(f"[VALID][warn] dropped {info_va['removed_total']} (RAW anchor).")
                     
                     if REPLACE_WITH_RT:
                         train_images = train_images[:, 1:2]

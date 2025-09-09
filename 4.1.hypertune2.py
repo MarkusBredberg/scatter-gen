@@ -4,8 +4,11 @@ import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader, Subset, Dataset
 from torchsummary import summary
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score 
-from utils.data_loader import load_galaxies, get_classes,  get_synthetic, augment_images, apply_formatting
-from utils.classifiers import RustigeClassifier, TinyCNN, MLPClassifier, SCNN, CNNSqueezeNet, ScatterResNet, DANNClassifier, BinaryClassifier, ScatterSqueezeNet, ScatterSqueezeNet2, DualCNNSqueezeNet, DualInputConvolutionalSqueezeNet
+from utils.data_loader import load_halos_and_relics, get_classes,  get_synthetic, augment_images, apply_formatting
+from utils.classifiers import (
+    RustigeClassifier, TinyCNN, MLPClassifier, SCNN, CNNSqueezeNet, ScatterResNet,
+    DANNClassifier, BinaryClassifier, ScatterSqueezeNet, ScatterSqueezeNet2,
+    DualCNNSqueezeNet, DualInputConvolutionalSqueezeNet, DISSN)
 from utils.training_tools import EarlyStopping, reset_weights
 from utils.calc_tools import cluster_metrics, normalise_images, check_tensor, fold_T_axis, compute_scattering_coeffs, custom_collate
 from utils.plotting import plot_histograms, plot_images_by_class, plot_image_grid, plot_background_histogram
@@ -46,14 +49,14 @@ os.makedirs('./classifier/trained_models_filtered', exist_ok=True)
 matplotlib.use('Agg')
 tqdm.pandas(disable=True)
 
-print("Running ht2 with DualInputConvolutionalSqueezeNet with seed", SEED)
+print("Running ht2 with seed", SEED)
 
 
 #############################################
 ################ CONFIGURATION ################
 ###############################################
 
-galaxy_classes    = [50, 51]
+galaxy_classes    = [52, 53]
 max_num_galaxies  = 1000000
 dataset_portions  = [1]
 J, L, order       = 2, 12, 2
@@ -70,15 +73,16 @@ classifier        = ["TinyCNN",       # Very Simple CNN
                      "Rustige",       # from Rustige et al. 2023
                      "SCNN",          # simple CNN variant
                      "CNNSqueezeNet", # with SE blocks
-                     "DualCNNSqueezeNet",
+                     "DualCNNSqueezeNet", # Dual mode Convolutional SqueezeNet
                      "DICSN",          # Dual-Input Convolutional SqueezeNet
+                     "DISSN",          # Dual-Input Scatter SqueezeNet
                      "CloudNet",      # from SorourMo/Cloud-Net
                      "DANN",          # domain‐adversarial NN
                      "ScatterNet",
                      "ScatterSqueezeNet",
                      "ScatterSqueezeNet2",
                      "Binary",
-                     "ScatterResNet"][5]
+                     "ScatterResNet"][-4]
 
 # Define every value you want to try
 param_grid = {
@@ -90,9 +94,9 @@ param_grid = {
     'order':         [2],
     'percentile_lo': [1, 30, 60],   
     'percentile_hi': [80, 90, 99], 
-    'crop_size':     [(512,512)],
+    'crop_size':     [(2000,2000)],
     'downsample_size':[(128,128)],
-    'versions':       [('RAW', 'T50kpc')]  # 'raw', 'T50kpc', ad hoc tapering: e.g. 'rt50'  strings in list → product() iterates them individually
+    'versions':       ['RAW']  # 'raw', 'T50kpc', ad hoc tapering: e.g. 'rt50'  strings in list → product() iterates them individually
 } #'versions': [('raw', 'rt50')]  # tuple signals “stack these”
 
 STRETCH = True  # Arcsinh stretch
@@ -275,6 +279,20 @@ def bg_sigma(t):
     m = _background_ring_mask(t.shape[-2], t.shape[-1], inner=64)
     return _robust_sigma(t.squeeze(1)[..., m])  # [B] robust σ
 
+def _to_strs(x): 
+    return [str(y) for y in x] if isinstance(x, (list, tuple)) else list(map(str, x))
+
+def _filter_to_keep_set(imgs, labels, fns, keep_set):
+    """Keep only samples whose filename is in keep_set; returns (imgs, labels, fns)."""
+    if fns is None:
+        raise RuntimeError("Filenames are required to filter by anchor T*kpc. Set PRINTFILENAMES=True.")
+    keep_idx = [i for i, fn in enumerate(_to_strs(fns)) if str(fn) in keep_set]
+    if not keep_idx:  # produce empty tensors with correct shape/device
+        return imgs[:0], labels[:0], []
+    imgs = imgs[keep_idx]
+    labels = labels[keep_idx]
+    fns = [fns[i] for i in keep_idx]
+    return imgs, labels, fns
 
 def _pixscale_arcsec(hdr):
     if 'CDELT1' in hdr:  # deg/pix
@@ -283,6 +301,12 @@ def _pixscale_arcsec(hdr):
     if cd11 is not None:
         return float(np.hypot(cd11, cd12)) * 3600.0
     raise KeyError("No CDELT* or CD* keywords in FITS header")
+
+def _has_anchors(fn: str, anchors):
+    # anchors like ["T50kpc"] or ["T25kpc","T100kpc"]
+    _, t25, t50, t100, *_ = _headers_for_name(str(fn))
+    avail = {"T25kpc": t25 is not None, "T50kpc": t50 is not None, "T100kpc": t100 is not None}
+    return all(avail[a] for a in anchors)
 
 def fwhm_to_sigma_rad(fwhm_arcsec):
     return (fwhm_arcsec*ARCSEC) / (2*np.sqrt(2*np.log(2)))
@@ -764,58 +788,37 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
         f"global_norm={USE_GLOBAL_NORMALISATION}, norm_mode={GLOBAL_NORM_MODE} ◀\n")
 
     if any (cls in galaxy_classes for cls in [10, 11, 12, 13]):
-        crop_size = (128, 128)  # Crop size for the images
-        downsample_size = (128, 128)  # Downsample size for the images
         batch_size = 128
-    elif galaxy_classes[0] in list(range(40, 49)):
-        crop_size = (1600, 1600)  # Crop size for the images
-        downsample_size = (128, 128)  # Downsample size for the images
+    else:
         batch_size = 16
-    elif galaxy_classes[0] in list(range(50, 60)):
-        crop_size = (1, 512, 512)  # Crop size for the images
-        downsample_size = (1, 128, 128)  # Downsample size for the images
-        batch_size = 16 
 
     img_shape = downsample_size
 
-    # parse versions
+    # --- Parse requested versions into what we LOAD and what we GENERATE (rt*) ---
     def _split_versions(v):
         v = v if isinstance(v, (list, tuple)) else [v]
         v = [str(x).lower() for x in v]
         gen, load = [], []
         for x in v:
             m = re.fullmatch(r'rt(\d+)(?:kpc)?', x)
-            if m:
-                gen.append(f"rt{m.group(1)}")
-            else:
-                load.append(x)
+            if m: gen.append(f"rt{m.group(1)}")
+            else: load.append(x)
         return load, gen
 
     _load_versions, _gen_versions = _split_versions(versions)
 
-    # NEW: align RTxx exactly to the fixed uv–tapered set Txxkpc by using that
-    ALIGN_RT_WITH_FIXED = True
-    if ALIGN_RT_WITH_FIXED and _gen_versions:
-        def _rt_anchor(g):
-            m = re.fullmatch(r'rt(\d+)', g)
-            if not m:
-                return None
-            k = int(m.group(1))
-            # nearest fixed anchor among 25/50/100 kpc (midpoints at 37.5 and 75)
-            if k < 38:
-                anchor = 25
-            elif k < 75:
-                anchor = 50
-            else:
-                anchor = 100
-            return f"T{anchor}kpc"
-        anchors = [a for a in (_rt_anchor(g) for g in _gen_versions) if a]
-        _versions_to_load = [anchors[0]] if anchors else (_load_versions if _load_versions else ['raw'])
-    else:
-        _versions_to_load = _load_versions if _load_versions else ['raw']
+    # Always load RAW unless the user explicitly asked for T* as input.
+    _versions_to_load = _load_versions or ['raw']   # e.g. ('raw','rt50') -> ['raw']
 
+    # If any rt* is requested, compute which fixed T*kpc set we will use to SELECT sources.
+    def _rt_anchor(g):
+        m = re.fullmatch(r'rt(\d+)', g)
+        if not m: return None
+        k = int(m.group(1))
+        # nearest anchor among 25/50/100 (midpoints ~37.5, 75)
+        return f"T{25 if k < 38 else 50 if k < 75 else 100}kpc"
 
-    print(f"_versions_to_load={_versions_to_load}, _gen_versions={_gen_versions}")
+    _anchor_versions = sorted({a for a in (_rt_anchor(g) for g in _gen_versions) if a})  # [] if no rt*
 
     REPLACE_WITH_RT = (
         (isinstance(versions, str) and versions.lower().startswith('rt')) or
@@ -827,16 +830,13 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
     LATE_AUG = bool(_gen_versions) # True if any(v.startswith('rt') for v in _gen_versions)
     PRINTFILENAMES = bool(_gen_versions)
     EXTRAVARS = False  # Use extra features (redshift, mass, size) for the classifier. Will automatically be true if test_meta is not None.
+    print(f"LATE_AUG={LATE_AUG}, PRINTFILENAMES={PRINTFILENAMES}, EXTRAVARS={EXTRAVARS}")
 
     if set(galaxy_classes) & {18} or set(galaxy_classes) & {19}:
         galaxy_classes = [20, 21, 21, 22, 23, 24, 25, 26, 27, 28, 29]  # Include all digits if 18 or 19 is in target_classes
     else:
         galaxy_classes = galaxy_classes
     num_classes = len(galaxy_classes)
-
-    EXTRAVARS = False  # Use extra features (redshift, mass, size) for the classifier. Will automatically be true if test_meta is not None.
-    LATE_AUG = bool(_gen_versions) # True if any(v.startswith('rt') for v in _gen_versions)
-    PRINTFILENAMES = bool(_gen_versions)
     
     def _verkey(v):
         if isinstance(v, (list, tuple)):
@@ -891,7 +891,7 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
         hidden_dim2 = 128
         vae_latent_dim = 64
         
-        _out  = load_galaxies(galaxy_classes=galaxy_classes,
+        _out  = load_halos_and_relics(galaxy_classes=galaxy_classes,
                     versions=_versions_to_load or ['raw'], 
                     fold=max(folds), #Any fold other than 5 gives me the test data for the five fold cross validation
                     crop_size=crop_size,
@@ -909,32 +909,35 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                     GLOBAL_NORM_MODE=GLOBAL_NORM_MODE,
                     PRINTFILENAMES=PRINTFILENAMES,
                     train=False)
-
+        
+            # Unpack test split (and shuffle it)
         if len(_out) == 4:
-            train_images, train_labels, test_images, test_labels = _out
-            train_fns = test_fns = None
-            perm_test = torch.randperm(test_images.size(0))
-            test_images, test_labels = test_images[perm_test], test_labels[perm_test]
+            _train_imgs_dummy, _train_lbls_dummy, test_images, test_labels = _out
+            test_fns = None
         elif len(_out) == 6:
-            train_images, train_labels, test_images, test_labels, train_fns, test_fns = _out
-            test_images, test_labels, test_fns = shuffle_with_filenames(test_images, test_labels, test_fns)
+            _train_imgs_dummy, _train_lbls_dummy, test_images, test_labels, _train_fns_dummy, test_fns = _out
         else:
-            raise ValueError(f"load_galaxies returned {len(_out)} values, expected 4 or 6")
+            raise ValueError(f"load_halos_and_relics(train=False) returned {len(_out)} values, expected 4 or 6")
 
-        train_labels = relabel(train_labels)  # Will be used for the sanity check below
-        test_labels  = relabel(test_labels)   # [0,1,...] aligning with galaxy_classes
-        unique_labels, counts = torch.unique(test_labels, return_counts=True)
+        perm_test = torch.randperm(test_images.size(0))
+        test_images, test_labels = test_images[perm_test], test_labels[perm_test]
+        test_labels = relabel(test_labels)  # map {50,51} -> {0,1}
+        if test_fns is not None:
+            test_fns = [test_fns[i] for i in perm_test.tolist()]
 
         # --- PSF matching for the test/eval set only (RAW → 50/100) ---
-        if _gen_versions:
+        if _gen_versions and _anchor_versions:
+            keep_set_test = {fn for fn in map(str, test_fns) if _has_anchors(fn, _anchor_versions)}
+            test_images, test_labels, test_fns = _filter_to_keep_set(test_images, test_labels, test_fns, keep_set_test)
+            print(f"[TEST-anchor] kept {len(test_fns)} after gating by {_anchor_versions}")
+
             if test_fns is None:
                 raise RuntimeError("versions includes rt*, but filenames were not returned. Set PRINTFILENAMES=True.")
+            
             test_images, test_labels, test_fns, info_test = _append_rt_versions(test_images, test_fns, _gen_versions, labels=test_labels)
             print(f"[TEST] dropped {info_test['removed_total']} (kept {info_test['kept']}/{info_test['initial']})")
-            assert info_test['removed_total'] == 0, (
-                f"RT alignment error (TEST): expected 0 drops with {_versions_to_load} "
-                f"as anchor, but dropped {info_test['removed_total']} out of {info_test['initial']}."
-            )
+            assert info_test['removed_total'] == 0, "After anchor gating there should be no rt* drops."
+
 
             if REPLACE_WITH_RT:
                 test_images = test_images[:, 1:2]  # keep only the runtime-tapered plane
@@ -954,44 +957,59 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
         #    cls_images = test_images[cls_mask]
         #    check_tensor(f"Test images for class {cls} (idx={i})", cls_images)
 
-        import hashlib
-
-        def img_hash(img: torch.Tensor) -> str:
-            # ensure CPU & contiguous
-            arr = img.cpu().contiguous().numpy()
-            return hashlib.sha1(arr.tobytes()).hexdigest()
-
-        # after loading train_images, test_images:
-        train_hss = {img_hash(img) for img in train_images}
-        test_hashes   = {img_hash(img) for img in test_images}
-
-        common = train_hss & test_hashes
-        assert not common, f"Overlap detected: {len(common)} images appear in both train and test validation!"
         # ————————————————————————
 
 
         # Produce an empty tensor to occupy the not used component of the datasets. 
         mock_tensor = torch.zeros_like(test_images)
-        if classifier in ['ScatterNet', 'ScatterResNet', 'ScatterSqueezeNet', 'ScatterSqueezeNet2']:
+        if classifier in ['ScatterNet', 'ScatterResNet', 'ScatterSqueezeNet', 'ScatterSqueezeNet2', 'DISSN']:
+            # merge T/version axis into channels
             test_images = fold_T_axis(test_images)
-            test_scat_coeffs = compute_scattering_coeffs(test_images, scattering, batch_size=128, device='cpu')
-            if test_scat_coeffs.dim() == 5:
-                # [B, C_in, C_scat, H, W] → [B, C_in*C_scat, H, W]
-                test_scat_coeffs = test_scat_coeffs.flatten(start_dim=1, end_dim=2)
-                            
-            if NORMALISESCS or NORMALISESCSTOPM:
-                if NORMALISESCSTOPM:
-                    test_scat_coeffs = normalise_images(test_scat_coeffs, -1, 1)
-                else:
-                    test_scat_coeffs = normalise_images(test_scat_coeffs, 0, 1)
 
-            if classifier in ['ScatterNet', 'ScatterResNet']:
-                mock_test = torch.zeros_like(test_images)  # images are ignored
-                test_dataset = TensorDataset(mock_test, test_scat_coeffs, test_labels)
-            elif classifier in ['ScatterSqueezeNet', 'ScatterSqueezeNet2']:
-                if EXTRAVARS:
-                    print("Not implemented yet for ScatterSqueezeNet with extra variables")
-                    exit(1)
+            if classifier == 'DISSN':
+                # We need: images = RAW, scat = scattering(T50kpc)
+                # Ensure both versions are present
+                vnames = [str(v).lower() for v in (_versions_to_load or ['raw'])]
+                assert 'raw' in vnames and 't50kpc' in vnames, \
+                    f"DISSN requires versions to include 'raw' and 'T50kpc', got: {vnames}"
+
+                idx_raw = vnames.index('raw')
+                idx_t50 = vnames.index('t50kpc')
+
+                raw_test = test_images[:, idx_raw:idx_raw+1].contiguous()
+                t50_only = test_images[:, idx_t50:idx_t50+1].contiguous()
+                test_scat_coeffs = compute_scattering_coeffs(t50_only, scattering, batch_size=128, device='cpu')
+
+                if test_scat_coeffs.dim() == 5:
+                    test_scat_coeffs = test_scat_coeffs.flatten(start_dim=1, end_dim=2)
+
+                if NORMALISESCS or NORMALISESCSTOPM:
+                    if NORMALISESCSTOPM:
+                        test_scat_coeffs = normalise_images(test_scat_coeffs, -1, 1)
+                    else:
+                        test_scat_coeffs = normalise_images(test_scat_coeffs, 0, 1)
+
+                # for shape bookkeeping downstream
+                scatdim = test_scat_coeffs.shape[1:]
+
+                # dataset feeds (img=scalar RAW, scat=scattering(T50kpc))
+                test_dataset = TensorDataset(raw_test, test_scat_coeffs, test_labels)
+
+            else:
+                # original behavior for the other scatter-based classifiers
+                test_scat_coeffs = compute_scattering_coeffs(test_images, scattering, batch_size=128, device='cpu')
+                if test_scat_coeffs.dim() == 5:
+                    test_scat_coeffs = test_scat_coeffs.flatten(start_dim=1, end_dim=2)
+                if NORMALISESCS or NORMALISESCSTOPM:
+                    if NORMALISESCSTOPM:
+                        test_scat_coeffs = normalise_images(test_scat_coeffs, -1, 1)
+                    else:
+                        test_scat_coeffs = normalise_images(test_scat_coeffs, 0, 1)
+
+                scatdim = test_scat_coeffs.shape[1:]
+                if classifier in ['ScatterNet', 'ScatterResNet']:
+                    mock_test = torch.zeros_like(test_images)
+                    test_dataset = TensorDataset(mock_test, test_scat_coeffs, test_labels)
                 else:
                     test_dataset = TensorDataset(test_images, test_scat_coeffs, test_labels)
 
@@ -1003,14 +1021,13 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
             if classifier in ["DICSN"]:
                 assert 'raw' in _versions_to_load and 't50kpc' in _versions_to_load, \
                     f"DICSN/DualCNN needs 'raw' and 't50kpc' in versions, got: {_versions_to_load}"
-                idx_raw = _versions_to_load.index('raw')
-                idx_t50 = _versions_to_load.index('t50kpc')
-                raw_test = test_images[:, idx_raw:idx_raw+1]   # [B,1,H,W]
-                t50_test = test_images[:, idx_t50:idx_t50+1]   # [B,1,H,W]
-                test_dataset = TensorDataset(raw_test, t50_test, test_labels)
+                idx_v1 = 0
+                idx_v2 = 1
+                raw_test = test_images[:, idx_v1:idx_v1+1]   # [B,1,H,W]
+                v2_test = test_images[:, idx_v2:idx_v2+1]   # [B,1,H,W]
+                test_dataset = TensorDataset(raw_test, v2_test, test_labels)
             else:
                 test_dataset = TensorDataset(test_images, mock_tensor, test_labels)
-
 
                                 
         test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=custom_collate, drop_last=False)
@@ -1034,7 +1051,7 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                 # only synthetic for training; reserve real for validation
                 train_images = torch.empty((0, *img_shape), device=DEVICE)
                 train_labels = torch.empty((0,), dtype=torch.long, device=DEVICE)
-                _out = load_galaxies(
+                _out = load_halos_and_relics(
                     galaxy_classes=galaxy_classes,
                     versions=_versions_to_load or ['raw'],
                     fold=fold,
@@ -1064,7 +1081,7 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
 
             else:
                 # real train + valid
-                _out = load_galaxies(
+                _out = load_halos_and_relics(
                     galaxy_classes=galaxy_classes,
                     versions=_versions_to_load or ['raw'],
                     fold=max(folds),
@@ -1101,7 +1118,12 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                         print("Not implemented extradata yet")
 
                     # --- PSF matching for train/valid when requested ---
-                    if _gen_versions:
+                    if _gen_versions and _anchor_versions:
+                        keep_train = {fn for fn in map(str, train_fns) if _has_anchors(fn, _anchor_versions)}
+                        keep_valid = {fn for fn in map(str, valid_fns) if _has_anchors(fn, _anchor_versions)}
+                        train_images, train_labels, train_fns = _filter_to_keep_set(train_images, train_labels, train_fns, keep_train)
+                        valid_images, valid_labels, valid_fns = _filter_to_keep_set(valid_images, valid_labels, valid_fns, keep_valid)
+                        print(f"[TRAIN-anchor] kept {len(train_fns)}; [VALID-anchor] kept {len(valid_fns)}")
                         if train_fns is None or valid_fns is None:
                             raise RuntimeError("versions includes rt*, but train/valid filenames were not returned.")
                         
@@ -1110,15 +1132,21 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                         valid_images, valid_labels, valid_fns, info_va = _append_rt_versions(valid_images, valid_fns, _gen_versions, labels=valid_labels)
                         print(f"[TRAIN] dropped {info_tr['removed_total']} (kept {info_tr['kept']}/{info_tr['initial']})")
                         print(f"[VALID] dropped {info_va['removed_total']} (kept {info_va['kept']}/{info_va['initial']})")
-                        assert info_tr['removed_total'] == 0, (
-                            f"RT alignment error (TRAIN): expected 0 drops with {_versions_to_load} "
-                            f"as anchor, but dropped {info_tr['removed_total']} out of {info_tr['initial']}."
-                        )
-                        assert info_va['removed_total'] == 0, (
-                            f"RT alignment error (VALID): expected 0 drops with {_versions_to_load} "
-                            f"as anchor, but dropped {info_va['removed_total']} out of {info_va['initial']}."
-                        )
+                        assert info_tr['removed_total'] == 0, "After anchor gating there should be no rt* drops (train)."
+                        assert info_va['removed_total'] == 0, "After anchor gating there should be no rt* drops (valid)."
                         
+                        # ---- Train/Test leakage check (AFTER train_images and test_images are defined) ----
+                        import hashlib
+                        def img_hash(img: torch.Tensor) -> str:
+                            arr = img.cpu().contiguous().numpy()
+                            return hashlib.sha1(arr.tobytes()).hexdigest()
+
+                        train_hashes = {img_hash(img) for img in train_images}   # ok if 4D or 5D; iterates per-sample
+                        test_hashes  = {img_hash(img) for img in test_images}
+                        overlap = train_hashes & test_hashes
+                        assert not overlap, f"Overlap detected: {len(overlap)} images appear in both train and test!"
+                        # -------------------------------------------------------------------------------
+
                         if REPLACE_WITH_RT:
                             train_images = train_images[:, 1:2]
                             valid_images = valid_images[:, 1:2]
@@ -1422,45 +1450,67 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
             if fold in [0, 5] and SHOWIMGS:
                 imgs = train_images.detach().cpu().numpy()
                 lbls = (train_labels + min(galaxy_classes)).detach().cpu().numpy() # This is to match the original class labels
-                plot_images_by_class(imgs, labels=lbls, num_images=5, save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_example_train_data.pdf")
+                plot_images_by_class(imgs, labels=lbls, num_images=5, save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_example_train_data.png")
             
             # Prepare input data
             mock_tensor = torch.zeros_like(train_images)
             valid_mock_tensor = torch.zeros_like(valid_images)
-            if classifier in ['ScatterNet', 'ScatterResNet', 'ScatterSqueezeNet', 'ScatterSqueezeNet2']:
-                # Define cache paths (you can adjust these names as needed)
-                train_cache_path = f"./.cache/train_scat_{galaxy_classes}_{fold}_{lambda_generate}_{dataset_portions[0]}_{FILTERED}_{TRAINONGENERATED}.npy"
-                valid_cache_path = f"./.cache/valid_scat_{galaxy_classes}_{fold}_{lambda_generate}_{dataset_portions[0]}_{FILTERED}_{TRAINONGENERATED}.npy"
-                
-                if USE_MEMMAP:
-                    # Use memmap-based caching (from script 1)
-                    train_cache_file, train_full_shape = cache_scattering_memmap(train_images, scattering, train_cache_path, batch_size=128, device="cpu")
-                    valid_cache_file, valid_full_shape = cache_scattering_memmap(valid_images, scattering, valid_cache_path, batch_size=128, device="cpu")
-                    # Create dataset using the memmap cache
-                    train_dataset = CachedScatterDataset(train_images, train_labels, train_cache_file, train_full_shape)
-                    valid_dataset = CachedScatterDataset(valid_images, valid_labels, valid_cache_file, valid_full_shape)
-                    scatdim = train_full_shape[1:]  # e.g., (C, H, W)
-                    
-                else:
-                    # fold T into C on both real & scattering inputs
-                    train_images = fold_T_axis(train_images) # Merges the image version into the channel dimension
-                    valid_images = fold_T_axis(valid_images)
-                    mock_train = torch.zeros_like(train_images)
-                    mock_valid = torch.zeros_like(valid_images)
+            if classifier in ['ScatterNet', 'ScatterResNet', 'ScatterSqueezeNet', 'ScatterSqueezeNet2', 'DISSN']:
+                train_images = fold_T_axis(train_images)
+                valid_images = fold_T_axis(valid_images)
 
+                if classifier == 'DISSN':
+                    vnames = [str(v).lower() for v in (_versions_to_load or ['raw'])]
+                    assert 'raw' in vnames and 't50kpc' in vnames, \
+                        f"DISSN requires versions to include 'raw' and 'T50kpc', got: {vnames}"
 
-                    train_cache = f"./.cache/train_scat_{galaxy_classes}_{fold}_{lambda_generate}_{dataset_portions[0]}_{FILTERED}.pt"
-                    valid_cache = f"./.cache/valid_scat_{galaxy_classes}_{fold}_{lambda_generate}_{dataset_portions[0]}_{FILTERED}.pt"
-                    train_scat_coeffs = compute_scattering_coeffs(train_images, scattering, batch_size=128, device="cpu")
-                    valid_scat_coeffs = compute_scattering_coeffs(valid_images, scattering, batch_size=128, device="cpu")
+                    idx_raw = vnames.index('raw')
+                    idx_t50 = vnames.index('t50kpc')
+
+                    # images are RAW
+                    raw_train = train_images[:, idx_raw:idx_raw+1]
+                    raw_valid = valid_images[:, idx_raw:idx_raw+1]
+
+                    # scattering on T50kpc only
+                    t50_train = train_images[:, idx_t50:idx_t50+1].contiguous()
+                    t50_valid = valid_images[:, idx_t50:idx_t50+1].contiguous()
+
+                    train_scat_coeffs = compute_scattering_coeffs(t50_train, scattering, batch_size=128, device="cpu")
+                    valid_scat_coeffs = compute_scattering_coeffs(t50_valid, scattering, batch_size=128, device="cpu")
 
                     if train_scat_coeffs.dim() == 5:
-                        # [B, C_in, C_scat, H, W] → [B, C_in*C_scat, H, W]
-                        print("Shape of train_scat_coeffs before flattening: ", train_scat_coeffs.shape)
                         train_scat_coeffs = train_scat_coeffs.flatten(start_dim=1, end_dim=2)
                         valid_scat_coeffs = valid_scat_coeffs.flatten(start_dim=1, end_dim=2)
-                        print("Shape of train_scat_coeffs after flattening: ", train_scat_coeffs.shape)
 
+                    # (optional) joint normalization for stability
+                    all_scat = torch.cat([train_scat_coeffs, valid_scat_coeffs], dim=0)
+                    if NORMALISESCS or NORMALISESCSTOPM:
+                        if NORMALISESCSTOPM:
+                            all_scat = normalise_images(all_scat, -1, 1)
+                        else:
+                            all_scat = normalise_images(all_scat, 0, 1)
+                    train_scat_coeffs = all_scat[:len(train_scat_coeffs)]
+                    valid_scat_coeffs = all_scat[len(train_scat_coeffs):]
+
+                    scatdim = train_scat_coeffs.shape[1:]
+
+                    # Build datasets (img=RAW, scat=scattering(T50kpc))
+                    train_dataset = TensorDataset(raw_train, train_scat_coeffs, train_labels)
+                    valid_dataset = TensorDataset(raw_valid, valid_scat_coeffs, valid_labels)
+
+                    # also keep these around for model shape inference below
+                    train_images = raw_train
+                    valid_images = raw_valid
+
+                else:
+                    # original behavior for the other scatter-based classifiers
+                    mock_train = torch.zeros_like(train_images)
+                    mock_valid = torch.zeros_like(valid_images)
+                    train_scat_coeffs = compute_scattering_coeffs(train_images, scattering, batch_size=128, device="cpu")
+                    valid_scat_coeffs = compute_scattering_coeffs(valid_images, scattering, batch_size=128, device="cpu")
+                    if train_scat_coeffs.dim() == 5:
+                        train_scat_coeffs = train_scat_coeffs.flatten(start_dim=1, end_dim=2)
+                        valid_scat_coeffs = valid_scat_coeffs.flatten(start_dim=1, end_dim=2)
                     all_scat = torch.cat([train_scat_coeffs, valid_scat_coeffs], dim=0)
                     if NORMALISESCS or NORMALISESCSTOPM:
                         if NORMALISESCSTOPM:
@@ -1468,23 +1518,14 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                         else:
                             all_scat = normalise_images(all_scat, 0, 1)
                     train_scat_coeffs, valid_scat_coeffs = all_scat[:len(train_scat_coeffs)], all_scat[len(train_scat_coeffs):]
-
-                    scatdim = train_scat_coeffs.shape[1:]   # tuple(C, H, W)
-
+                    scatdim = train_scat_coeffs.shape[1:]
                     if classifier in ['ScatterNet', 'ScatterResNet']:
                         train_dataset = TensorDataset(mock_train, train_scat_coeffs, train_labels)
                         valid_dataset = TensorDataset(mock_valid, valid_scat_coeffs, valid_labels)
-                    else: # if classifier in ['ScatterSqueezeNet', 'ScatterSqueezeNet2']:
-                        if EXTRAVARS:
-                            print(train_images.shape)
-                            print(train_scat_coeffs.shape)
-                            print(train_data.shape)
-                            print(train_labels.shape)
-                            train_dataset = TensorDataset(train_images, train_scat_coeffs, train_data, train_labels)
-                            valid_dataset = TensorDataset(valid_images, valid_scat_coeffs, valid_data, valid_labels)
-                        else:
-                            train_dataset = TensorDataset(train_images, train_scat_coeffs, train_labels)
-                            valid_dataset = TensorDataset(valid_images, valid_scat_coeffs, valid_labels)
+                    else:
+                        train_dataset = TensorDataset(train_images, train_scat_coeffs, train_labels)
+                        valid_dataset  = TensorDataset(valid_images, valid_scat_coeffs, valid_labels)
+
             else:
                 if train_images.dim() == 5:
                     train_images = fold_T_axis(train_images)   # [B,T,1,H,W] -> [B,T,H,W]
@@ -1495,14 +1536,14 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                 mock_train = torch.zeros_like(train_images)
                 mock_valid = torch.zeros_like(valid_images)
                 if classifier == "DICSN":
-                    idx_raw = _versions_to_load.index('raw') if 'raw' in _versions_to_load else 0
-                    idx_t50 = _versions_to_load.index('t50kpc') if 't50kpc' in _versions_to_load else 1
-                    raw_train = train_images[:, idx_raw:idx_raw+1]
-                    t50_train = train_images[:, idx_t50:idx_t50+1]
-                    raw_valid = valid_images[:, idx_raw:idx_raw+1]
-                    t50_valid = valid_images[:, idx_t50:idx_t50+1]
-                    train_dataset = TensorDataset(raw_train, t50_train, train_labels)
-                    valid_dataset = TensorDataset(raw_valid, t50_valid, valid_labels)
+                    idx_v1 = 0
+                    idx_v2 = 1
+                    v1_train = train_images[:, idx_v1:idx_v1+1]
+                    v2_train = train_images[:, idx_v2:idx_v2+1]
+                    v1_valid = valid_images[:, idx_v1:idx_v1+1]
+                    v2_valid = valid_images[:, idx_v2:idx_v2+1]
+                    train_dataset = TensorDataset(v1_train, v2_train, train_labels)
+                    valid_dataset = TensorDataset(v1_valid, v2_valid, valid_labels)
                 else:
                     train_dataset = TensorDataset(train_images, mock_train, train_labels)
                     valid_dataset = TensorDataset(valid_images, mock_valid, valid_labels)
@@ -1532,6 +1573,8 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
             elif classifier == "DICSN":
                 H, W = valid_images.shape[-2], valid_images.shape[-1]
                 models = {"DICSN": {"model": DualInputConvolutionalSqueezeNet(input_shape=(1, H, W), num_classes=num_classes).to(DEVICE)}}
+            elif classifier == "DISSN":
+                models = {"DISSN": {"model": DISSN(img_shape=tuple(valid_images.shape[1:]), scat_shape=scatdim, num_classes=num_classes).to(DEVICE)}}
             elif classifier == "TinyCNN":
                 models = {"TinyCNN": {"model": TinyCNN(input_shape=tuple(valid_images.shape[1:]), num_classes=num_classes).to(DEVICE)}} 
             elif classifier == 'CloudNet':
@@ -1565,7 +1608,6 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
             ###############################################
             
             if weights is not None:
-                print(f"Using class weights: {weights}")
                 criterion = nn.CrossEntropyLoss(weight=weights, label_smoothing=label_smoothing)
             else:
                 print("No class weighting")
@@ -1647,7 +1689,7 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                                 else:
                                     if classifier in ["ScatterNet", "ScatterResNet"]:
                                         logits = model(scat)
-                                    elif classifier in ["ScatterSqueezeNet", "ScatterSqueezeNet2", "DICSN"]:
+                                    elif classifier in ["ScatterSqueezeNet", "ScatterSqueezeNet2", "DICSN", "DISSN"]:
                                         logits = model(images, scat)
                                     else:
                                         logits = model(images)
@@ -1701,7 +1743,7 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                                     else:
                                         if classifier in ["ScatterNet", "ScatterResNet"]:
                                             logits = model(scat)
-                                        elif classifier in ["ScatterSqueezeNet", "ScatterSqueezeNet2", "DICSN"]:
+                                        elif classifier in ["ScatterSqueezeNet", "ScatterSqueezeNet2", "DICSN", "DISSN"]:
                                             logits = model(images, scat)
                                         else:
                                             logits = model(images)
@@ -1760,7 +1802,7 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                                 else:
                                     if classifier in ["ScatterNet", "ScatterResNet"]:
                                         logits = model(scat)
-                                    elif classifier in ["ScatterSqueezeNet", "ScatterSqueezeNet2", "DICSN"]:
+                                    elif classifier in ["ScatterSqueezeNet", "ScatterSqueezeNet2", "DICSN", "DISSN"]:
                                         logits = model(images, scat)
                                     else:
                                         logits = model(images)
@@ -1880,19 +1922,20 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                 
                 generated_features = []
                 with torch.no_grad():
-                    for images, scat, _ in test_loader:
+                    for images, scat, _rest in test_loader:
                         if EXTRAVARS:
                             meta, labels = _rest
-                            meta = meta.to(DEVICE)  # Send metadata to device
+                            meta = meta.to(DEVICE)
                         else:
                             labels = _rest
                         images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE)
+                        
                         if classifier == "DANN":
                             class_logits, _ = model(images, alpha=1.0)
                             outputs = class_logits.cpu().detach().numpy()
                         elif classifier in ["ScatterNet", "ScatterResNet"]:
                             outputs = model(scat).cpu().detach().numpy()
-                        elif classifier in ["ScatterSqueezeNet", "ScatterSqueezeNet2", "DICSN"]:
+                        elif classifier in ["ScatterSqueezeNet", "ScatterSqueezeNet2", "DICSN", "DISSN"]:
                             outputs = model(images, scat).cpu().detach().numpy()
                         else:
                             outputs = model(images).cpu().detach().numpy()
@@ -1940,5 +1983,4 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
         with open(summary_path, "wb") as f:
             pickle.dump(_clean, f)
         print(f"Summary metrics written to {summary_path}") 
-
 

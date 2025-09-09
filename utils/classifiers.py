@@ -781,7 +781,25 @@ class ScatterSqueezeNet(nn.Module):
         x = self.dropout(x)
         #return torch.softmax(self.FC_classifier(x), dim=1)  # Return probabilities for multi-class classification
         return self.FC_classifier(x)  # Return logits directly for multi-class classification
-    
+
+class DISSN(ScatterSqueezeNet):
+    """
+    Dual-Input ScatterSqueezeNet:
+    - first input: RAW image  (shape ~ [B, 1, H, W])
+    - second input: scattering coefficients of the *second* version (e.g. T50kpc)
+    This is functionally identical to ScatterSqueezeNet, but named for clarity.
+    """
+    def __init__(self, img_shape, scat_shape, num_classes,
+                 hidden_dim1=256, hidden_dim2=128, classifier_hidden_dim=256,
+                 dropout_rate=0.3, J=2):
+        super().__init__(img_shape=img_shape,
+                         scat_shape=scat_shape,
+                         num_classes=num_classes,
+                         hidden_dim1=hidden_dim1,
+                         hidden_dim2=hidden_dim2,
+                         classifier_hidden_dim=classifier_hidden_dim,
+                         dropout_rate=dropout_rate,
+                         J=J)
 
 
 class ScatterSqueezeNet2(nn.Module):
