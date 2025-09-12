@@ -782,6 +782,7 @@ class ScatterSqueezeNet(nn.Module):
         #return torch.softmax(self.FC_classifier(x), dim=1)  # Return probabilities for multi-class classification
         return self.FC_classifier(x)  # Return logits directly for multi-class classification
 
+
 class DISSN(ScatterSqueezeNet):
     """
     Dual-Input ScatterSqueezeNet:

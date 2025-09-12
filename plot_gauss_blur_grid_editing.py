@@ -1,45 +1,53 @@
 #!/usr/bin/env python3
 
-from utils.data_loader2 import load_galaxies
-from utils.data_loader2 import apply_formatting
+from utils.data_loader import load_galaxies
+from utils.data_loader import apply_formatting
 from utils.calc_tools import check_tensor
 import numpy as np
-from scipy import signal
-from scipy.ndimage import gaussian_filter
 import torch
-from astropy.wcs import WCS
 from pathlib import Path
+from scipy.ndimage import gaussian_filter
+from scipy.ndimage import shift as _imgshift
 import matplotlib.pyplot as plt
 from matplotlib import colors as mcolors
 from matplotlib.colors import TwoSlopeNorm
 from matplotlib.cm import ScalarMappable
 from matplotlib.patches import Ellipse
+from astropy.wcs import WCS
 from astropy.cosmology import Planck18 as COSMO
 import astropy.units as u
 from astropy.io import fits
+from astropy.time import Time
 from astropy.convolution import convolve_fft, Gaussian2DKernel
 from mpl_toolkits.axes_grid1 import make_axes_locatable
-from functools import lru_cache
 import os, glob
+try:
+    # best case
+    from skimage.registration import phase_cross_correlation as _pcc
+    HAVE_PCC = True
+except Exception:
+    HAVE_PCC = False
 try:
     from reproject import reproject_interp
     HAVE_REPROJECT = True
 except Exception:
     HAVE_REPROJECT = False
 print(f"HAVE_REPROJECT={HAVE_REPROJECT}")
+
+
     
 print("Loading scatter_galaxies/plot_gauss_blur_grid_editing.py...")
 
+REQUIRE_REDSHIFT_ONLY = False # ignore sources without z
+ROOT = "/users/mbredber/scratch/data/PSZ2"
 APPLY_UV_TAPER = os.getenv("RT_USE_UV_TAPER","0") == "1"  # default: off
 UV_TAPER_FRAC  = float(os.getenv("RT_UV_TAPER_FRAC","0.0"))  # e.g. 0.2 for mild
-# Single global broadening factor (calibrate once offline, then freeze)
+AUTO_FUDGE = os.getenv("RT_AUTO_FUDGE", "1") == "1"   # default on
 FUDGE_GLOBAL   = float(os.getenv("RT_FUDGE_SCALE","1.00"))
-REQUIRE_REDSHIFT_ONLY = os.getenv("RT_REQUIRE_Z", "1") == "1"
 ARCSEC = np.deg2rad(1/3600)
 crop_size = (1, 512, 512)  # (T, C, H, W) for 3 channels, 512x512 images
+CLUSTER_METADATA_CSV = "/users/mbredber/scratch/data/PSZ2/cluster_metadata.csv" # Metadata CSV with redshifts
 
-# --- redshift metadata from CSV ---
-CLUSTER_METADATA_CSV = "/users/mbredber/scratch/data/PSZ2/cluster_metadata.csv"
 
 def _load_cluster_meta(csv_path):
     import csv, math, os
@@ -62,43 +70,10 @@ def _load_cluster_meta(csv_path):
     return d
 
 CLUSTER_META = _load_cluster_meta(CLUSTER_METADATA_CSV)
+
 def _z_from_meta(name):
     """Lookup z by PSZ2 slug (we already pass base names like PSZ2G192.18+56.12)."""
     return CLUSTER_META.get(name)
-
-@lru_cache(maxsize=None)
-def _z_from_meta_any(name: str):
-    """
-    CSV lookup that tolerates short slugs like 'PSZ2G192.18+56' by also trying
-    the resolved data directory name (e.g. 'PSZ2G192.18+56.12').
-    """
-    # exact
-    z = CLUSTER_META.get(name)
-    if z is not None: 
-        return float(z)
-
-    # also try the resolved on-disk folder name, if it exists
-    bd = _find_base_dir(name)
-    if bd:
-        base = os.path.basename(bd)
-        z = CLUSTER_META.get(base)
-        if z is not None:
-            return float(z)
-
-    # tolerate spacing/underscore variants that show up in some CSVs
-    for alt in (name.replace("PSZ2G", "PSZ2 G"),
-                name.replace("PSZ2G", "PSZ2_G")):
-        z = CLUSTER_META.get(alt)
-        if z is not None:
-            return float(z)
-
-    # last resort: unambiguous prefix match (only if it’s unique)
-    hits = [k for k in CLUSTER_META.keys() if k.startswith(name)]
-    if len(hits) == 1:
-        return float(CLUSTER_META[hits[0]])
-
-    return None
-
 
 def radial_tukey(ny, nx, alpha=0.35):
     y = np.linspace(-1, 1, ny); x = np.linspace(-1, 1, nx)
@@ -130,23 +105,25 @@ def reproject_like(arr, src_hdr, dst_hdr):
     if arr is None or src_hdr is None or dst_hdr is None:
         return None
 
-    # 2-D celestial WCS only
+    # FAST PATH: identical grid → return as-is
+    if _same_pixel_grid(src_hdr, dst_hdr):
+        return np.asarray(arr, float)
+
+    # Otherwise do the real thing (but with a cached WCS)
     try:
-        w_src = WCS(src_hdr).celestial
-        w_dst = WCS(dst_hdr).celestial
+        w_src = _wcs_celestial_cached(src_hdr)
+        w_dst = _wcs_celestial_cached(dst_hdr)
     except Exception:
         w_src = w_dst = None
 
     if HAVE_REPROJECT and (w_src is not None) and (w_dst is not None):
-        ny_out = int(dst_hdr['NAXIS2'])
-        nx_out = int(dst_hdr['NAXIS1'])
+        ny_out = int(dst_hdr['NAXIS2']); nx_out = int(dst_hdr['NAXIS1'])
         reproj, _ = reproject_interp((arr, w_src), w_dst,
                                      shape_out=(ny_out, nx_out),
                                      order='bilinear')
         return reproj.astype(float)
 
     # Fallback: simple center alignment with subpixel shift
-    from scipy.ndimage import shift as _shift
     if (w_src is None) or (w_dst is None):
         return arr.astype(float)
 
@@ -155,7 +132,7 @@ def reproject_like(arr, src_hdr, dst_hdr):
     (x_dst, y_dst) = w_dst.wcs_world2pix([[ra, dec]], 0)[0]
     dx = (float(dst_hdr['NAXIS1'])/2.0) - x_dst
     dy = (float(dst_hdr['NAXIS2'])/2.0) - y_dst
-    return _shift(arr, shift=(dy, dx), order=1, mode="nearest").astype(float)
+    return _imgshift(arr, shift=(dy, dx), order=1, mode="nearest").astype(float)
 
 
 def kpc_to_arcsec(z, L_kpc):
@@ -265,11 +242,6 @@ def get_z(name, hdr_primary):
     """Return a usable redshift for this source (CSV → header → siblings)."""
     import re, glob, os
     from astropy.io import fits
-    
-    z_meta = _z_from_meta_any(name)
-    if z_meta is not None:
-        print(f"[z] {name}: using z={z_meta:.4f} from CSV")
-        return z_meta
 
     def _coerce_float(val):
         try:
@@ -344,6 +316,37 @@ def get_z(name, hdr_primary):
 
     raise KeyError(f"No redshift for {name_base}; not in CSV and no valid header keys.")
 
+# --- add near reproject_like() ---
+_WCS_CACHE = {}
+def _wcs_celestial_cached(hdr):
+    key = id(hdr)  # stable within this run
+    w = _WCS_CACHE.get(key)
+    if w is None:
+        w = WCS(hdr).celestial
+        _WCS_CACHE[key] = w
+    return w
+
+def _same_pixel_grid(h1, h2, atol=1e-12):
+    # compare essential geometry; beams may differ
+    for k in ('NAXIS1','NAXIS2','CTYPE1','CTYPE2'):
+        if (h1.get(k) != h2.get(k)):
+            return False
+    # CD/PC + CDELT
+    def _cd(h):
+        if 'CD1_1' in h:
+            return (float(h['CD1_1']), float(h.get('CD1_2',0.0)),
+                    float(h.get('CD2_1',0.0)), float(h['CD2_2']))
+        # PC*CDELT fallback
+        pc11=h.get('PC1_1',1.0); pc12=h.get('PC1_2',0.0)
+        pc21=h.get('PC2_1',0.0); pc22=h.get('PC2_2',1.0)
+        c1=h.get('CDELT1',-1.0); c2=h.get('CDELT2', 1.0)
+        m = np.array([[pc11,pc12],[pc21,pc22]],float) @ np.diag([c1,c2])
+        return (float(m[0,0]), float(m[0,1]), float(m[1,0]), float(m[1,1]))
+    return np.allclose(_cd(h1), _cd(h2), atol=atol) and \
+           np.allclose([h1.get('CRPIX1'),h1.get('CRPIX2')],
+                       [h2.get('CRPIX1'),h2.get('CRPIX2')], atol=1e-9) and \
+           np.allclose([h1.get('CRVAL1'),h1.get('CRVAL2')],
+                       [h2.get('CRVAL1'),h2.get('CRVAL2')], atol=1e-9)
 
 def _stretch_from_p(arr, p_lo, p_hi, clip=False):
     if arr is None:
@@ -408,17 +411,15 @@ def _fits_path_triplet(base_dir, real_base):
     t100_path = _first(f"{base_dir}/{real_base}T100kpc*.fits")
     return raw_path, t25_path, t50_path, t100_path
 
-@lru_cache(maxsize=None)
 def _has_redshift_by_name(name: str) -> bool:
-    # CSV wins first (normalized)
-    if _z_from_meta_any(name) is not None:
+    # CSV wins — this avoids the expensive FITS scan for most sources
+    if _z_from_meta(_name_base_from_fn(name)) is not None:
         return True
 
     base_dir = _find_base_dir(name)
     if base_dir is None:
         return False
     base = os.path.basename(base_dir)
-
     cand = []
     cand.extend(sorted(glob.glob(f"{base_dir}/*CHANDRA*.fits")))
     raw_guess = _find_raw_path(base_dir, base)
@@ -428,11 +429,10 @@ def _has_redshift_by_name(name: str) -> bool:
     cand.extend(sorted(glob.glob(f"{base_dir}/{base}T100kpc*.fits")))
     if not cand:
         cand = sorted(glob.glob(f"{base_dir}/*.fits"))
-
     for p in cand:
         try:
             hdr = fits.getheader(p)
-            z = get_z(base, hdr)   # <-- use the resolved basename here
+            z = get_z(name, hdr)   # will also try CSV again
             if 0.0 < float(z) < 5.0:
                 return True
         except Exception:
@@ -483,17 +483,6 @@ def synth_taper_header_from_ref(raw_hdr, ref_hdr, kpc_target, kpc_ref=50.0, mode
         if k in raw_hdr: thdr[k] = raw_hdr[k]
     return thdr
 
-def make_rt_from_ref(raw_arr, raw_hdr, ref_hdr, kpc_target, kpc_ref=50.0, do_uv_taper=True):
-    """RAW → target beam defined by scaling the REF beam (e.g., 40/50)."""
-    tgt_hdr = synth_taper_header_from_ref(raw_hdr, ref_hdr, kpc_target, kpc_ref, mode="keep_ratio")
-    rt = convolve_to_target_native(raw_arr, raw_hdr, tgt_hdr, fudge_scale=1.0)
-
-    if do_uv_taper:
-        # Use ref geom-mean FWHM scaled to target as a uv-taper proxy (no z needed)
-        theta_ref_as = _eq_fwhm_as(ref_hdr)
-        theta_tgt_as = (kpc_target/float(kpc_ref)) * theta_ref_as
-        rt = apply_uv_gaussian_taper(rt, raw_hdr, theta_tgt_as, pad_factor=2)
-    return rt, tgt_hdr
 
 def _name_base_from_fn(fn):
     # robust base name; strips any trailing "T25kpc" etc. if present
@@ -526,8 +515,6 @@ def _load_fits_arrays_scaled(name, crop_ch=1, out_hw=(128,128)):
 
     raw_hdr = fits.getheader(raw_path)
     raw_arr = np.squeeze(fits.getdata(raw_path)).astype(float)
-    # Require a usable redshift up-front (raises KeyError if missing)
-    z_required = get_z(name, raw_hdr)
     pix_native = _pixscale_arcsec(raw_hdr)
 
     real_base = os.path.splitext(os.path.basename(raw_path))[0]
@@ -535,25 +522,29 @@ def _load_fits_arrays_scaled(name, crop_ch=1, out_hw=(128,128)):
 
     # try to read TXkpc; if missing, synthesize from redshift
     def _hdr_or_synth(tpath, Xkpc, ref_hdr=None, kpc_ref=None):
+        """
+        Prefer on-disk header; otherwise build synthetic beam.
+        Try z→kpc; if z is missing but a reference taper header is available
+        (e.g. T50), fall back to scaling that header to the requested kpc.
+        """
         if tpath and os.path.exists(tpath):
             return fits.getheader(tpath)
         try:
-            z_local = get_z(name, raw_hdr)  # will raise if not found
+            z_local = get_z(name, raw_hdr)
             return synth_taper_header_from_kpc(raw_hdr, z_local, Xkpc, mode="keep_ratio")
         except Exception as e:
-            if REQUIRE_REDSHIFT_ONLY:
-                raise
             if ref_hdr is not None and kpc_ref is not None:
                 print(f"[z-miss] {name}: {e}. Falling back to REF {int(kpc_ref)}kpc header scaling.")
                 return synth_taper_header_from_ref(raw_hdr, ref_hdr, Xkpc, kpc_ref, mode="keep_ratio")
             print(f"[z-miss] {name}: {e}. Proceeding with RAW→target-beam only on RAW grid.")
-            # copy RAW beam so code does not crash (no broadening)
+            # Final fallback: copy RAW beam so code does not crash (no broadening).
             th = fits.Header()
             for k in ('BMAJ','BMIN','BPA','CTYPE1','CTYPE2','CRVAL1','CRVAL2','CRPIX1','CRPIX2',
-                    'CDELT1','CDELT2','CD1_1','CD1_2','CD2_1','CD2_2',
-                    'PC1_1','PC1_2','PC2_1','PC2_2','NAXIS1','NAXIS2'):
+                      'CDELT1','CDELT2','CD1_1','CD1_2','CD2_1','CD2_2',
+                      'PC1_1','PC1_2','PC2_1','PC2_2','NAXIS1','NAXIS2'):
                 if k in raw_hdr: th[k] = raw_hdr[k]
             return th
+
 
     # Build in an order that allows ref-scaling fallbacks (prefer T50 as ref)
     t50_hdr  = _hdr_or_synth(t50_path,  50)
@@ -582,22 +573,37 @@ def _load_fits_arrays_scaled(name, crop_ch=1, out_hw=(128,128)):
     else:
         raw_arr_prefiltered = raw_arr
     
-    # Compute angular sizes of the targets at this z
+    # Try redshift ➜ kpc→arcsec. If missing, skip uv-taper (still make rtX via image-domain PSF match).
+    theta25_as = theta50_as = theta100_as = None
     try:
-        z = get_z(name, raw_hdr)  # raises if not found
+        z = get_z(name, raw_hdr)
         theta25_as  = kpc_to_arcsec(z,  25.0)
         theta50_as  = kpc_to_arcsec(z,  50.0)
         theta100_as = kpc_to_arcsec(z, 100.0)
     except Exception as e:
-        if REQUIRE_REDSHIFT_ONLY:
-            raise
         print(f"[z-miss] {name}: {e}. Proceeding without uv-taper; convolving RAW→target beam only.")
+        
+    # --- per-taper fudge to fix the long-baseline mismatch (esp. T25) ---
+    s25 = s50 = s100 = FUDGE_GLOBAL
+    if AUTO_FUDGE:
+        if t25_arr is not None:
+            s25 = auto_fudge_scale(raw_arr_prefiltered, raw_hdr, t25_hdr, t25_arr,
+                                s_grid=np.linspace(1.00, 1.35, 15), nbins=48)
+            print(f"[fudge] {name} T25: using s={s25:.3f}")
+        if t50_arr is not None:
+            s50 = auto_fudge_scale(raw_arr_prefiltered, raw_hdr, t50_hdr, t50_arr,
+                                s_grid=np.linspace(1.00, 1.20, 11), nbins=48)
+            print(f"[fudge] {name} T50: using s={s50:.3f}")
+        if t100_arr is not None:
+            s100 = auto_fudge_scale(raw_arr_prefiltered, raw_hdr, t100_hdr, t100_arr,
+                                    s_grid=np.linspace(1.00, 1.15, 8), nbins=48)
+            print(f"[fudge] {name} T100: using s={s100:.3f}")
 
 
     # 2a) convolve RAW → target restoring beam (always)
-    r2_25_native  = convolve_to_target_native(raw_arr_prefiltered, raw_hdr, t25_hdr,  fudge_scale=FUDGE_GLOBAL)
-    r2_50_native  = convolve_to_target_native(raw_arr_prefiltered, raw_hdr, t50_hdr,  fudge_scale=FUDGE_GLOBAL)
-    r2_100_native = convolve_to_target_native(raw_arr_prefiltered, raw_hdr, t100_hdr, fudge_scale=FUDGE_GLOBAL)
+    r2_25_native  = convolve_to_target(raw_arr_prefiltered, raw_hdr, t25_hdr,  fudge_scale=s25)
+    r2_50_native  = convolve_to_target(raw_arr_prefiltered, raw_hdr, t50_hdr,  fudge_scale=s50)
+    r2_100_native = convolve_to_target(raw_arr_prefiltered, raw_hdr, t100_hdr, fudge_scale=s100)
 
     # 2b) uv-taper (disable by default to avoid double-broadening)
     if APPLY_UV_TAPER and UV_TAPER_FRAC > 0:
@@ -614,11 +620,15 @@ def _load_fits_arrays_scaled(name, crop_ch=1, out_hw=(128,128)):
     def _fmt(arr, ver_hdr):
         if ver_hdr is None or arr is None:
             return None
-        scale = abs(raw_hdr['CDELT1'] / ver_hdr['CDELT1'])  # keeps same sky size as RAW crop
+        # use robust pixel size along x
+        s_raw = abs(_cdelt_deg(raw_hdr, 1))
+        s_ver = abs(_cdelt_deg(ver_hdr, 1))
+        scale = s_raw / s_ver
         Hc = int(round(Hc_raw * scale)); Wc = int(round(Wc_raw * scale))
         ten = torch.from_numpy(arr).unsqueeze(0).float()
         ten = apply_formatting(ten, (ch, Hc, Wc), (ch, outH, outW)).squeeze(0).numpy()
         return ten
+
 
     t25_cut   = _fmt(t25_on_t,  t25_hdr)
     t50_cut   = _fmt(t50_on_t,  t50_hdr)
@@ -644,21 +654,7 @@ def _load_fits_arrays_scaled(name, crop_ch=1, out_hw=(128,128)):
             rt25_cut, rt50_cut, rt100_cut,
             raw_hdr, t25_hdr, t50_hdr, t100_hdr, pix_eff_arcsec, hdr_fft)
 
-    
-def fwhm_to_sigma_rad(fwhm_arcsec):
-    return (fwhm_arcsec*ARCSEC) / (2*np.sqrt(2*np.log(2)))
-
-def beam_cov_matrix(bmaj_as, bmin_as, pa_deg):
-    # sigmas in radians
-    sx = fwhm_to_sigma_rad(bmaj_as)
-    sy = fwhm_to_sigma_rad(bmin_as)
-    th = np.deg2rad(pa_deg)
-    R = np.array([[np.cos(th), -np.sin(th)],
-                  [np.sin(th),  np.cos(th)]], dtype=float)
-    S = np.diag([sx**2, sy**2])
-    return R @ S @ R.T
-
-def kernel_from_beams(raw_hdr, targ_hdr, pixscale_arcsec=None, fudge_scale=1.0):
+def kernel_from_beams(raw_hdr, targ_hdr, fudge_scale=1.0):
     """
     Build a Gaussian2DKernel that turns the RAW restoring beam into the TARGET
     restoring beam on the RAW pixel grid.
@@ -671,15 +667,12 @@ def kernel_from_beams(raw_hdr, targ_hdr, pixscale_arcsec=None, fudge_scale=1.0):
 
     Notes
     -----
-    - 'pixscale_arcsec' is unused (kept for backward compatibility).
     - Small negative eigenvalues (numerical noise) are clipped to zero.
     """
-    def _fwhm_to_sigma_rad(fwhm_arcsec):
-        return (fwhm_arcsec * ARCSEC) / (2.0 * np.sqrt(2.0 * np.log(2.0)))
 
     def _beam_cov_radians(bmaj_as, bmin_as, pa_deg):
-        sx = _fwhm_to_sigma_rad(bmaj_as)
-        sy = _fwhm_to_sigma_rad(bmin_as)
+        sx = _sigma_from_fwhm_arcsec(bmaj_as)
+        sy = _sigma_from_fwhm_arcsec(bmin_as)
         th = np.deg2rad(pa_deg)
         R  = np.array([[np.cos(th), -np.sin(th)],
                        [np.sin(th),  np.cos(th)]], dtype=float)
@@ -739,32 +732,73 @@ def kernel_from_beams(raw_hdr, targ_hdr, pixscale_arcsec=None, fudge_scale=1.0):
     #ker = Gaussian2DKernel(x_stddev=s_major, y_stddev=s_minor, theta=theta)
     return ker
 
-def make_rt_from_raw(raw_arr, raw_hdr, z, L_kpc, mode="keep_ratio"):
-    tgt_hdr = synth_taper_header_from_kpc(raw_hdr, z, L_kpc, mode=mode)
-    rt = convolve_to_target_native(raw_arr, raw_hdr, tgt_hdr, fudge_scale=1.0)
-    return rt, tgt_hdr
+_KER_CACHE = {}
+def kernel_from_beams_cached(raw_hdr, targ_hdr, fudge_scale=1.0):
+    key = (
+        round(float(raw_hdr['BMAJ']),9), round(float(raw_hdr['BMIN']),9), round(float(raw_hdr.get('BPA',0.0)),6),
+        round(float(targ_hdr['BMAJ']),9), round(float(targ_hdr['BMIN']),9), round(float(targ_hdr.get('BPA', raw_hdr.get('BPA',0.0))),6),
+        tuple(round(float(x),12) for x in (
+            raw_hdr.get('CD1_1', raw_hdr.get('CDELT1', 0.0)),
+            raw_hdr.get('CD1_2', 0.0),
+            raw_hdr.get('CD2_1', 0.0),
+            raw_hdr.get('CD2_2', raw_hdr.get('CDELT2', 0.0)),
+        )),
+        round(float(fudge_scale),6),
+    )
+    ker = _KER_CACHE.get(key)
+    if ker is None:
+        ker = kernel_from_beams(raw_hdr, targ_hdr, fudge_scale=fudge_scale)
+        _KER_CACHE[key] = ker
+    return ker
 
 def make_fft_header(raw_hdr, pix_eff_arcsec, out_hw):
-    """Header describing the downsampled cutout grid for correct uv axes."""
     h = fits.Header()
-    # carry the celestial frame/orientation
-    for k in ('CTYPE1','CTYPE2','CRVAL1','CRVAL2','PC1_1','PC1_2','PC2_1','PC2_2'):
-        if k in raw_hdr: h[k] = raw_hdr[k]
-    # choose CDELT form unless your RAW uses CD
-    if 'CD1_1' in raw_hdr or 'CD2_2' in raw_hdr:
-        # scale the CD matrix to the effective pixel size
-        s1 = np.sign(raw_hdr.get('CD1_1', raw_hdr.get('CDELT1', -1.0)))
-        s2 = np.sign(raw_hdr.get('CD2_2', raw_hdr.get('CDELT2',  1.0)))
-        h['CD1_1'] = s1 * (pix_eff_arcsec/3600.0); h['CD1_2'] = 0.0
-        h['CD2_1'] = 0.0;                           h['CD2_2'] = s2 * (pix_eff_arcsec/3600.0)
+
+    # --- orientation matrix from RAW ---
+    if 'CD1_1' in raw_hdr:
+        M = np.array([[raw_hdr['CD1_1'], raw_hdr.get('CD1_2', 0.0)],
+                      [raw_hdr.get('CD2_1', 0.0), raw_hdr['CD2_2']]], float)
     else:
-        s1 = np.sign(raw_hdr.get('CDELT1', -1.0))
-        s2 = np.sign(raw_hdr.get('CDELT2',  1.0))
-        h['CDELT1'] = s1 * (pix_eff_arcsec/3600.0)
-        h['CDELT2'] = s2 * (pix_eff_arcsec/3600.0)
+        pc11 = raw_hdr.get('PC1_1', 1.0); pc12 = raw_hdr.get('PC1_2', 0.0)
+        pc21 = raw_hdr.get('PC2_1', 0.0); pc22 = raw_hdr.get('PC2_2', 1.0)
+        cd1  = raw_hdr.get('CDELT1', -1.0); cd2 = raw_hdr.get('CDELT2', 1.0)
+        M = np.array([[pc11, pc12],[pc21, pc22]], float) @ np.diag([cd1, cd2])  # deg/pix
+
+    # unit-column orientation (preserve rotation/handedness), new isotropic step
+    sx = abs(_cdelt_deg(raw_hdr, 1))
+    sy = abs(_cdelt_deg(raw_hdr, 2))
+    if sx <= 0 or sy <= 0 or not np.isfinite(sx*sy):
+        s1 = np.sign(raw_hdr.get('CDELT1', raw_hdr.get('CD1_1', -1.0)) or -1.0)
+        s2 = np.sign(raw_hdr.get('CDELT2', raw_hdr.get('CD2_2',  1.0)) or  1.0)
+        step = pix_eff_arcsec/3600.0
+        CD_new = np.array([[s1*step, 0.0],[0.0, s2*step]], float)
+    else:
+        R = M @ np.diag([1.0/sx, 1.0/sy])
+        CD_new = R * (pix_eff_arcsec/3600.0)
+
     outH, outW = out_hw
+    h['CD1_1'] = float(CD_new[0,0]); h['CD1_2'] = float(CD_new[0,1])
+    h['CD2_1'] = float(CD_new[1,0]); h['CD2_2'] = float(CD_new[1,1])
     h['NAXIS1'] = int(outW); h['NAXIS2'] = int(outH)
+
+    # put the reference pixel at the center of the new cutout
+    h['CRPIX1'] = 0.5*(outW+1); h['CRPIX2'] = 0.5*(outH+1)
+
+    # anchor CRVAL to the sky position that was at the RAW center
+    try:
+        w_raw = WCS(raw_hdr).celestial
+        ra_c, dec_c = w_raw.wcs_pix2world([[raw_hdr['NAXIS1']/2.0, raw_hdr['NAXIS2']/2.0]], 0)[0]
+        h['CRVAL1'] = float(ra_c); h['CRVAL2'] = float(dec_c)
+    except Exception:
+        for k in ('CRVAL1','CRVAL2'):
+            if k in raw_hdr: h[k] = raw_hdr[k]
+
+    # carry frame type strings (safe to copy verbatim)
+    for k in ('CTYPE1','CTYPE2'):
+        if k in raw_hdr: h[k] = raw_hdr[k]
+
     return h
+
 
 def _maybe_draw_beam(ax, j, r):
     try:
@@ -792,28 +826,12 @@ def _beam_solid_angle_sr(hdr):
     bmin_rad = abs(bmin_deg) * np.pi / 180.0
     return (np.pi / (4.0 * np.log(2.0))) * bmaj_rad * bmin_rad
 
-def convolve_to_target(raw_img, raw_hdr, target_hdr, pixscale_arcsec=None, fudge_scale=1.0):
-    """
-    Convolve a RAW Jy/beam_native image to the TARGET beam and convert units
-    to Jy/beam_target by multiplying with Ω_target / Ω_raw.
-    """
-    ker = kernel_from_beams(raw_hdr, target_hdr, fudge_scale=fudge_scale)
-    out = convolve_fft(raw_img, ker,
-                       boundary='fill', fill_value=np.nan,
-                       nan_treatment='interpolate',
-                       normalize_kernel=True)
-    try:
-        out *= (_beam_solid_angle_sr(target_hdr) / _beam_solid_angle_sr(raw_hdr))
-    except Exception:
-        pass
-    return out
-
-def convolve_to_target_native(raw_arr, raw_hdr, target_hdr, fudge_scale=1.0):
+def convolve_to_target(raw_arr, raw_hdr, target_hdr, fudge_scale=1.0):
     """
     Same as convolve_to_target(); provided for convenience when the image is
     already on the RAW grid. Units in = Jy/beam_native; units out = Jy/beam_target.
     """
-    ker = kernel_from_beams(raw_hdr, target_hdr, fudge_scale=fudge_scale)
+    ker = kernel_from_beams_cached(raw_hdr, target_hdr, fudge_scale=fudge_scale)
     out = convolve_fft(raw_arr, ker, boundary='fill', fill_value=np.nan,
                    nan_treatment='interpolate', normalize_kernel=True,
                    psf_pad=True, fft_pad=True, allow_huge=True)    
@@ -837,27 +855,6 @@ def _pixscale_arcsec(hdr):
         return abs(pix_deg) * 3600.0
     raise KeyError("No CDELT* or CD* keywords in FITS header")
 
-ROOT = "/users/mbredber/scratch/data/PSZ2"
-def load_headers(base, ds_factor=1.0):
-    base_dir = _first(f"{ROOT}/fits/{base}*") or f"{ROOT}/fits/{base}"
-    raw_path = _first(f"{base_dir}/{os.path.basename(base_dir)}*.fits")
-    if raw_path is None:
-        raise FileNotFoundError(f"RAW FITS not found under {base_dir}")
-
-    real_base = os.path.splitext(os.path.basename(raw_path))[0]
-    t50_path  = _first(f"{base_dir}/{real_base}T50kpc*.fits")
-    t100_path = _first(f"{base_dir}/{real_base}T100kpc*.fits")
-
-    raw_hdr  = fits.getheader(raw_path)
-    t50_hdr  = fits.getheader(t50_path)  if t50_path  else None
-    t100_hdr = fits.getheader(t100_path) if t100_path else None
-
-    # native pixel scale (arcsec/pixel)
-    pix_native = _pixscale_arcsec(raw_hdr)
-    # effective pixel scale of the **downsampled** arrays you display
-    pix_eff = pix_native * ds_factor
-
-    return raw_hdr, t50_hdr, t100_hdr, pix_eff
 
 def auto_fudge_scale(raw_img, raw_hdr, targ_hdr, T_img,
                      s_grid=np.linspace(1.00, 1.20, 11), nbins=36):
@@ -866,7 +863,7 @@ def auto_fudge_scale(raw_img, raw_hdr, targ_hdr, T_img,
     U,V,FT,AT = image_to_vis(T_img, targ_hdr, beam_hdr=targ_hdr)
 
     for s in s_grid:
-        RT_native = convolve_to_target_native(raw_img, raw_hdr, targ_hdr, fudge_scale=s)
+        RT_native = convolve_to_target(raw_img, raw_hdr, targ_hdr, fudge_scale=s)
         RT_on_t   = reproject_like(RT_native, raw_hdr, targ_hdr)
         _,_,FR,AR = image_to_vis(RT_on_t, targ_hdr, beam_hdr=targ_hdr)
 
@@ -1012,7 +1009,6 @@ def vis_compare_quicklook(name, T, RT, hdr_img, hdr_beam, tag, outdir='.', nbins
     _,_,FR,AR = image_to_vis(RT, hdr_img, beam_hdr=hdr_beam)
 
     # Differences
-    dA   = np.abs(FT) - np.abs(FR)
     dphi = np.angle(FT * np.conj(FR))
 
     # Radial profiles
@@ -1094,6 +1090,10 @@ def vis_compare_quicklook(name, T, RT, hdr_img, hdr_beam, tag, outdir='.', nbins
 
     # Suppress meaningless ratio spikes at very low coherence
     good = (coh > 0.6)
+    # Add a tiny floor on both medians
+    thrT = np.nanpercentile(aT, 5.0)
+    thrR = np.nanpercentile(aR, 5.0)
+    good &= (aT > thrT) & (aR > thrR)
     ratio_plot = np.where(good, ratio, np.nan)
 
     axA2 = axA.twinx()
@@ -1169,28 +1169,22 @@ def plot_galaxy_grid(images, filenames, labels,
     de_all  = [i for i, y in enumerate(labels) if int(y) == 50]
     nde_all = [i for i, y in enumerate(labels) if int(y) == 51]
 
-    def _take_with_z(idxs, need=3):
-        have, removed = [], []
-        for i in idxs:
-            if _has_redshift_for_index(i, filenames):
-                have.append(i)
-                if len(have) == need:
-                    break
-            else:
-                removed.append(_name_base_from_fn(filenames[i]))
-        return have, removed
-
+    # keep only those that have a usable redshift (fast check)
     if REQUIRE_REDSHIFT_ONLY:
-        de_idx,  de_rm  = _take_with_z(de_all,  need=3)
-        nde_idx, nde_rm = _take_with_z(nde_all, need=3)
-        skipped = de_rm + nde_rm
-        if skipped:
-            preview = ", ".join(skipped[:12]) + (" ..." if len(skipped) > 12 else "")
-            print(f"[skip-z] removed {len(skipped)} sources with no redshift: {preview}")
+        de_idx, nde_idx = [], []
+        for i in de_all:
+            if _has_redshift_for_index(i, filenames):
+                de_idx.append(i)
+            if len(de_idx) == 3:
+                break
+        for i in nde_all:
+            if _has_redshift_for_index(i, filenames):
+                nde_idx.append(i)
+            if len(nde_idx) == 3:
+                break
     else:
         de_idx  = de_all[:3]
         nde_idx = nde_all[:3]
-
         
     if len(de_idx) == 0 and len(nde_idx) == 0:
         sample = [ _name_base_from_fn(f) for f in filenames[:6] ]
@@ -1266,22 +1260,10 @@ def plot_galaxy_grid(images, filenames, labels,
     rows = []
     for i_src, grid_row in enumerate(row_map):
         name = _name_base_from_fn(filenames[i_src])
-        try:
-            (raw_cut, t25_cut, t50_cut, t100_cut,
-            rt25_cut, rt50_cut, rt100_cut,
-            raw_hdr, t25_hdr, t50_hdr, t100_hdr,
-            pix_eff, hdr_fft) = _load_fits_arrays_scaled(name, crop_ch=1, out_hw=(outH, outW))
-        except Exception as e:
-            print(f"[skip-z] {name}: {e}")
-            continue
-
-        # Debug prints: T next to RT
-        if t25_cut  is not None: check_tensor(f"t25_cut {name}",  torch.tensor(t25_cut))
-        if rt25_cut is not None: check_tensor(f"rt25kpc {name}",  torch.tensor(rt25_cut))
-        if t50_cut  is not None: check_tensor(f"t50_cut {name}",  torch.tensor(t50_cut))
-        if rt50_cut is not None: check_tensor(f"rt50kpc {name}",  torch.tensor(rt50_cut))
-        if t100_cut is not None: check_tensor(f"t100_cut {name}", torch.tensor(t100_cut))
-        if rt100_cut is not None:  check_tensor(f"rt100kpc {name}", torch.tensor(rt100_cut))    
+        (raw_cut, t25_cut, t50_cut, t100_cut,
+        rt25_cut, rt50_cut, rt100_cut,
+        raw_hdr, t25_hdr, t50_hdr, t100_hdr,
+        pix_eff, hdr_fft) = _load_fits_arrays_scaled(name, crop_ch=1, out_hw=(outH, outW))
         
         rows.append(dict(
             name=name, grid_row=grid_row,
@@ -1300,30 +1282,28 @@ def plot_galaxy_grid(images, filenames, labels,
             if (t100_cut is not None) and (rt100_cut is not None):
                 vis_compare_quicklook(name, t100_cut, rt100_cut, hdr_fft, t100_hdr, tag='T100')
 
-
-
-        # --- Registration sanity check on the display grid (T vs RT) ---
+        # --- Registration sanity + optional correction on the display grid ---
         for tgt, T, RT in [(25, t25_cut, rt25_cut),
                         (50, t50_cut, rt50_cut),
                         (100, t100_cut, rt100_cut)]:
             if T is not None and RT is not None:
                 dy, dx = xcorr_shift(T, RT)
                 print(f"{name}  T{tgt} vs RT{tgt}: estimated shift dy={dy:.2f}, dx={dx:.2f} px")
-
-        for r in rows:
-            name = r['name']
-            for tgt in (25, 50, 100):
-                T  = r.get(f"t{tgt}")
-                RT = r.get(f"rt{tgt}")   # <- rt, not r
-                if T is None or RT is None:
-                    continue
-                sT, sR = _summ(T), _summ(RT)
-                rms = _nanrms(T, RT)
-                print(f"Row {name}  T{tgt}kpc vs RT{tgt}kpc  |  "
-                    f"T[min={sT['min']:.3g}, max={sT['max']:.3g}, mean={sT['mean']:.3g}, std={sT['std']:.3g}]  ||  "
-                    f"RT[min={sR['min']:.3g}, max={sR['max']:.3g}, mean={sR['mean']:.3g}, std={sR['std']:.3g}]  |  "
-                    f"RMSΔ={rms:.3g}"
-                )
+                
+    # Print the summary stats for each row once                
+    for r in rows:
+        name = r['name']
+        for tgt in (25, 50, 100):
+            T  = r.get(f"t{tgt}")
+            RT = r.get(f"rt{tgt}")
+            if T is None or RT is None:
+                continue
+            sT, sR = _summ(T), _summ(RT)
+            rms = _nanrms(T, RT)
+            print(f"Row {name}  T{tgt}kpc vs RT{tgt}kpc  |  "
+                f"T[min={sT['min']:.3g}, max={sT['max']:.3g}, mean={sT['mean']:.3g}, std={sT['std']:.3g}]  ||  "
+                f"RT[min={sR['min']:.3g}, max={sR['max']:.3g}, mean={sR['mean']:.3g}, std={sR['std']:.3g}]  |  "
+                f"RMSΔ={rms:.3g}")
 
     def describe(h):
         return f"{h['BMAJ']*3600:.2f}\"×{h['BMIN']*3600:.2f}\" @ PA={h.get('BPA',0):.1f}°"
@@ -1382,15 +1362,20 @@ def plot_galaxy_grid(images, filenames, labels,
         resid_norm = TwoSlopeNorm(vmin=-R, vcenter=0.0, vmax=+R)
 
         # draw
+        img_norm = mcolors.Normalize(vmin=vmin, vmax=vmax)  # <-- add this
         for r in rows:
             gr = r['grid_row']
             for j, arr in enumerate(r['planes']):
                 ax = axes[gr, j]
                 if arr is not None:
                     if j in RES_COLS:
-                        ax.imshow(arr, cmap=RES_CMAP, norm=resid_norm, origin="lower", interpolation="nearest")
+                        # was: norm=res_norm_global  (doesn't exist here)
+                        ax.imshow(arr, cmap=RES_CMAP, norm=resid_norm,
+                                origin="lower", interpolation="nearest")
                     else:
-                        ax.imshow(arr, cmap="viridis", vmin=vmin, vmax=vmax, origin="lower", interpolation="nearest")
+                        # was: norm=img_norm  (but img_norm wasn't defined)
+                        ax.imshow(arr, cmap="viridis", norm=img_norm,
+                                origin="lower", interpolation="nearest")
                         _maybe_draw_beam(ax, j, r)
                 ax.set_axis_off()
 
@@ -1522,7 +1507,7 @@ def plot_galaxy_grid(images, filenames, labels,
                 label="stretched intensity (0–1)")
     valid_R = [float(r) for r in R_all if np.isfinite(r) and r > 0]
     R_global = max(valid_R) if valid_R else 1.0
-    res_norm_global = TwoSlopeNorm(vmin=-R_global, vcenter=0.0, vmax=R_global)
+    res_norm_global = TwoSlopeNorm(vmin=-R_global, vcenter=0.0, vmax=+R_global)
     fig.colorbar(ScalarMappable(norm=res_norm_global, cmap=RES_CMAP),
                 cax=cax_resid, label="Δ (stretched units)")
 

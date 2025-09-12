@@ -18,12 +18,9 @@ from collections import Counter, defaultdict
 import pandas as pd
 from PIL import Image
 from astropy.io import fits
-from astropy.cosmology import Planck18 as cosmo
 import random
-import math
-import hashlib
-import glob
-import os
+import math, hashlib
+import glob, os
 
 # For reproducibility
 SEED = 42 
@@ -154,7 +151,7 @@ def get_synthetic(
         n_here = min(ddpm_data.shape[0], num_generate)  # Use as many samples as num_generate, or all if fewer exist
         ddpm_data = ddpm_data[:n_here]
         if CLIPDDPM: # Clip to [0,1] range
-            ddpm_data = ddpm_data.clamp(0, 1)
+            ddpm_data = np.clip(ddpm_data, 0, 1)
 
         # Append to the lists (do not overwrite!)
         generated_images_list.append(ddpm_data)
@@ -1060,26 +1057,18 @@ def apply_formatting(image: torch.Tensor,
     # Unpack sizes
     _, Hc, Wc = crop_size
     _, Ho, Wo = downsample_size
-    
+
     # Center crop and resize
-    # Debug: show input and requested sizes (first 20 calls to avoid flooding)
-    if not hasattr(apply_formatting, "_printed"):
-        apply_formatting._printed = 0
-    if apply_formatting._printed < 20:
-        print(f"[apply_formatting] input={H0}x{W0}, requested_crop={Hc}x{Wc}, output={Ho}x{Wo}")
-        apply_formatting._printed += 1
-
     y0, x0 = H0 // 2, W0 // 2
-    y1, x1 = y0 - Hc // 2, x0 - Wc // 2
-    y2, x2 = y1 + Hc, x1 + Wc
-
-    # clamp in case input smaller than crop (no padding here—just report sizes)
+    y1, y2 = y0 - Hc // 2, y0 + Hc // 2
+    x1, x2 = x0 - Wc // 2, x0 + Wc // 2
     y1, y2 = max(0, y1), min(H0, y2)
     x1, x2 = max(0, x1), min(W0, x2)
 
-    crop = img[:, y1:y2, x1:x2].unsqueeze(0)   # [1,C,*,*]
+    crop = img[:, y1:y2, x1:x2].unsqueeze(0)   # [1,C,Hc,Wc]
     resized = F.interpolate(crop, size=(Ho, Wo), mode='bilinear', align_corners=False)
     return resized.squeeze(0)                   # [C,Ho,Wo]
+
 
 def apply_formatting_old(image: torch.Tensor,
                      crop_size: tuple = (1, 1, 128, 128),
@@ -1332,10 +1321,6 @@ def reduce_by_class(images, labels, sample_size, num_classes):
         reduced_labels.extend([lbl] * len(selected_imgs))
     
     return reduced_images, reduced_labels
-
-import math
-import hashlib
-from collections import defaultdict
 
 def redistribute_excess(train_images, train_labels,
                         eval_images,  eval_labels,
@@ -2045,85 +2030,141 @@ def load_PSZ2(path=root_path + "PSZ2/classified/",
               USE_GLOBAL_NORMALISATION=False,
               GLOBAL_NORM_MODE='flux',
               percentile_lo=1, percentile_hi=99,
-              target_fov_kpc=1000.0,   # <<< NEW: enforce same physical size (1 Mpc default)
               train=False):
     """
-    PSZ2 loader with strict version alignment for tesseracts and optional physical FOV cropping.
+    PSZ2 loader with strict version alignment for tesseracts.
 
-    If target_fov_kpc is not None/False:
-      - we compute a centered crop that spans target_fov_kpc (in kpc) using the FITS header
-        pixel scale and the cluster redshift (from PSZ2/cluster_source_data.csv).
-      - this happens both for multi-version 'CUBE' mode and single-version mode,
-        so every image spans the same physical size on the sky before resizing to downsample_size.
+    • If T>1 (i.e., crop_size/downsample_size provided as 4-tuples), we:
+      - choose the versions from `versions` (e.g., 'T50kpc', 'T100kpc', 'RAW').
+      - build the set intersection of base names across the chosen versions
+      - if 'RAW' is present, we additionally remove any RAW-only bases not present in T50kpc or T100kpc
+      - stack frames per base into a cube [T, C, H, W]
+
+    • If T==1 we keep the legacy single-version path (FITS -> tensor via apply_formatting).
+
+    NOTE: We now **override** the CUBE selection using `versions`:
+      - If `versions` is a list with length > 1 → CUBE=True (tesseract, PNGs).
+      - Else → CUBE=False (single version, FITS).
     """
 
-    # --- helper: pixel scale (deg/pixel) ---
-    def _pixdeg(hdr):
-        if 'CDELT1' in hdr:
-            return abs(hdr['CDELT1'])
-        cd11 = hdr.get('CD1_1'); cd12 = hdr.get('CD1_2', 0.0)
-        if cd11 is not None:
-            return float(np.hypot(cd11, cd12))
-        raise KeyError("No CDELT* or CD* keywords in FITS header")
+    # --- unpack crop/downsample (kept as-is for compatibility) ---
+    if len(crop_size) == 4:
+        num_versions, ch_c, h_c, w_c = crop_size
+        crop_size = (ch_c, h_c, w_c)
+    elif len(crop_size) == 3:
+        num_versions = None
+        ch_c, h_c, w_c = crop_size
+    elif len(crop_size) == 2:
+        num_versions = None
+        ch_c, h_c, w_c = 1, crop_size[0], crop_size[1]
+    else:
+        raise ValueError("crop_size must be 2, 3 or 4 dims")
+    crop_size = (ch_c, h_c, w_c)
 
-    # Canonicalize requested versions; decide whether we build a time cube
+
+    if len(downsample_size) == 4:
+        num_versions, ch_d, h_d, w_d = downsample_size
+        downsample_size = (ch_d, h_d, w_d)
+    elif len(downsample_size) == 3:
+        ch_d, h_d, w_d = downsample_size
+    elif len(downsample_size) == 2:
+        ch_d, h_d, w_d = 1, downsample_size[0], downsample_size[1]
+    else:
+        raise ValueError("downsample_size must be 2, 3 or 4 dims")
+    downsample_size = (ch_d, h_d, w_d)
+
     def _canon_one(v):
         s  = str(v).strip()
         sl = s.lower()
+
+        # Canonical folders, ordered for readability
         canonical = {
-            'raw':'RAW','t25kpcsub':'T25kpcSUB','25kpcsub':'T25kpcSUB','t25kpc':'T25kpc','t25':'T25kpc','25kpc':'T25kpc',
-            't50kpcsub':'T50kpcSUB','50kpcsub':'T50kpcSUB','t50kpc':'T50kpc','t50':'T50kpc','50kpc':'T50kpc',
-            't100kpcsub':'T100kpcSUB','100kpcsub':'T100kpcSUB','t100kpc':'T100kpc','t100':'T100kpc','100kpc':'T100kpc',
+            # RAW
+            'raw':          'RAW',
+
+            # 25 kpc
+            't25kpcsub':    'T25kpcSUB',
+            '25kpcsub':     'T25kpcSUB',
+            't25S':         'T25kpcSUB',
+            '25kpcS':       'T25kpcSUB',
+            't25kpc':       'T25kpc',
+            't25':          'T25kpc',
+            '25kpc':        'T25kpc',
+
+            # 50 kpc
+            't50kpcsub':    'T50kpcSUB',
+            '50kpcsub':     'T50kpcSUB',
+            't50S':        'T50kpcSUB',
+            '50kpcS':      'T50kpcSUB',
+            't50kpc':       'T50kpc',
+            't50':          'T50kpc',
+            '50kpc':        'T50kpc',
+
+            # 100 kpc
+            't100kpcsub':   'T100kpcSUB',
+            '100kpcsub':    'T100kpcSUB',
+            't100S':        'T100kpcSUB',
+            '100kpcS':      'T100kpcSUB',
+            't100kpc':      'T100kpc',
+            't100':         'T100kpc',
+            '100kpc':       'T100kpc',
         }
-        return canonical.get(sl, s)
+        if sl in canonical:
+            return canonical[sl]
+
+        # Shorthand like 'rt25' or 'rt50kpc' → 'T25kpc' / 'T50kpc'
+        if sl.startswith('rt'):
+            num = sl[2:].rstrip('kpc')
+            if num.isdigit():
+                return f"T{num}kpc"
+
+        # Fall through untouched (e.g. custom folder names)
+        return s
+
 
     if isinstance(versions, (list, tuple)):
-        vf_list = [_canon_one(v) for v in versions]
+        _vf_list = [_canon_one(v) for v in versions]
     else:
-        vf_list = [_canon_one(versions)]
-    CUBE = len(vf_list) > 1
+        _vf_list = [_canon_one(versions)]
 
-    # --- load cluster metadata if we will crop to a physical FOV ---
-    TARGET_FOV_KPC = target_fov_kpc if target_fov_kpc else None
-    meta_df = None; ZCOL = None
-    if TARGET_FOV_KPC:
-        meta_csv = os.path.join(root_path, "PSZ2/cluster_source_data.csv")
-        if os.path.exists(meta_csv):
-            meta_df = pd.read_csv(meta_csv)
-            if 'slug' in meta_df.columns:
-                meta_df = meta_df.rename(columns={'slug': 'base'})
-            meta_df = meta_df.set_index('base')
-            ZCOL = 'z' if 'z' in meta_df.columns else ('redshift' if 'redshift' in meta_df.columns else None)
-            if ZCOL is None:
-                print("[load_PSZ2] WARNING: metadata missing redshift column; disabling physical cropping.")
-                TARGET_FOV_KPC = None
-        else:
-            print(f"[load_PSZ2] WARNING: {meta_csv} not found; disabling physical cropping.")
-            TARGET_FOV_KPC = None
+    #CUBE = len(_vf_list) > 1   # <-- override: CUBE determined by `versions`
+    CUBE = isinstance(versions, (list, tuple))
+    # For single-version FITS branch below, reuse local name `version`
+    version = _vf_list[0]
 
     images, labels, filenames = [], [], []
+
+    # --- tag -> folder name map ---
     classes_map = {c["tag"]: c["description"] for c in get_classes()}
 
     if CUBE:
+        vf_list = _vf_list
         ref_version = 'RAW' if 'RAW' in {v.upper() for v in vf_list} else vf_list[0]
 
         def _list_fits_bases(version, class_folder):
+            # use the function arg `path` so callers can override root
             folder = os.path.join(path, version, class_folder)
             if not os.path.isdir(folder):
                 raise FileNotFoundError(f"Version folder missing: {folder}")
             bases = {os.path.splitext(fn)[0] for fn in os.listdir(folder)
-                     if fn.lower().endswith(".fits")}
+                    if fn.lower().endswith(".fits")}
             if not bases:
                 raise FileNotFoundError(f"No FITS files found in {folder}")
             return folder, bases
+
+        # canonical output size and reference crop size
+        ch_out, Ho, Wo = downsample_size
+        ref_ch, Hc_ref, Wc_ref = crop_size
 
         for cls in target_classes:
             class_folder = classes_map.get(cls)
             if class_folder is None:
                 continue
-            label = cls
+            label = cls  # keep original class ids (50, 51, ...)
 
-            folder_map, base_sets = {}, {}
+            # Build intersection of FITS basenames across requested versions for this class
+            folder_map = {}
+            base_sets = {}
             for vf in vf_list:
                 folder, bases = _list_fits_bases(vf, class_folder)
                 folder_map[vf] = folder
@@ -2134,10 +2175,17 @@ def load_PSZ2(path=root_path + "PSZ2/classified/",
                 print(f"[load_PSZ2] No common basenames for class '{class_folder}' across {vf_list}. Skipping.")
                 continue
 
-            Ho, Wo = downsample_size[-2:]
-            Hc_ref, Wc_ref = crop_size[-2:]  # used if physical cropping is disabled
+            # Helper: pixel scale (deg/pix)
+            def _pixdeg(h):
+                if 'CDELT1' in h:
+                    return abs(h['CDELT1'])
+                cd11 = h.get('CD1_1'); cd12 = h.get('CD1_2', 0.0)
+                if cd11 is not None:
+                    return float(np.hypot(cd11, cd12))
+                raise KeyError("No CDELT* or CD* keywords in FITS header")
 
             for base in common_bases:
+                # reference header to define physical crop
                 ref_path = os.path.join(folder_map[ref_version], f"{base}.fits")
                 ref_hdr  = fits.getheader(ref_path)
                 ref_pixdeg = _pixdeg(ref_hdr)
@@ -2148,45 +2196,33 @@ def load_PSZ2(path=root_path + "PSZ2/classified/",
                     hdr   = fits.getheader(fpath)
                     arr   = np.squeeze(fits.getdata(fpath)).astype(np.float32)
                     if arr.ndim == 3:
-                        arr = arr.mean(axis=0)
+                        arr = arr.mean(axis=0)  # collapse cubes if any
+
+                    # scale crop to same physical FOV as reference
+                    s = ref_pixdeg / _pixdeg(hdr)   # >1 ⇒ coarser pixels ⇒ larger crop window
+                    Hc_v = max(1, int(round(Hc_ref * s)))
+                    Wc_v = max(1, int(round(Wc_ref * s)))
+
                     ten = torch.from_numpy(arr).unsqueeze(0)  # [1,H,W]
-
-                    if TARGET_FOV_KPC and meta_df is not None and base in meta_df.index:
-                        try:
-                            z = float(meta_df.loc[base, ZCOL])
-                            kpc_per_arcsec = cosmo.kpc_proper_per_arcmin(z).value / 60.0
-                            arcsec_per_pix = _pixdeg(hdr) * 3600.0
-                            side_pix = max(1, int(round(TARGET_FOV_KPC / (kpc_per_arcsec * arcsec_per_pix))))
-                            frm = apply_formatting(ten, (1, side_pix, side_pix), (1, Ho, Wo))
-                        except Exception as e:
-                            print(f"[load_PSZ2] Physical crop failed for {base} ({e}); falling back to ratio.")
-                            s = ref_pixdeg / _pixdeg(hdr)
-                            Hc_v = max(1, int(round(Hc_ref * s)))
-                            Wc_v = max(1, int(round(Wc_ref * s)))
-                            frm = apply_formatting(ten, (1, Hc_v, Wc_v), (1, Ho, Wo))
-                    else:
-                        # old behavior: keep versions aligned by pixel-scale ratio
-                        s = ref_pixdeg / _pixdeg(hdr)
-                        Hc_v = max(1, int(round(Hc_ref * s)))
-                        Wc_v = max(1, int(round(Wc_ref * s)))
-                        frm = apply_formatting(ten, (1, Hc_v, Wc_v), (1, Ho, Wo))
-
+                    frm = apply_formatting(ten, (1, Hc_v, Wc_v), (1, Ho, Wo))
                     frames.append(frm)
 
-                cube = torch.stack(frames, dim=0)  # [T,1,Ho,Wo]
+                cube = torch.stack(frames, dim=0)  # [T,1,Ho,Wo] in vf_list order
                 images.append(cube)
                 labels.append(label)
                 filenames.append(base)
 
-    else:
-        Ho, Wo = downsample_size[-2:]
 
+    else:
+        # ---------- legacy single-version path (FITS-based) ----------
+        #print(f"[load_PSZ2] Single-version path: version='{version}' (FITS)")
         for cls in target_classes:
             class_folder = classes_map.get(cls, None)
             if class_folder is None:
                 continue
             label = cls
-            folder_path = os.path.join(path, vf_list[0], class_folder)
+
+            folder_path = os.path.join(path, version, class_folder)
             if not os.path.isdir(folder_path):
                 continue
 
@@ -2194,11 +2230,11 @@ def load_PSZ2(path=root_path + "PSZ2/classified/",
                 if not fname.lower().endswith(".fits"):
                     continue
                 base, _ = os.path.splitext(fname)
-                if base.endswith(vf_list[0]):
+                # ignore any file that already embeds the version suffix in its name
+                if base.endswith(version):
                     continue
 
                 fits_path = os.path.join(folder_path, fname)
-                hdr = fits.getheader(fits_path)
                 arr = fits.getdata(fits_path).astype(float)
                 arr2 = np.squeeze(arr)
                 if arr2.ndim == 3:
@@ -2206,51 +2242,50 @@ def load_PSZ2(path=root_path + "PSZ2/classified/",
                 elif arr2.ndim != 2:
                     raise ValueError(f"Expected 2-D or 3-D stack, got {arr2.shape!r}")
 
-                if USE_GLOBAL_NORMALISATION and GLOBAL_NORM_MODE == "flux":
+                if USE_GLOBAL_NORMALISATION and GLOBAL_NORM_MODE == "flux": # apply global flux normalisation
+                    hdr = fits.getheader(fits_path)
                     fluxconv = hdr.get('FLUXCONV', 1.0)
-                    src = torch.from_numpy(arr2 * fluxconv).float().unsqueeze(0)  # [1,H,W]
-                    src = src.clamp(1e-10, 1e-5)
-                    src = (src - 1e-10) / (1e-5 - 1e-10)
+                    flux = arr * fluxconv
+                    flux_t = torch.from_numpy(np.squeeze(flux)).float().unsqueeze(0)
+                    flux_clipped = flux_t.clamp(1e-10, 1e-5)
+                    frame = (flux_clipped - 1e-10) / (1e-5 - 1e-10)
                 else:
-                    src = torch.from_numpy(arr2).float().unsqueeze(0)
+                    frame = torch.from_numpy(arr2).unsqueeze(0).float()
 
-                if TARGET_FOV_KPC and meta_df is not None and base in meta_df.index:
-                    try:
-                        z = float(meta_df.loc[base, ZCOL])
-                        kpc_per_arcsec = cosmo.kpc_proper_per_arcmin(z).value / 60.0
-                        arcsec_per_pix = _pixdeg(hdr) * 3600.0
-                        side_pix = max(1, int(round(TARGET_FOV_KPC / (kpc_per_arcsec * arcsec_per_pix))))
-                        frame = apply_formatting(src, (1, side_pix, side_pix), (1, Ho, Wo))
-                    except Exception as e:
-                        print(f"[load_PSZ2] Physical crop failed for {base} ({e}); using crop_size.")
-                        frame = apply_formatting(src, crop_size=crop_size, downsample_size=downsample_size)
-                else:
-                    frame = apply_formatting(src, crop_size=crop_size, downsample_size=downsample_size)
-
-                images.append(frame)
+                frame = apply_formatting(frame, crop_size=crop_size, downsample_size=downsample_size)
+                images.append(frame)           # [C,H,W]
                 labels.append(label)
                 filenames.append(base)
-
-    # Global percentile/flux normalization (unchanged)
+    # ---- GLOBAL, DATASET-WIDE NORMALISATION (one mapping for all sets) ----
     if USE_GLOBAL_NORMALISATION and GLOBAL_NORM_MODE == "percentile":
         print(f"[load_PSZ2] Applying global percentile normalisation ({percentile_lo}–{percentile_hi}%)")
+        # compute percentiles on the entire dataset
         imgs_tensor = torch.stack(images) if isinstance(images, list) else images
         flat = imgs_tensor.reshape(-1).float()
         qlo = flat.quantile(percentile_lo/100)
         qhi = flat.quantile(percentile_hi/100)
+
         def _apply_fixed_pct_elem(x, lo=qlo, hi=qhi):
             return ((x - lo) / (hi - lo + 1e-6)).clamp(0, 1).to(x.dtype)
+
         if isinstance(images, list):
             images = [_apply_fixed_pct_elem(x) for x in images]
         else:
             images = _apply_fixed_pct_elem(images)
 
+
+    # --------- safety checks ---------
     if len(images) == 0:
         raise ValueError("No images loaded. Check the PSZ2 path/versions/classes.")
-    assert len(images) == len(labels) == len(filenames)
 
-    # RH vs RR conflicts + hash dedup (unchanged)
+    assert len(images) == len(labels) == len(filenames), \
+        f"mismatch: {len(images)} imgs, {len(labels)} labels, {len(filenames)} files"
+
+    # --------- class-conflict handling (RH vs RR) ----------
+    # For {52 (RH), 53 (RR)} first drop *cluster basenames* that appear in both classes,
+    # independent of pixel identity. Then (optionally) do hash de-dup on the remainder.
     if set(target_classes) == {52, 53}:
+        # 1) basename-level conflict filter
         base_to_labels = {}
         for lbl, base in zip(labels, filenames):
             base_to_labels.setdefault(base, set()).add(lbl)
@@ -2266,8 +2301,8 @@ def load_PSZ2(path=root_path + "PSZ2/classified/",
             images, labels, filenames = map(list, zip(*filtered_triplets))
         else:
             images, labels, filenames = [], [], []
-
-        from collections import Counter
+    
+        # 2) (optional) hash de-dup (keeps only one copy of identical frames)
         hashes = []
         for img in images:
             arr = img.squeeze().numpy()
@@ -2275,26 +2310,35 @@ def load_PSZ2(path=root_path + "PSZ2/classified/",
         counts = Counter(hashes)
         dup_hashes = {h for h, c in counts.items() if c > 1}
         if dup_hashes:
-            keep = set(); seen = set()
+            keep = set()
+            seen = set()
             for i, h in enumerate(hashes):
                 if h not in seen:
-                    keep.add(i); seen.add(h)
+                    keep.add(i)
+                    seen.add(h)
             images  = [images[i]  for i in sorted(keep)]
             labels  = [labels[i]  for i in sorted(keep)]
             filenames = [filenames[i] for i in sorted(keep)]
 
-    # Stratified split (unchanged)
+
+    # --------- stratified split ----------
     all_idx = list(range(len(images)))
     train_idx, test_idx = train_test_split(
-        all_idx, test_size=0.2, stratify=labels, random_state=SEED
+        all_idx,
+        test_size=0.2,
+        stratify=labels,
+        random_state=SEED
     )
+
     train_images = [images[i] for i in train_idx]
     train_labels = [labels[i] for i in train_idx]
     eval_images  = [images[i] for i in test_idx]
     eval_labels  = [labels[i] for i in test_idx]
+    train_filenames = [filenames[i] for i in train_idx]
+    eval_filenames  = [filenames[i] for i in test_idx]
 
-    return train_images, train_labels, eval_images, eval_labels, \
-           [filenames[i] for i in train_idx], [filenames[i] for i in test_idx]
+    # --------- return types exactly as before ----------
+    return train_images, train_labels, eval_images, eval_labels, train_filenames, eval_filenames
 
 
 def load_MGCLS(path='/users/mbredber/data/MGCLS/classified_crops_1600/',  # Path to MGCLS data
@@ -2367,9 +2411,10 @@ def load_MGCLS(path='/users/mbredber/data/MGCLS/classified_crops_1600/',  # Path
 
     return train_images, train_labels, eval_images, eval_labels
 
+
 def load_galaxies(galaxy_classes, path=None, versions=None, fold=None, island=None, crop_size=None, downsample_size=None, sample_size=None, DEBUG=False,
                   REMOVEOUTLIERS=True, BALANCE=False, AUGMENT=False, USE_GLOBAL_NORMALISATION=False, GLOBAL_NORM_MODE="percentile", STRETCH=False, percentile_lo=30, percentile_hi=99,
-                  NORMALISE=True, NORMALISETOPM=False, EXTRADATA=False, PRINTFILENAMES=False, SAVE_IMAGES=False, train=None, target_fov_kpc=1000.0): 
+                 NORMALISE=True, NORMALISETOPM=False, EXTRADATA=False, PRINTFILENAMES=False, SAVE_IMAGES=False, train=None):
     """
     Master loader that delegates to specific dataset loaders and returns zero-based labels.
     """
@@ -2381,7 +2426,7 @@ def load_galaxies(galaxy_classes, path=None, versions=None, fold=None, island=No
     # Clean up kwargs to remove None values
     kwargs = {'path': path, 'versions': versions, 'sample_size': sample_size, 'fold':fold, 'train': train,
               'island': island, 'crop_size': crop_size, 'downsample_size': downsample_size, 'USE_GLOBAL_NORMALISATION': USE_GLOBAL_NORMALISATION,
-              'GLOBAL_NORM_MODE': GLOBAL_NORM_MODE, 'percentile_lo': percentile_lo, 'percentile_hi': percentile_hi, 'target_fov_kpc': target_fov_kpc} 
+                'GLOBAL_NORM_MODE': GLOBAL_NORM_MODE, 'percentile_lo': percentile_lo, 'percentile_hi': percentile_hi}
     clean_kwargs = {k: v for k, v in kwargs.items() if v is not None}
 
     max_class = get_max_class(galaxy_classes)
@@ -2537,6 +2582,8 @@ def load_galaxies(galaxy_classes, path=None, versions=None, fold=None, island=No
                 cls_imgs = [img for img, lbl in zip(imgs, lbls) if lbl == (cls-min(target_classes))]
                 print(f"Length of {kind} images for class {cls}: {len(cls_imgs)}")
                 np.save(f"{path}_{kind}_{cls}_{len(cls_imgs)}.npy", cls_imgs)
+
+
         
     if EXTRADATA and not PRINTFILENAMES:
         if DEBUG:
@@ -2588,7 +2635,9 @@ def load_galaxies(galaxy_classes, path=None, versions=None, fold=None, island=No
             eval_images = torch.stack(eval_images)
         if isinstance(eval_labels, (list, tuple)):
             eval_labels = torch.tensor(eval_labels, dtype=torch.long)
-            
+        
+    print("Shape of train_images returned from PSZ2:", train_images.shape)
+    
     if PRINTFILENAMES:
         return train_images, train_labels, eval_images, eval_labels, train_filenames, eval_filenames
     elif EXTRADATA:
@@ -2596,7 +2645,11 @@ def load_galaxies(galaxy_classes, path=None, versions=None, fold=None, island=No
         eval_data  = torch.tensor(np.stack(eval_data),  dtype=torch.float32)
         return train_images, train_labels, eval_images, eval_labels, train_data, eval_data
     
+    
     return train_images, train_labels, eval_images, eval_labels
+
+
+
 
 def load_halos_and_relics(
     galaxy_classes,
@@ -2653,14 +2706,21 @@ def load_halos_and_relics(
             percentile_hi=percentile_hi,
             train=False,  # splitting handled below
         )
-        # Accept (imgs,lbls,fnames) or (imgs,lbls)
-        if isinstance(raw, tuple) and len(raw) == 3:
-            images, labels, filenames = raw
-        elif isinstance(raw, tuple) and len(raw) == 2:
-            images, labels = raw
-            filenames = [""] * len(labels)
+        
+        if len(raw) == 6:
+            tr_imgs, tr_lbls, ev_imgs, ev_lbls, tr_fns, ev_fns = raw
+        elif len(raw) == 4:
+            tr_imgs, tr_lbls, ev_imgs, ev_lbls = raw
+            tr_fns, ev_fns = [], []
         else:
-            raise RuntimeError("load_PSZ2 returned unexpected shape")
+            raise RuntimeError(f"load_PSZ2 returned unexpected shape (len={len(raw)})")
+        # combine so we can stratify/split here
+        def _as_list(x):
+            return [x[i] for i in range(len(x))] if torch.is_tensor(x) else list(x)
+        images    = _as_list(tr_imgs) + _as_list(ev_imgs)
+        labels    = (tr_lbls.cpu().tolist() if torch.is_tensor(tr_lbls) else list(tr_lbls)) + \
+                    (ev_lbls.cpu().tolist() if torch.is_tensor(ev_lbls) else list(ev_lbls))
+        filenames = list(tr_fns) + list(ev_fns)
 
     elif is_first:
         # FIRST already returns train/eval; we’ll unify shapes anyway.

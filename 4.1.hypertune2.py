@@ -1,9 +1,3 @@
-import numpy as np
-import torch, math, time, random
-import torch.nn as nn
-from torch.utils.data import TensorDataset, DataLoader, Subset, Dataset
-from torchsummary import summary
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score 
 from utils.data_loader import load_halos_and_relics, get_classes,  get_synthetic, augment_images, apply_formatting
 from utils.classifiers import (
     RustigeClassifier, TinyCNN, MLPClassifier, SCNN, CNNSqueezeNet, ScatterResNet,
@@ -12,20 +6,21 @@ from utils.classifiers import (
 from utils.training_tools import EarlyStopping, reset_weights
 from utils.calc_tools import cluster_metrics, normalise_images, check_tensor, fold_T_axis, compute_scattering_coeffs, custom_collate
 from utils.plotting import plot_histograms, plot_images_by_class, plot_image_grid, plot_background_histogram
-from torchvision.utils import make_grid, save_image
+
+import numpy as np
+import torch, math, time, random
+import torch.nn as nn
+from torch.utils.data import TensorDataset, DataLoader, Subset
+from torch.optim import AdamW
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
 from kymatio.torch import Scattering2D
-from scipy.ndimage import gaussian_filter
-from collections import defaultdict, Counter
+from collections import defaultdict
 from astropy.io import fits
 from astropy.convolution import convolve_fft, Gaussian2DKernel
 from functools import lru_cache
-import pandas as pd
-import pickle
 from tqdm import tqdm
-from torch.optim import AdamW
 import itertools
 from itertools import product
-from sklearn.metrics import confusion_matrix
 import seaborn as sns
 import matplotlib 
 import matplotlib.pyplot as plt
@@ -57,7 +52,6 @@ print("Running ht2 with seed", SEED)
 ###############################################
 
 galaxy_classes    = [52, 53]
-max_num_galaxies  = 1000000
 dataset_portions  = [1]
 J, L, order       = 2, 12, 2
 gen_model_names   = ['DDPM'] #['ST', 'DDPM', 'wGAN', 'GAN', 'Dual', 'CNN', 'STMLP', 'lavgSTMLP', 'ldiffSTMLP'] # Specify the generative model_name
@@ -121,7 +115,6 @@ HISTOGRAMMATCHING = False  # Histogram matching for generated images
 USE_MEMMAP = False  # Use memmap for scattering coefficients
 SIGMACLIPPONDDPM = False  # Apply sigma clipping to DDPM data
 
-
 # -------------------------- GAN CONFIGURATION --------------------------
 gan_epoch = 5000           # e.g., epoch number to load from
 gan_gen_loss = 'MSE'       # e.g., generator loss value (as used in filename)
@@ -170,6 +163,13 @@ PSZ2_ROOT = "/users/mbredber/scratch/data/PSZ2"  # FITS root used below
 if TRAINONGENERATED:
     lambda_values = [8]  # To identify and distinguish TRAINONGENERATED from other runs
     print("Using generated data for testing.")
+    
+if galaxy_classes == [52, 53]:
+    # —— MULTI-LABEL SWITCH ——
+    MULTILABEL = True     # predict presence of RH and/or RR (independent)
+    LABEL_INDEX = {"RH": 0, "RR": 1}   # RH=52, RR=53 below
+    THRESHOLD = 0.5       # sigmoid threshold at inference
+
 
 ########################################################################
 ##################### HELPER FUNCTIONS #################################
@@ -274,11 +274,6 @@ def _first(pattern: str):
     hits = sorted(glob.glob(pattern))
     return hits[0] if hits else None
 
-# After you get tapered images back:
-def bg_sigma(t):
-    m = _background_ring_mask(t.shape[-2], t.shape[-1], inner=64)
-    return _robust_sigma(t.squeeze(1)[..., m])  # [B] robust σ
-
 def _to_strs(x): 
     return [str(y) for y in x] if isinstance(x, (list, tuple)) else list(map(str, x))
 
@@ -308,17 +303,34 @@ def _has_anchors(fn: str, anchors):
     avail = {"T25kpc": t25 is not None, "T50kpc": t50 is not None, "T100kpc": t100 is not None}
     return all(avail[a] for a in anchors)
 
-def fwhm_to_sigma_rad(fwhm_arcsec):
-    return (fwhm_arcsec*ARCSEC) / (2*np.sqrt(2*np.log(2)))
+def collapse_logits(logits, num_classes, multilabel):
+    # [B,C,H,W] → [B,C]
+    if logits.ndim == 4:
+        logits = torch.nn.functional.adaptive_avg_pool2d(logits, (1, 1)).squeeze(-1).squeeze(-1)
+    elif logits.ndim == 3:
+        logits = logits.mean(dim=-1)
+    # ensure [B,C]
+    if logits.ndim == 1:
+        logits = logits.unsqueeze(1)
+    if not multilabel and logits.shape[1] == 1 and num_classes == 2:
+        logits = torch.cat([-logits, logits], dim=1)
+    return logits
 
-def _cov_from_beam(bmaj_as, bmin_as, pa_deg):
-    sx = fwhm_to_sigma_rad(bmaj_as)   # radians
-    sy = fwhm_to_sigma_rad(bmin_as)
-    th = np.deg2rad(pa_deg)
-    R = np.array([[np.cos(th), -np.sin(th)],
-                  [np.sin(th),  np.cos(th)]], dtype=float)
-    S = np.diag([sx*sx, sy*sy])
-    return R @ S @ R.T
+def compute_classification_metrics(y_true, y_pred, multilabel, num_classes):
+    acc = accuracy_score(y_true, y_pred)
+    if multilabel:
+        avg = 'macro'
+        return acc, precision_score(y_true, y_pred, average=avg, zero_division=0), \
+                     recall_score(y_true, y_pred, average=avg, zero_division=0), \
+                     f1_score(y_true, y_pred, average=avg, zero_division=0)
+    if num_classes == 2:
+        return acc, precision_score(y_true, y_pred, average='binary', zero_division=0), \
+                     recall_score(y_true, y_pred, average='binary', zero_division=0), \
+                     f1_score(y_true, y_pred, average='binary', zero_division=0)
+    avg = 'macro'
+    return acc, precision_score(y_true, y_pred, average=avg, zero_division=0), \
+                 recall_score(y_true, y_pred, average=avg, zero_division=0), \
+                 f1_score(y_true, y_pred, average=avg, zero_division=0)
 
 def _kernel_from_headers(raw_hdr, targ_hdr, _pixscale_arcsec_unused=None):
     """
@@ -433,23 +445,7 @@ def _headers_for_name(base_name: str):
     return raw_hdr, t25_hdr, t50_hdr, t100_hdr, pix_native, raw_path
 
 
-def plot_raw_vs_fake_taper(raw_imgs, tapered_imgs, filenames, taper_mode,
-                           save_dir="./classifier", max_n=4):
-    n = min(max_n, raw_imgs.size(0), tapered_imgs.size(0), len(filenames))
-    fig, axes = plt.subplots(2, n, figsize=(3*n, 6), constrained_layout=True)
-    for i in range(n):
-        r = raw_imgs[i, 0].detach().cpu().numpy()
-        t = tapered_imgs[i, 0].detach().cpu().numpy()
-        axes[0, i].imshow(r, cmap="viridis", origin="lower", vmin=0, vmax=1)
-        axes[0, i].axis("off"); axes[0, i].set_title(str(filenames[i]), fontsize=8)
-        axes[1, i].imshow(t, cmap="viridis", origin="lower", vmin=0, vmax=1)
-        axes[1, i].axis("off")
-    axes[0, 0].set_ylabel("RAW", fontsize=11)
-    axes[1, 0].set_ylabel("RAW → " + ("50 kpc" if taper_mode=="rt50" else "100 kpc"), fontsize=11)
-    os.makedirs(save_dir, exist_ok=True)
-    out = os.path.join(save_dir, f"raw_vs_{taper_mode}_eval_{n}x2_{raw_imgs.shape[-2]}x{raw_imgs.shape[-1]}.png")
-    plt.savefig(out, dpi=150, bbox_inches="tight"); plt.close(fig)
-    print(f"Saved {out}")
+
 
 def permute_like(x, perm):
     if x is None: return None
@@ -459,29 +455,18 @@ def permute_like(x, perm):
     if isinstance(x, (list, tuple)): return [x[i] for i in idx]
     return x
 
-base_cls = min(galaxy_classes)
-def relabel(y): 
-    return (y - base_cls).long()
-
-
-def _maybe_resize_center(img_chw, out_hw):
-    """Center-crop + resize but skips resize if shape already matches (C)."""
-    # img_chw: [1,H,W] torch; out_hw: (Hout, Wout)
-    C, H0, W0 = img_chw.shape
-    Hout, Wout = out_hw
-    # center-crop to requested crop_size (same as your apply_formatting logic)
-    y0, x0 = H0//2, W0//2
-    y1, y2 = y0 - Hout//2, y0 + (Hout - Hout//2)
-    x1, x2 = x0 - Wout//2, x0 + (Wout - Wout//2)
-    y1, y2 = max(0, y1), min(H0, y2)
-    x1, x2 = max(0, x1), min(W0, x2)
-    crop = img_chw[:, y1:y2, x1:x2]
-    if crop.shape[-2:] == (Hout, Wout):
-        return crop
-    return torch.nn.functional.interpolate(
-        crop.unsqueeze(0), size=(Hout, Wout), mode='bilinear', align_corners=False
-    ).squeeze(0)
-    
+def relabel(y):
+    """
+    Convert raw single-class ids to 2-bit multi-label targets [RH, RR].
+    RH (52) -> [1,0]
+    RR (53) -> [0,1]
+    If you ever have 'both', set both bits to 1 *upstream*.
+    """
+    y = y.long()
+    out = torch.zeros((y.shape[0], 2), dtype=torch.float32, device=y.device)
+    out[:, 0] = (y == 52).float()  # RH
+    out[:, 1] = (y == 53).float()  # RR
+    return out    
 
 def _background_ring_mask(h, w, inner=64, pad=8):
     yy, xx = torch.meshgrid(torch.arange(h), torch.arange(w), indexing='ij')
@@ -495,15 +480,6 @@ def _robust_sigma(x2d):
     x = torch.as_tensor(x2d, dtype=torch.float32)
     med = x.median()
     return 1.4826 * (x - med).abs().median()
-
-def build_ref_sigma_map(real_imgs, filenames, inner=64):
-    """Measure background σ on the already-loaded images (top row)."""
-    ref = {}
-    for img, name in zip(real_imgs, filenames):
-        im = torch.as_tensor(img, dtype=torch.float32).squeeze(0)  # [H,W]
-        mask = _background_ring_mask(*im.shape, inner=inner)
-        ref[str(name)] = _robust_sigma(im[mask]).item()
-    return ref
 
 def _per_image_percentile_stretch(x2d, lo=60, hi=95):
     t = torch.as_tensor(x2d, dtype=torch.float32)
@@ -649,17 +625,8 @@ def apply_taper_to_tensor(
     out = torch.stack(out, dim=0).to(device=device, dtype=dtype) if out else torch.empty((0,1,Hout,Wout), device=device, dtype=dtype)
     return out, keep_mask, kept_fns, skipped
 
-
-
 def replicate_list(x, n):
     return [v for v in x for _ in range(int(n))]
-
-def shuffle_with_filenames(images, labels, filenames=None):
-    perm = torch.randperm(images.size(0))
-    images, labels = images[perm], labels[perm]
-    if filenames is not None:
-        filenames = [filenames[i] for i in perm.tolist()]
-    return images, labels, filenames
 
 def late_augment(images, labels, filenames=None, *, st_aug=False):
     """
@@ -808,7 +775,7 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
     _load_versions, _gen_versions = _split_versions(versions)
 
     # Always load RAW unless the user explicitly asked for T* as input.
-    _versions_to_load = _load_versions or ['raw']   # e.g. ('raw','rt50') -> ['raw']
+    _versions_to_load = _load_versions[0] if len(_load_versions) == 1 else _load_versions
 
     # If any rt* is requested, compute which fixed T*kpc set we will use to SELECT sources.
     def _rt_anchor(g):
@@ -848,13 +815,6 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
     ########## INITIALIZE DICTIONARIES ############
     ###############################################
 
-    metrics = {
-        "accuracy": {},
-        "precision": {},
-        "recall": {},
-        "f1_score": {}
-    }
-
     metric_colors = {
         "accuracy": 'blue',
         "precision": 'green',
@@ -879,7 +839,7 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
     scattering = Scattering2D(J=J, L=L, shape=img_shape[-2:], max_order=order)      
     for gen_model_name in gen_model_names:
 
-        with torch.no_grad():
+        with torch.inference_mode():
             dummy = torch.zeros((1, *img_shape)).cpu()
             scat_dummy = scattering(dummy)
             if scat_dummy.dim()==5:
@@ -891,8 +851,9 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
         hidden_dim2 = 128
         vae_latent_dim = 64
         
+        _versions_arg = _versions_to_load if isinstance(_versions_to_load, (list, tuple)) else [_versions_to_load]
         _out  = load_halos_and_relics(galaxy_classes=galaxy_classes,
-                    versions=_versions_to_load or ['raw'], 
+                    versions=_versions_arg or ['raw'],
                     fold=max(folds), #Any fold other than 5 gives me the test data for the five fold cross validation
                     crop_size=crop_size,
                     downsample_size=downsample_size,
@@ -921,7 +882,7 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
 
         perm_test = torch.randperm(test_images.size(0))
         test_images, test_labels = test_images[perm_test], test_labels[perm_test]
-        test_labels = relabel(test_labels)  # map {50,51} -> {0,1}
+        test_labels = relabel(test_labels) if MULTILABEL else test_labels
         if test_fns is not None:
             test_fns = [test_fns[i] for i in perm_test.tolist()]
 
@@ -1051,9 +1012,10 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                 # only synthetic for training; reserve real for validation
                 train_images = torch.empty((0, *img_shape), device=DEVICE)
                 train_labels = torch.empty((0,), dtype=torch.long, device=DEVICE)
+                _versions_arg = _versions_to_load if isinstance(_versions_to_load, (list, tuple)) else [_versions_to_load]
                 _out = load_halos_and_relics(
                     galaxy_classes=galaxy_classes,
-                    versions=_versions_to_load or ['raw'],
+                    versions=_versions_arg or ['raw'],
                     fold=fold,
                     crop_size=crop_size,
                     downsample_size=downsample_size,
@@ -1074,7 +1036,7 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                     _, _, valid_images, valid_labels, _, valid_data = _out
 
                 # Relabel and shuffle validation data
-                valid_labels = relabel(valid_labels)  # [0,1,2,...] for classes [50,51,...]
+                valid_labels = relabel(valid_labels) if MULTILABEL else valid_labels # [0,1,2,...] for classes [50,51,...]
                 perm_valid = torch.randperm(valid_images.size(0))
                 valid_images, valid_labels = valid_images[perm_valid], valid_labels[perm_valid]
                 if PRINTFILENAMES: valid_fns = permute_like(valid_fns, perm_valid)
@@ -1162,10 +1124,10 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                         train_data = train_fns
                         valid_data = valid_fns
                 dataset_sizes[fold] = [max(2, int(len(train_images) * p)) for p in dataset_portions]
-                
-                train_labels = relabel(train_labels)  # [0,1,2,...] for classes [50,51,...]
-                valid_labels = relabel(valid_labels)  # [0,1,2,...] for classes [50,51,...]
-                
+
+                train_labels = relabel(train_labels) if MULTILABEL else train_labels  # [0,1,2,...] for classes [50,51,...]
+                valid_labels = relabel(valid_labels) if MULTILABEL else valid_labels  # [0,1,2,...] for classes [50,51,...]
+
             ##########################################################
             ############# READ IN GENERATED DATA #####################
             ##########################################################
@@ -1230,7 +1192,7 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                         train_images = torch.cat([train_images, generated_images.to(train_images.device)])
                         train_labels = torch.cat([train_labels, generated_labels])
                     else:
-                        train_images = generated_images.to(DEVICE)
+                        train_images = generated_images.to(DEVICE, non_blocking=True) # Non_blocking makes things faster by overlapping data transfer and computation
                         train_labels = generated_labels
                         
                     # store per-class generated images for sanity checking later
@@ -1248,7 +1210,7 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                     cls_mask = (train_labels == cls)
                     cls_images = train_images[cls_mask]
                     check_tensor(f"Generated images for class {cls} with model {gen_model_name}", cls_images)
-                train_labels = relabel(train_labels)  # [0,1,2,...] for classes [50,51,...]
+                train_labels = relabel(train_labels) if MULTILABEL else train_labels  # [0,1,2,...] for classes [50,51,...]
                         
             if TRAINONGENERATED:
                 # For each class, select the correct slice of (images, labels), then concatenate all.
@@ -1430,20 +1392,15 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                                 save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_background_hist.png")
             
             if USE_CLASS_WEIGHTS:
-                unique, counts = np.unique(train_labels.cpu().numpy(), return_counts=True)
-                total_count = sum(counts)
-                class_weights = {i: total_count / count for i, count in zip(unique, counts)}
-                weights = torch.tensor([class_weights.get(i, 1.0) for i in range(num_classes)],
-                                    dtype=torch.float, device=DEVICE)
-                missing_classes = [cls for cls in unique if cls not in class_weights]
-                if missing_classes:
-                    print(f"Warning: Missing classes in dataset: {missing_classes}")
-                    class_weights.update({int(cls): 1.0 for cls in missing_classes})
-                    
-                unique_valid, counts_valid = np.unique(valid_labels.cpu().numpy(), return_counts=True)
-                unique_test, counts_test = np.unique(test_labels.cpu().numpy(), return_counts=True)
-                class_counts_valid = dict(zip(map(int, unique_valid), map(int, counts_valid)))
-                class_counts_test = dict(zip(map(int, unique_test), map(int, counts_test)))
+                # —— per-label pos_weight for BCEWithLogitsLoss ——
+                # counts on the *current* train split after augmentation
+                pos_counts = train_labels.sum(dim=0)            # [2]
+                neg_counts = train_labels.shape[0] - pos_counts # [2]
+                # avoid divide-by-zero
+                pos_counts = torch.clamp(pos_counts, min=1.0)
+                pos_weight = (neg_counts / pos_counts).to(DEVICE)  # [2] larger → up-weight positives
+                print(f"[imbalance] RH positives: {int(pos_counts[0].item())}, RR positives: {int(pos_counts[1].item())}")
+                print(f"[pos_weight] RH={pos_weight[0].item():.2f}, RR={pos_weight[1].item():.2f}")
             else:
                 weights = None
 
@@ -1607,14 +1564,17 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
             ############### TRAINING LOOP #################
             ###############################################
             
-            if weights is not None:
-                criterion = nn.CrossEntropyLoss(weight=weights, label_smoothing=label_smoothing)
+            if galaxy_classes == [52, 53]:
+                criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
             else:
-                print("No class weighting")
-                if len(galaxy_classes) == 2:
-                    criterion = nn.BCEWithLogitsLoss()
+                if weights is not None:
+                    criterion = nn.CrossEntropyLoss(weights=weights, label_smoothing=label_smoothing)
                 else:
-                    criterion = nn.CrossEntropyLoss()
+                    print("No class weighting")
+                    if len(galaxy_classes) == 2:
+                        criterion = nn.BCEWithLogitsLoss()
+                    else:
+                        criterion = nn.CrossEntropyLoss()
                 
 
             optimizer = AdamW(models[classifier_name]["model"].parameters(), lr=lr, weight_decay=reg)
@@ -1694,24 +1654,9 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                                     else:
                                         logits = model(images)
 
-                                    # Collapse spatial maps to [B, C] if the model returns [B, C, H, W]
-                                    if logits.ndim == 4:
-                                        print(f"Collapsing logits from shape {logits.shape} to [B, C]")
-                                        logits = torch.nn.functional.adaptive_avg_pool2d(logits, (1, 1)).squeeze(-1).squeeze(-1)
-                                    elif logits.ndim == 3:  # rare: [B, C, H]
-                                        print(f"Collapsing logits from shape {logits.shape} to [B, C]")
-                                        logits = logits.mean(dim=-1)
+                                    logits = collapse_logits(logits, num_classes, MULTILABEL)
 
-                                    # Keep binary 2-logit shape for CE
-                                    if logits.ndim == 1:
-                                        print(f"Expanding logits from shape {logits.shape} to [B, C]")
-                                        logits = logits.unsqueeze(1)
-                                    if logits.shape[1] == 1 and num_classes == 2:
-                                        print(f"Expanding logits from shape {logits.shape} to [B, 2]")
-                                        logits = torch.cat([-logits, logits], dim=1)
-
-
-                                    labels = labels.long()
+                                    #labels = labels.long()
                                     loss = criterion(logits, labels)
 
                                     loss.backward()
@@ -1727,7 +1672,7 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                             val_total_loss = 0
                             val_total_images = 0
 
-                            with torch.no_grad(): # Validate on validation data
+                            with torch.inference_mode(): # Validate on validation data
                                 for i, (images, scat, _rest) in enumerate(valid_loader):
                                     if images is None or len(images) == 0:
                                         print(f"Empty batch at index {i}. Skipping...")
@@ -1747,24 +1692,38 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                                             logits = model(images, scat)
                                         else:
                                             logits = model(images)
+                                            
+                                    if galaxy_classes == [52, 53]:
+                                        # If a model ever returns [B, C, H, W], keep your collapse:
+                                        if logits.ndim == 4:
+                                            logits = torch.nn.functional.adaptive_avg_pool2d(logits, (1, 1)).squeeze(-1).squeeze(-1)
+                                        elif logits.ndim == 3:
+                                            logits = logits.mean(dim=-1)
 
-                                    # Collapse spatial maps to [B, C] if the model returns [B, C, H, W]
-                                    if logits.ndim == 4:
-                                        logits = torch.nn.functional.adaptive_avg_pool2d(logits, (1, 1)).squeeze(-1).squeeze(-1)
-                                    elif logits.ndim == 3:  # rare: [B, C, H]
-                                        logits = logits.mean(dim=-1)
+                                        # For BCE: labels must be float and same shape as logits
+                                        labels = labels.float()
 
-                                    # Keep binary 2-logit shape for CE
-                                    if logits.ndim == 1:
-                                        logits = logits.unsqueeze(1)
-                                    if logits.shape[1] == 1 and num_classes == 2:
-                                        logits = torch.cat([-logits, logits], dim=1)
+                                        
+                                    else:
 
-                                    labels = labels.long()
+                                        # Collapse spatial maps to [B, C] if the model returns [B, C, H, W]
+                                        if logits.ndim == 4:
+                                            logits = torch.nn.functional.adaptive_avg_pool2d(logits, (1, 1)).squeeze(-1).squeeze(-1)
+                                        elif logits.ndim == 3:  # rare: [B, C, H]
+                                            logits = logits.mean(dim=-1)
+
+                                        # Keep binary 2-logit shape for CE
+                                        if logits.ndim == 1:
+                                            logits = logits.unsqueeze(1)
+                                        if logits.shape[1] == 1 and num_classes == 2 and galaxy_classes != [52, 53]:
+                                            logits = torch.cat([-logits, logits], dim=1)
+
+                                    #labels = labels.long()
                                     loss = criterion(logits, labels)
                                         
                                     # inside the training loop, just before loss = criterion(outputs, labels)
-                                    assert labels.dtype == torch.long, f"labels dtype {labels.dtype} must be long"
+                                    if galaxy_classes != [52, 53]:
+                                        assert labels.dtype == torch.long, f"labels dtype {labels.dtype} must be long"
                                     mn, mx = int(labels.min()), int(labels.max())
                                     assert 0 <= mn and mx < num_classes, f"label range [{mn},{mx}] not in [0,{num_classes-1}]"
 
@@ -1781,7 +1740,7 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                                     break
 
                         model.eval()
-                        with torch.no_grad(): # Evaluate on test data
+                        with torch.inference_mode(): # Evaluate on test data
                             key = f"{gen_model_name}_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}"
                             all_pred_probs[key] = []
                             all_pred_labels[key] = []
@@ -1806,76 +1765,82 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                                         logits = model(images, scat)
                                     else:
                                         logits = model(images)
+                                        
+                                if galaxy_classes == [52, 53]:
+                                    # If a model ever returns [B, C, H, W], keep your collapse:
+                                    if logits.ndim == 4:
+                                        logits = torch.nn.functional.adaptive_avg_pool2d(logits, (1, 1)).squeeze(-1).squeeze(-1)
+                                    elif logits.ndim == 3:
+                                        logits = logits.mean(dim=-1)
+                                        
+                                    # For BCE: labels must be float and same shape as logits
+                                    #true_labels = labels.float()
+                                    true_labels_np = labels.cpu().numpy().astype(int)
+                                    
+                                    pred_probs = torch.sigmoid(logits).cpu().numpy()     # [B,2]
+                                    pred_labels = (pred_probs >= THRESHOLD).astype(int)  # [B,2]
+                                    all_pred_probs[key].extend(pred_probs)
+                                    all_pred_labels[key].extend(pred_labels)
+                                    all_true_labels[key].extend(labels.cpu().numpy().astype(int))   # [B,2]
 
-                                # Collapse spatial maps to [B, C] if the model returns [B, C, H, W]
-                                if logits.ndim == 4:
-                                    logits = torch.nn.functional.adaptive_avg_pool2d(logits, (1, 1)).squeeze(-1).squeeze(-1)
-                                elif logits.ndim == 3:  # rare: [B, C, H]
-                                    logits = logits.mean(dim=-1)
+                                else:
+                                    # Collapse spatial maps to [B, C] if the model returns [B, C, H, W]
+                                    if logits.ndim == 4:
+                                        logits = torch.nn.functional.adaptive_avg_pool2d(logits, (1, 1)).squeeze(-1).squeeze(-1)
+                                    elif logits.ndim == 3:  # rare: [B, C, H]
+                                        logits = logits.mean(dim=-1)
 
-                                # Keep binary 2-logit shape for CE
-                                if logits.ndim == 1:
-                                    logits = logits.unsqueeze(1)
-                                if logits.shape[1] == 1 and num_classes == 2:
-                                    logits = torch.cat([-logits, logits], dim=1)
+                                    # Keep binary 2-logit shape for CE
+                                    if logits.ndim == 1:
+                                        logits = logits.unsqueeze(1)
+                                    if logits.shape[1] == 1 and num_classes == 2 and galaxy_classes != [52, 53]:
+                                        logits = torch.cat([-logits, logits], dim=1)
+                                        
+                                    pred_probs = torch.softmax(logits, dim=1).cpu().numpy()
 
-
-                                pred_probs = torch.softmax(logits, dim=1).cpu().numpy()
-
-                                true_labels = labels.cpu().numpy()
-                                #true_labels = torch.argmax(labels, dim=1).cpu().numpy()
-                                pred_labels = np.argmax(pred_probs, axis=1)
-                                all_pred_probs[key].extend(pred_probs)
-                                all_pred_labels[key].extend(pred_labels)
-                                all_true_labels[key].extend(true_labels)
+                                    true_labels = labels.cpu().numpy()
+                                    #true_labels = torch.argmax(labels, dim=1).cpu().numpy()
+                                    
+                                    pred_labels = np.argmax(pred_probs, axis=1)
+                                    all_pred_probs[key].extend(pred_probs)
+                                    all_pred_labels[key].extend(pred_labels)
+                                    all_true_labels[key].extend(true_labels)
 
                                 
                                 if SHOWIMGS and experiment == num_experiments - 1:
-                                    mask = pred_labels != true_labels
+                                    #mask = pred_labels != true_labels
+                                    mask = pred_labels != true_labels_np
                                     mis_images.append(images.cpu()[mask])
                                     mis_trues .append(true_labels[mask])
                                     mis_preds .append(pred_labels[mask])
                                     
                                     if galaxy_classes == [52, 53]:
-                                        cm = confusion_matrix(all_true_labels[key], all_pred_labels[key], labels=[0,1])
-                                        plt.figure(figsize=(4,4))
-                                        sns.heatmap(cm, annot=True, fmt='d',
-                                                    xticklabels=['RH (52)','RR (53)'],
-                                                    yticklabels=['RH (52)','RR (53)'])
-                                        plt.xlabel('Predicted')
-                                        plt.ylabel('True')
-                                        plt.title(f'Confusion Matrix — {classifier_name}')
-                                        plt.savefig(f"./{galaxy_classes}_{classifier_name}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_confusion_matrix.png", dpi=150)
-                                        plt.close()
-
-                            accuracy = accuracy_score(all_true_labels[key], all_pred_labels[key])
-                            if len(galaxy_classes) == 2:
-                                # For binary classification, pos_label=1 corresponds to the second class in sorted order
-                                positive_class = 1 if 1 in np.unique(all_true_labels[key]) else 0
-                                precision = precision_score(all_true_labels[key], all_pred_labels[key], pos_label=positive_class, average='binary', zero_division=0)
-                                recall = recall_score(all_true_labels[key], all_pred_labels[key], pos_label=positive_class, average='binary', zero_division=0)
-                                f1 = f1_score(all_true_labels[key], all_pred_labels[key], pos_label=positive_class, average='binary', zero_division=0)
-                            else:
-                                # For multi-class, use macro averaging
-                                precision = precision_score(all_true_labels[key], all_pred_labels[key], average='macro', zero_division=0)
-                                recall = recall_score(all_true_labels[key], all_pred_labels[key], average='macro', zero_division=0)
-                                f1 = f1_score(all_true_labels[key], all_pred_labels[key], average='macro', zero_division=0)
-
+                                        names = ["RH", "RR"]
+                                        for i, name in enumerate(names):
+                                            cm = confusion_matrix(y_true[:, i], y_pred[:, i], labels=[0,1])
+                                            plt.figure(figsize=(4,4))
+                                            sns.heatmap(cm, annot=True, fmt='d',
+                                                        xticklabels=[f'no {name}', f'{name}'],
+                                                        yticklabels=[f'no {name}', f'{name}'])
+                                            plt.xlabel('Predicted'); plt.ylabel('True')
+                                            plt.title(f'Confusion Matrix — {name}')
+                                            plt.savefig(f"./{galaxy_classes}_{classifier_name}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_cm_{name}.png", dpi=150)
+                                            plt.close()
+                                            
+                            # --- metrics ---
+                            y_true = np.array(all_true_labels[key])
+                            y_pred = np.array(all_pred_labels[key])
+                            accuracy, precision, recall, f1 = compute_classification_metrics(y_true, y_pred, multilabel=MULTILABEL, num_classes=num_classes)
                             update_metrics(metrics, gen_model_name, subset_size, fold, experiment, lr, reg, accuracy, precision, recall, f1, lambda_generate, crop_size, downsample_size, ver_key)
-
-                            
-                            # Print accuracy and other metrics
                             print(f"Fold {fold}, Experiment {experiment}, Subset Size {subset_size}, Classifier {classifier_name}, "
                                 f"Accuracy: {accuracy:.4f}, Precision: {precision:.4f}, "
-                                f"Recall: {recall:.4f}, F1 Score: {f1:.4f}, ")
-        
+                                f"Recall: {recall:.4f}, F1 Score: {f1:.4f}")
 
                             if SHOWIMGS and mis_images and experiment == num_experiments - 1:
                                 mis_images = torch.cat(mis_images, dim=0)[:36]
                                 mis_trues  = np.concatenate(mis_trues)[:36]
                                 mis_preds  = np.concatenate(mis_preds)[:36]
-
-                                import matplotlib.pyplot as plt
+                                
                                 fig, axes = plt.subplots(6, 6, figsize=(12, 12))
                                 axes = axes.flatten()
 
@@ -1921,14 +1886,17 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                             file.write(f"Time taken to train the model on fold {fold}: {elapsed_time:.2f} seconds \n")
                 
                 generated_features = []
-                with torch.no_grad():
+                with torch.inference_mode():
                     for images, scat, _rest in test_loader:
                         if EXTRAVARS:
                             meta, labels = _rest
                             meta = meta.to(DEVICE)
                         else:
                             labels = _rest
-                        images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE)
+                        images = images.to(DEVICE, non_blocking=True)
+                        scat   = scat.to(DEVICE, non_blocking=True)
+                        labels = labels.to(DEVICE, non_blocking=True)
+
                         
                         if classifier == "DANN":
                             class_logits, _ = model(images, alpha=1.0)
@@ -1952,35 +1920,4 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
 
                 model_save_path = f'./classifier/trained_models/{gen_model_name}_model.pth'
                 torch.save(model.state_dict(), model_save_path)
-        import pickle
-        from collections import defaultdict
-
-        def dictify(x):
-            """
-            Recursively turn any defaultdict into a regular dict.
-            Leave other types alone.
-            """
-            if isinstance(x, defaultdict):
-                return {k: dictify(v) for k, v in x.items()}
-            elif isinstance(x, dict):
-                return {k: dictify(v) for k, v in x.items()}
-            else:
-                return x
-
-        # … after all your training loops, right before saving:
-        _clean = {
-            "models": models,
-            "history": dictify(history),
-            "metrics": dictify(metrics),
-            "metric_colors": metric_colors,
-            "all_true_labels": dictify(all_true_labels),
-            "all_pred_labels": dictify(all_pred_labels),
-            "training_times": dictify(training_times),
-            "all_pred_probs": dictify(all_pred_probs),
-        }
-        
-        summary_path = f'./classifier/trained_models/{classifier}_{gen_model_names[0]}_summary_metrics.pkl'
-        with open(summary_path, "wb") as f:
-            pickle.dump(_clean, f)
-        print(f"Summary metrics written to {summary_path}") 
 
