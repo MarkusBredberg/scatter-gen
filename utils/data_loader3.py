@@ -1292,7 +1292,7 @@ def apply_formatting(image: torch.Tensor,
     x1, x2 = max(0, x1), min(W0, x2)
 
     crop = img[:, y1:y2, x1:x2].unsqueeze(0)   # [1,C,Hc,Wc]
-    resized = F.interpolate(crop, size=(Ho, Wo), mode='bilinear') # bilinear or area
+    resized = F.interpolate(crop, size=(Ho, Wo), mode='bilinear', align_corners=False)
     return resized.squeeze(0)                   # [C,Ho,Wo]
 
 def img_hash(img: torch.Tensor) -> str:
@@ -2154,16 +2154,13 @@ def load_PSZ2(
     fold = 5,                         # 0..4 = CV folds, 5 = last split
     train = False,                    # Not implemented
     processed_dir = "/users/mbredber/scratch/outputs/processed_psz2_fits", # directory for preformatted images
-    prefer_processed = False,   # whether to prefer processed images when available
-    gate_with = None  # None | "auto" | "T50kpc" | 50 (number). If set, gate RAW/T/RT against this T directory.
+    prefer_processed_raw = False,   # whether to prefer processed RAW images when available
 ):
     # Data available at: https://lofar-surveys.org/planck_dr2.html
     # Fetch data with utils.download_PSZ2.py
     # Categorise data with utils.process_PSZ2.py
     # Format and taper data with taper_tools.create_image_sets.py
     # This is the data loader for any version of the processed data
-
-    print("Preferred processedimages:", prefer_processed)
 
     def _kpc_tag(v):
         # Find the canonical kpc tag for a version string
@@ -2208,11 +2205,8 @@ def load_PSZ2(
             
     # ----- equal-beams pre-scan to make images similar in beam counts -----
     # Disable equal-beam logic when matching loader-2
-    if prefer_processed:
-        EQUAL_TAPER = _pick_equal_taper_from(versions)  # T50kpc by default
-        n_beams_min, _T_header_cache = _scan_min_beams(path, target_classes, taper=EQUAL_TAPER)
-    else:
-        n_beams_min, _T_header_cache = None, {}
+    EQUAL_TAPER = _pick_equal_taper_from(versions)  # T50kpc by default
+    n_beams_min, _T_header_cache = _scan_min_beams(path, target_classes, taper=EQUAL_TAPER)
 
     # --- class → folder map ---
     classes_map = {c["tag"]: c["description"] for c in get_classes()}
@@ -2383,6 +2377,7 @@ def load_PSZ2(
     else:
         vU = versions[0].upper() if isinstance(versions, (list, tuple)) else str(versions).upper()
         tag = _kpc_tag(versions)
+        FALLBACK = True     # Default to fallback to RAW loading
         for cls in target_classes:
             sub = classes_map.get(cls)
             print("Processing class:", cls, "subfolder:", sub)
@@ -2394,46 +2389,32 @@ def load_PSZ2(
             if not os.path.isdir(raw_dir):
                 print(f"[SKIP] RAW folder missing: {raw_dir}")
                 continue
+        
+            # build a common eligibility set so TXX and RTXX see exactly the same sources
+            if vU == "RAW" and prefer_processed_raw:
+                # RAW: no gating; just use the RAW folder
+                print("  → RAW loading (no gating)")
+                gate_dirname = None  # not used
+                gate_dir = None      # not used
+                gate_keys = None     # not used for RAW
+            elif vU.startswith("T") or vU.startswith("RT") and prefer_processed_raw:
+                m = re.search(r"RT(\d+(?:\.\d+)?)", vU) if vU.startswith("RT") else re.search(r"T(\d+(?:\.\d+)?)KPC", vU)
+                req_num = float(m.group(1)) if m else None
 
-            # --- Unified gating: applies to RAW/T/RT if gate_with is set ---
-            gate_keys = None
-            gate_dirname = None
-            if gate_with is not None:
-                # resolve desired gate kpc
-                desired_num = None
-                if isinstance(gate_with, str) and gate_with.lower() == "auto":
-                    # derive from versions if T/RT, default to 50 for RAW
-                    m_rt = re.search(r"RT(\d+(?:\.\d+)?)", vU)
-                    m_t  = re.search(r"T(\d+(?:\.\d+)?)KPC", vU)
-                    if m_rt:
-                        desired_num = float(m_rt.group(1))
-                    elif m_t:
-                        desired_num = float(m_t.group(1))
-                    else:
-                        desired_num = 50.0  # RAW default
-                elif isinstance(gate_with, (int, float)):
-                    desired_num = float(gate_with)
-                elif isinstance(gate_with, str):
-                    m = re.search(r"T(\d+(?:\.\d+)?)KPC", gate_with.upper())
-                    if m: desired_num = float(m.group(1))
-
-                if desired_num is not None:
-                    preferred_gate = f"T{int(desired_num) if desired_num.is_integer() else desired_num}kpc"
-                    # pick exact or nearest available TXXkpc/<sub>
-                    if os.path.isdir(os.path.join(path, preferred_gate, sub)):
-                        gate_dirname = preferred_gate
-                    else:
-                        nearest = _nearest_T_dir(path, sub, desired_num)
+                preferred_gate = f"T{int(req_num) if (req_num is not None and float(req_num).is_integer()) else req_num}kpc" if req_num is not None else None
+                gate_dirname = preferred_gate if (preferred_gate and os.path.isdir(os.path.join(path, preferred_gate, sub))) else None
+                if gate_dirname is None and req_num is not None:
+                    nearest = _nearest_T_dir(path, sub, req_num)
+                    if nearest:
                         gate_dirname = nearest
-
                 if gate_dirname is None:
-                    print(f"[GATE] No suitable TXXkpc found for gating with '{gate_with}' in sub='{sub}'. Proceeding without gating.")
-                else:
-                    gate_dir = os.path.join(path, gate_dirname, sub)
-                    raw_map = {os.path.splitext(f)[0].lower(): os.path.splitext(f)[0] for f in os.listdir(raw_dir) if f.lower().endswith(".fits")}            
-                    txx_map = {os.path.splitext(f)[0].lower(): os.path.splitext(f)[0] for f in os.listdir(gate_dir) if f.lower().endswith(".fits")}
-                    gate_keys = set(raw_map) & set(txx_map)  # lowercase intersection only
-                    print(f"[GATE] Using {gate_dirname} for sub='{sub}' ({len(gate_keys)} sources intersect).")
+                    print(f"[SKIP] No suitable TXXkpc found for gating RT{req_num}kpc in sub='{sub}'")
+                    continue
+
+                gate_dir = os.path.join(path, gate_dirname, sub)
+                raw_map  = {os.path.splitext(f)[0].lower(): os.path.splitext(f)[0] for f in os.listdir(raw_dir)  if f.lower().endswith(".fits")}
+                txx_map  = {os.path.splitext(f)[0].lower(): os.path.splitext(f)[0] for f in os.listdir(gate_dir) if f.lower().endswith(".fits")}
+                gate_keys = set(raw_map) & set(txx_map)   # lowercase intersection only
 
             for fname in sorted(os.listdir(raw_dir)):
                 if not fname.lower().endswith(".fits"):
@@ -2441,16 +2422,13 @@ def load_PSZ2(
                     continue
                 base = os.path.splitext(fname)[0]
                 src  = _source_id(base)
-                if src in _seen_sources:
-                    print("Skipping already seen source:", src)
-                    continue
-                if gate_keys is not None and (base.lower() not in gate_keys):
-                    print("Skipping (not in gated intersection):", src)
+                if src in _seen_sources or ((vU.startswith("RT") or vU.startswith("T")) and base.lower() not in gate_keys):
+                    print("Skipping already seen or ineligible source:", src)
                     continue
                 
                 # === Prefer processed T/RT; else generate ===
-                use_processed = bool(prefer_processed) and (vU.startswith("T") or vU.startswith("RT") or vU == "RAW")
-                if use_processed:
+                if vU.startswith("T") or vU.startswith("RT") or vU == "RAW" and prefer_processed_raw:
+                    print(f"Processing source: {src} (base: {base}) for version: {vU}")
                     src_name = _source_id(base)
                     Hwant, Wwant = Ho, Wo
                     proc_path = os.path.join(
@@ -2459,35 +2437,29 @@ def load_PSZ2(
                     )
                     if os.path.isfile(proc_path):
                         arr = np.squeeze(fits.getdata(proc_path)).astype(np.float32)
-                        if arr.ndim == 3: arr = arr.mean(axis=0)
+                        if arr.ndim == 3:
+                            arr = arr.mean(axis=0)
                         if arr.ndim == 2:
                             ten = torch.from_numpy(arr).unsqueeze(0).float()
-                            images.append(ten); labels.append(cls); basenames.append(src)
+                            images.append(ten)
+                            labels.append(cls)
+                            basenames.append(src)
                             _seen_sources.add(src)
+                            FALLBACK = False # If we are using processed files, no fallback needed. Want to compare with T/RT loads only.
                             continue
-                    else:
-                        print(f"[MISS] processed not found for class={sub}: {proc_path}")
-                        continue
 
-                # === FALLBACK when processed file is missing or not preferred ===
+                # === FALLBACK when processed file is missing ===
                 fpath = os.path.join(raw_dir, fname)
                 if vU.startswith("T"):
-                    # Load tapered image directly from TXXkpc/<sub>/<base>TXXkpc.fits and format
-                    t_dir = os.path.join(path, tag, sub)  # tag is e.g. "T50kpc"
-                    t_path = os.path.join(t_dir, f"{base}{tag}.fits")
-                    if not os.path.isfile(t_path):
-                        print(f"[MISS] tapered FITS not found for class={sub}: {t_path}")
-                        continue
-
-                    print(f"[T-FALLBACK] Using tapered image: {t_path}")
-                    arr = np.squeeze(fits.getdata(t_path)).astype(np.float32)
+                    # Load native T image and format — no RT convolution, no gate_version needed
+                    arr = np.squeeze(fits.getdata(fpath)).astype(np.float32)
                     if arr.ndim == 3:
                         arr = arr.mean(axis=0)
                     if arr.ndim != 2:
-                        print("  [SKIP] T image not 2D after squeeze/mean.")
+                        print("  [SKIP] RAW data not 2D after squeeze/mean.")
                         print("  arr.shape:", arr.shape)
                         continue
-                    hdr = fits.getheader(t_path)
+                    hdr = fits.getheader(fpath)
 
                     # Crop based on beam count if requested; else use requested crop
                     Hc_eff, Wc_eff = Hc_ref, Wc_ref
@@ -2503,8 +2475,6 @@ def load_PSZ2(
 
                 elif vU.startswith("RT"):
                     # Generate RT from RAW using gate header (existing logic)
-                    print("Generating RT from RAW for source:", src)
-                    print("Not yet implemented well")
                     arr = np.squeeze(fits.getdata(fpath)).astype(np.float32)
                     if arr.ndim == 3:
                         arr = arr.mean(axis=0)
@@ -2515,13 +2485,10 @@ def load_PSZ2(
                     raw_hdr = fits.getheader(fpath)
                     Hc_eff, Wc_eff = Hc_ref, Wc_ref
 
-                    num = ''.join([c for c in vU if c.isdigit()])
-                    gate_T = f"T{num}kpc"
-                    txx_path = os.path.join(path, gate_T, sub, f"{base}.fits")
-                    if not os.path.isfile(txx_path):
-                        print(f"  [SKIP] missing gate T image for RT convolution: {txx_path}")
+                    txx = os.path.join(path, gate_dirname, sub, f"{base}.fits")
+                    if not os.path.isfile(txx):
                         continue
-                    txx_hdr = fits.getheader(txx_path)
+                    txx_hdr = fits.getheader(txx)
 
                     ker = _kernel_from_beams(raw_hdr, txx_hdr)
                     arr = convolve_fft(
@@ -2541,7 +2508,7 @@ def load_PSZ2(
                     ten = torch.from_numpy(arr).unsqueeze(0).float()
                     frm = apply_formatting(ten, crop_size=(1, Hc_eff, Wc_eff), downsample_size=(1, Ho, Wo))
 
-                elif vU == "RAW":
+                elif vU == "RAW" and FALLBACK:
                     # NEW: fallback for RAW — read native RAW and format
                     arr = np.squeeze(fits.getdata(fpath)).astype(np.float32)
                     if arr.ndim == 3:
@@ -2562,7 +2529,7 @@ def load_PSZ2(
 
                     ten = torch.from_numpy(arr).unsqueeze(0).float()
                     frm = apply_formatting(ten, crop_size=(1, Hc_eff, Wc_eff), downsample_size=(1, Ho, Wo))
-                else:
+                elif not FALLBACK:
                     print(f"Skipping source {src} as processed files are preferred and available.")
                     continue
 
@@ -2897,12 +2864,17 @@ def load_halos_and_relics(
 
     if is_psz2:
         raw = load_PSZ2(
-            path = root_path + "PSZ2/classified/",
-            sample_size = sample_size,              # per class in training set; eval uses sample_size*0.2
-            target_classes = galaxy_classes,  # list of int class tags to load
-            versions = versions,          # string or list/tuple; list => Multiple versions
-            crop_size = crop_size,        # (C,Hc,Wc) — angular FoV is taken from the ref version
-            downsample_size = downsample_size,  # (C,Ho,Wo) — output per frame
+            fold=fold,
+            sample_size=sample_size,
+            target_classes=galaxy_classes,
+            crop_size=crop_size,
+            downsample_size=downsample_size,
+            versions=versions,
+            USE_GLOBAL_NORMALISATION=USE_GLOBAL_NORMALISATION,
+            GLOBAL_NORM_MODE=GLOBAL_NORM_MODE,
+            percentile_lo=percentile_lo,
+            percentile_hi=percentile_hi,
+            train=False,  # splitting handled below
         )
         
         if len(raw) == 6:

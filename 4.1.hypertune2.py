@@ -51,7 +51,7 @@ print("Running ht2 with seed", SEED)
 ################ CONFIGURATION ################
 ###############################################
 
-galaxy_classes    = [52, 53]
+galaxy_classes    = [50, 51]
 dataset_portions  = [1]
 J, L, order       = 2, 12, 2
 gen_model_names   = ['DDPM'] #['ST', 'DDPM', 'wGAN', 'GAN', 'Dual', 'CNN', 'STMLP', 'lavgSTMLP', 'ldiffSTMLP'] # Specify the generative model_name
@@ -88,7 +88,7 @@ param_grid = {
     'order':         [2],
     'percentile_lo': [1, 30, 60],   
     'percentile_hi': [80, 90, 99], 
-    'crop_size':     [(2000,2000)],
+    'crop_size':     [(512,512), (2000,2000)],  # (H,W) of central crop before downsampling
     'downsample_size':[(128,128)],
     'versions':       ['RAW']  # 'raw', 'T50kpc', ad hoc tapering: e.g. 'rt50'  strings in list → product() iterates them individually
 } #'versions': [('raw', 'rt50')]  # tuple signals “stack these”

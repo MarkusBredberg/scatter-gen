@@ -1,8 +1,9 @@
+from utils.data_loader import get_classes
 import numpy as np
 import matplotlib.pyplot as plt
-from torchvision.utils import make_grid, save_image
-from utils.data_loader import get_classes
+import math
 import torch
+from torchvision.utils import make_grid, save_image
 import os
 
 
@@ -79,48 +80,86 @@ def plot_GAN_losses(output_dir, galaxy_class, g_loss_history, d_loss_history, ge
     filename = f"ScatterGAN_loss_plot_{galaxy_class}_gen-{gen_loss_name}_disc-{disc_loss_name}.png"
     plt.savefig(os.path.join(output_dir, filename))
     plt.close()
-    
 
 
-def plot_image_grid(images, num_images=36, save_path="grid.png"):
+
+def plot_image_grid(
+    images,
+    num_images=36,
+    nrow=6,
+    save_path=None,
+    titles=None,          # <-- new, optional
+    cmap="viridis",
+    **_
+):
     """
-    Displays the first `n_images` in a 6×6 grid (36 total images).
-    Assumes `images` is either:
-      - shape [N, H, W], or
-      - shape [N, 1, H, W].
+    Show up to `num_images` in an nrow x ncol grid.
+    Accepts images shaped [N,C,H,W] or [N,H,W] (torch.Tensor or np.ndarray).
+    If `titles` is provided, it should be a list of strings (one per shown image).
     """
-    # We’ll make a 6×6 grid
-    nrows, ncols = 6, 6
-    fig, axes = plt.subplots(nrows, ncols, figsize=(12, 12))
 
-    for idx, ax in enumerate(axes.flatten()):
-        if idx >= num_images or idx >= len(images):
-            break
-        # If images are [N, 1, H, W], call .squeeze() to remove the extra dimension
-        #ax.imshow(images[idx].squeeze(), cmap='viridis')
-        #ax.axis('off')
-        
-        # select the cube
-        img = images[idx].cpu().numpy()
-        # if it’s C×H×W, average down to H×W for display
-        im = images[idx]
-        if torch.is_tensor(im):
-            im = im.detach().cpu().numpy()
-        while im.ndim > 2:
-            im = im[0]
-        ax.imshow(im, cmap='viridis')
+    # to numpy
+    if isinstance(images, torch.Tensor):
+        imgs = images.detach().cpu().numpy()
+    else:
+        imgs = np.asarray(images)
 
-        ax.axis('off')
+    # keep only the first num_images
+    imgs = imgs[:num_images]
+
+    # shape handling
+    if imgs.ndim == 4:          # [N, C, H, W]
+        if imgs.shape[1] == 1:  # single channel
+            imgs = imgs[:, 0]   # -> [N, H, W]
+        elif imgs.shape[1] == 3:  # RGB
+            imgs = np.transpose(imgs, (0, 2, 3, 1))  # -> [N, H, W, 3]
+        else:
+            # fall back to first channel
+            imgs = imgs[:, 0]
+    elif imgs.ndim != 3:        # expect [N, H, W]
+        raise ValueError(f"Expected images with ndim 3 or 4, got {imgs.ndim}")
+
+    n = imgs.shape[0]
+    ncols = max(1, int(nrow))
+    nrows = int(math.ceil(n / ncols))
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(2.2*ncols, 2.2*nrows))
+    axes = np.atleast_1d(axes).ravel()
+
+    # pad/trim titles safely
+    if titles is None:
+        titles_list = [None]*n
+    else:
+        titles_list = list(titles)[:n] + [None]*max(0, n - len(titles))
+
+    for i, ax in enumerate(axes):
+        if i < n:
+            im = imgs[i]
+            if im.ndim == 2:           # grayscale
+                ax.imshow(im, origin="lower", cmap=cmap)
+            else:                       # RGB
+                ax.imshow(im, origin="lower")
+            if titles_list[i]:
+                ax.set_title(str(titles_list[i]), fontsize=8)
+        ax.axis("off")
+
+    fig.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+    else:
+        return fig
 
 
-    plt.tight_layout()
-    plt.savefig(save_path)
-    plt.close()
     
 def plot_images_by_class(images, labels, num_images=5, save_path="./classifier/unknown_omdel_example_inputs.png"):
     """
     Plots a specified number of input images in a row for each class with the class label as a title.
     """
+    labels = np.asarray(labels)
+    if labels.ndim > 1:
+        labels = labels.argmax(axis=1)  # collapse multi-label to a single index
+
     unique_labels = np.unique(labels)
     fig, axes = plt.subplots(len(unique_labels), num_images,
                       figsize=(num_images * 3, len(unique_labels) * 3))

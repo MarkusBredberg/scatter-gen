@@ -1,1 +1,0 @@
-from .cloud_net_model import model_arch as CloudNet

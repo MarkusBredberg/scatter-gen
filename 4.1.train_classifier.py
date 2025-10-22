@@ -1,36 +1,24 @@
-import numpy as np
-import torch, math, time, random
-import torch.nn as nn
-from torch.utils.data import TensorDataset, DataLoader, Subset, Dataset
-from torchsummary import summary
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score 
-from utils.data_loader import load_galaxies, load_halos_and_relics, get_classes, get_synthetic, augment_images, apply_formatting
-import torch.nn.functional as F
+import os, re, time, random, pickle, hashlib, itertools, torch
+from utils.data_loader import load_galaxies, get_classes, get_synthetic, augment_images
 from utils.classifiers import RustigeClassifier, TinyCNN, MLPClassifier, SCNN, CNNSqueezeNet, ScatterResNet, DANNClassifier, BinaryClassifier, ScatterSqueezeNet, ScatterSqueezeNet2, DualCNNSqueezeNet
 from utils.training_tools import EarlyStopping, reset_weights
 from utils.calc_tools import cluster_metrics, normalise_images, check_tensor, fold_T_axis, compute_scattering_coeffs, custom_collate
 from utils.plotting import plot_histograms, plot_images_by_class, plot_image_grid, plot_background_histogram
-from torchvision.utils import make_grid, save_image
-from kymatio.torch import Scattering2D
-from scipy.ndimage import gaussian_filter
-from collections import defaultdict, Counter
-from astropy.io import fits
-from astropy.convolution import convolve_fft, Gaussian2DKernel
-from functools import lru_cache
-import pandas as pd
-import pickle
-from tqdm import tqdm
+import numpy as np
+import torch.nn as nn
+import torch.nn.functional as F
 from torch.optim import AdamW
-import hashlib
-import itertools
-from itertools import product
-from sklearn.metrics import confusion_matrix
-import seaborn as sns
-import matplotlib 
+from torch.utils.data import TensorDataset, DataLoader, Subset
+from torchsummary import summary
+from kymatio.torch import Scattering2D
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+import pandas as pd
+from tqdm import tqdm
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import sys, os, glob, re
 
-SEED = 42  # Set a seed for reproducibility
+SEED = 41  # Set a seed for reproducibility # Original: 42
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -42,22 +30,15 @@ def set_seed(seed):
 
 set_seed(SEED)
 
-os.makedirs('./classifier/trained_models', exist_ok=True)
-os.makedirs('./classifier/trained_models_filtered', exist_ok=True)
-matplotlib.use('Agg')
-tqdm.pandas(disable=True)
-
 print("Running script 4.1 Latest version with seed", SEED)
 
-#Update the classifiers so that they are okay for just two classes
 #EDIT: Allow for max_num_galaxies as None
 
 ###############################################
 ################ CONFIGURATION ################
 ###############################################
 
-classes = get_classes()
-galaxy_classes = [50, 51]  # Classes to classify
+galaxy_classes = [52, 53]  # Classes to classify
 max_num_galaxies = 1000000  # Upper limit for the all-classes combined training data before classical augmentation
 dataset_portions = [1]  # Portions of complete dataset for the accuracy vs dataset size
 J, L, order = 2, 12, 2  # Scatter transform parameters
@@ -66,44 +47,37 @@ classifier = ["TinyCNN", # Very Simple CNN
               "SCNN", # Simple CNN similar to Rustige's
               "CNNSqueezeNet", # SCNN with Squeeze-and-Excitation blocks
               "DualCNNSqueezeNet", # Dual CNN with Squeeze-and-Excitation blocks
-              "CloudNet", # From https://github.com/SorourMo/Cloud-Net-A-semantic-segmentation-CNN-for-cloud-detection/tree/master
               "DANN", # Domain-Adversarial Neural Network
               "ScatterNet", "ScatterSqueezeNet", "ScatterSqueezeNet2",
               "Binary", "ScatterResNet"][-4]
 gen_model_names = ['DDPM'] #['ST', 'DDPM', 'wGAN', 'GAN', 'Dual', 'CNN', 'STMLP', 'lavgSTMLP', 'ldiffSTMLP'] # Specify the generative model_name
 num_epochs_cuda = 200
 num_epochs_cpu = 100
-learning_rates = [1e-3]  # Learning rates
+learning_rates = [1e-3]  # Learning rates done 
 regularization_params = [1e-3]  # Regularisation parameters
-label_smoothing = 0.1  # Label smoothing for the classifier
+label_smoothing = 0.2  # Label smoothing for the classifier
 num_experiments = 100
 folds = [5] # 0-4 for 5-fold cross validation, 5 for only one training
 lambda_values = [0]  # Ratio between generated images and original images per class. 8 is reserfved for TRAINONGENERATED
 percentile_lo = 30 # Percentile stretch lower bound
 percentile_hi = 99  # Percentile stretch upper bound
-versions = ['raw']  # any mix of loadable and runtime-tapered planes. 'rt50' or 'rt100' for tapering. Square brackets for stacking
+versions = ['RAW']  # any mix of loadable and runtime-tapered planes. 'rt50' or 'rt100' for tapering. Square brackets for stacking
 
 STRETCH = True  # Arcsinh stretch
 USE_GLOBAL_NORMALISATION = False           # single on/off switch . False - image-by-image normalisation 
-GLOBAL_NORM_MODE = "percentile"           # "percentile" or "flux". Becomes "none" if USE_GLOBAL_NORMALISATION is False
-ES, patience = True, 10  # Use early stopping
-SCHEDULER = False  # Use a learning rate scheduler
-SHOWIMGS = True  # Show some generated images for each class (Tool for control)
-
+GLOBAL_NORM_MODE = "percentile"           # "percentile" or "flux". Becomes "none" if USE_GLOBAL_NORMALISATION is 
 NORMALISEIMGS = True  # Globally normalise images to [0, 1]
 NORMALISEIMGSTOPM = False  # Globally normalise images to [-1, 1] 
 NORMALISESCS = False  # Normalise scattering coefficients to [0, 1]
 NORMALISESCSTOPM = False  # Normalise scattering coefficients to [-1, 1]
-
-USE_CLASS_WEIGHTS = True  # Set to False to disable class weights
-TRAINONGENERATED = False  # Use generated data as testdata
 FILTERED = True  # Remove in training, validation and test data for the classifier
 FILTERGEN = False  # Remove generated images that are too similar to other generated images
-
-HISTOGRAMMATCHING = False  # Histogram matching for generated images
+USE_CLASS_WEIGHTS = True  # Set to False to disable class weights
+TRAINONGENERATED = False  # Use generated data as testdata
+ES, patience = True, 10  # Use early stopping
+SCHEDULER = False  # Use a learning rate scheduler
+SHOWIMGS = True  # Show some generated images for each class (Tool for control)
 USE_MEMMAP = False  # Use memmap for scattering coefficients
-SIGMACLIPPONDDPM = False  # Apply sigma clipping to DDPM data
-
 
 # -------------------------- GAN CONFIGURATION --------------------------
 gan_epoch = 5000           # e.g., epoch number to load from
@@ -120,7 +94,6 @@ gan_lambda_div = 0
 gan_type = ['Simple', 'Advanced'][0]
 gan_data_version = 'clean' if FILTERED else 'full'  # 'full' or 'clean'
 
-
 # ---------------------------- VAE CONFIGURATION -----------------------------
 VAE_train_size = 1101128
 forbidden_classes = 12  # Generated bent sources look awful
@@ -128,6 +101,9 @@ forbidden_classes = 12  # Generated bent sources look awful
 #####################################################################################
 ########################### AUTOMATIC CONFIGURATION #################################
 #####################################################################################
+
+os.makedirs('./classifier/trained_models', exist_ok=True)
+os.makedirs('./classifier/trained_models_filtered', exist_ok=True)
     
 if any (cls in galaxy_classes for cls in [10, 11, 12, 13]):
     crop_size = (128, 128)  # Crop size for the images
@@ -158,59 +134,6 @@ else:
     DEVICE = "cpu"
     num_epochs = num_epochs_cpu
 print(f"{DEVICE.upper()} is available. Setting epochs to {num_epochs}.")
-ARCSEC = np.deg2rad(1/3600.0)
-PSZ2_ROOT = "/users/mbredber/scratch/data/PSZ2"  # FITS root used below
-
-# parse versions
-def _split_versions(v):
-    # Accept scalars, lists, tuples, and nested combos. Return (load, gen).
-    if not isinstance(v, (list, tuple)):
-        v = [v]
-    flat = []
-    for x in v:
-        if isinstance(x, (list, tuple)):
-            flat.extend(x)
-        else:
-            flat.append(x)
-    flat = [str(x).strip().lower() for x in flat]
-
-    load, gen = [], []
-    for x in flat:
-        m = re.fullmatch(r'rt(\d+)(?:kpc)?', x)
-        if m:
-            gen.append(f"rt{m.group(1)}")
-        else:
-            load.append(x)
-    return load, gen
-
-_load_versions, _gen_versions = _split_versions(versions)
-
-# NEW: align RTxx exactly to the fixed uv–tapered set Txxkpc by using that
-# set as the *loader anchor* (so filenames match 1:1).
-ALIGN_RT_WITH_FIXED = True
-if ALIGN_RT_WITH_FIXED and _gen_versions and not _load_versions:
-    # e.g. ['rt25'] -> ['T25kpc']
-    def _rt_to_fixed(g):
-        m = re.fullmatch(r'rt(\d+)', g)
-        return f"T{m.group(1)}kpc" if m else None
-    fixed = [_rt_to_fixed(g) for g in _gen_versions if _rt_to_fixed(g)]
-    _versions_to_load = [fixed[0]] if fixed else ['raw']
-else:
-    _versions_to_load = _load_versions if _load_versions else ['raw']
-
-print(f"_versions_to_load={_versions_to_load}, _gen_versions={_gen_versions}")
-
-def _is_fixed_anchor(vlist):
-    vlist = [str(v).lower() for v in vlist]
-    return any(v.startswith("t") and v.endswith("kpc") for v in vlist)
-
-FIXED_ANCHOR = _is_fixed_anchor(_versions_to_load)
-
-REPLACE_WITH_RT = (
-    (isinstance(versions, str) and versions.lower().startswith('rt')) or
-    (isinstance(versions, (list, tuple)) and len(versions) == 1
-    and isinstance(versions[0], str) and versions[0].lower().startswith('rt'))
-)
 
 if set(galaxy_classes) & {18} or set(galaxy_classes) & {19}:
     galaxy_classes = [20, 21, 21, 22, 23, 24, 25, 26, 27, 28, 29]  # Include all digits if 18 or 19 is in target_classes
@@ -220,6 +143,8 @@ num_classes = len(galaxy_classes)
 
 # —— MULTI-LABEL SWITCH for RH/RR ——
 if galaxy_classes == [52, 53]:
+    from utils.data_loader import load_halos_and_relics
+    import seaborn as sns
     MULTILABEL = True            # predict RH and RR independently
     LABEL_INDEX = {"RH": 0, "RR": 1}
     THRESHOLD = 0.5
@@ -227,14 +152,17 @@ else:
     MULTILABEL = False
 
 _loader = load_halos_and_relics if galaxy_classes == [52, 53] else load_galaxies
-
 BALANCE = True if galaxy_classes == [52, 53] else False  # Balance the dataset by undersampling the majority class
 EXTRAVARS = False  # Use extra features (redshift, mass, size) for the classifier. Will automatically be true if test_meta is not None.
-LATE_AUG = bool(_gen_versions) # True if any(v.startswith('rt') for v in _gen_versions)
-PRINTFILENAMES = bool(_gen_versions)
-if not USE_GLOBAL_NORMALISATION:
-    GLOBAL_NORM_MODE = "none"
+LATE_AUG =  True if any(v.startswith('rt') for v in versions) else False  # Apply augmentations after tapering
+PRINTFILENAMES = True if any(v.startswith('rt') for v in versions) else False  # Print filenames if rt versions are used
+GLOBAL_NORM_MODE = "none" if not USE_GLOBAL_NORMALISATION else GLOBAL_NORM_MODE
     
+if EXTRAVARS:
+    try:
+        from utils.classifiers import MetaWrapper  # only used if EXTRAVARS=True
+    except Exception:
+        MetaWrapper = None
 
 def _verkey(v):
     if isinstance(v, (list, tuple)):
@@ -250,300 +178,8 @@ def as_index_labels(y: torch.Tensor) -> torch.Tensor:
     # returns 1-D class indices regardless of encoding
     return y.argmax(dim=1) if y.ndim > 1 else y
 
-def _synthetic_taper_header(raw_hdr, t25_hdr, t50_hdr, t100_hdr, desired_kpc):
-    """
-    Build a minimal 'target header' dict with BMAJ/BMIN/BPA (deg) for an
-    arbitrary desired_kpc. We calibrate kpc/arcsec from any of the available
-    T25/T50/T100 headers (preferring T50, then T100, then T25).
-    The target beam is circular and never sharper than RAW.
-    """
-    # choose a calibrator in priority order
-    k_cal, hdr_cal = None, None
-    if t50_hdr is not None:
-        k_cal, hdr_cal = 50.0, t50_hdr
-    elif t100_hdr is not None:
-        k_cal, hdr_cal = 100.0, t100_hdr
-    elif t25_hdr is not None:
-        k_cal, hdr_cal = 25.0, t25_hdr
-    else:
-        raise RuntimeError("No T25/T50/T100 header available for synthetic taper calibration.")
-
-    # angular size (arcsec) that corresponded to the calibrator kpc
-    bmaj_cal_as = float(hdr_cal['BMAJ'] * 3600.0)
-    # kpc per arcsec from the calibrator
-    kpc_per_arcsec = k_cal / bmaj_cal_as
-
-    # desired target FWHM in arcsec for desired_kpc
-    theta_des_as = float(desired_kpc) / kpc_per_arcsec
-
-    # do not request a target finer than the raw beam
-    bmaj_raw_as = float(raw_hdr['BMAJ'] * 3600.0)
-    bmin_raw_as = float(raw_hdr['BMIN'] * 3600.0)
-    theta_des_as = max(theta_des_as, max(bmaj_raw_as, bmin_raw_as))
-
-    # make a circular target beam at theta_des_as
-    bmaj_deg = theta_des_as / 3600.0
-    bmin_deg = theta_des_as / 3600.0
-    bpa_deg  = float(raw_hdr.get('BPA', 0.0))  # arbitrary if circular
-
-    return {'BMAJ': bmaj_deg, 'BMIN': bmin_deg, 'BPA': bpa_deg}
-
-
-
-def _append_rt_versions(imgs, fns, gen_versions, labels=None):
-    """
-    Append runtime-tapered planes to the loaded images and drop samples
-    that are missing any requested taper.
-
-    Inputs
-    ------
-    imgs: torch.Tensor [B, 1, H, W]
-    fns:  list[str] length B
-    gen_versions: e.g. ['rt50'] or ['rt50','rt100']
-    labels: optional torch.Tensor [B] (kept in sync if provided)
-
-    Returns
-    -------
-    imgs_out:   [B_kept, 1+len(gen_versions), H, W]
-    labels_out: [B_kept] or None if labels=None
-    fns_out:    list[str] of length B_kept
-    info:       dict with removal counts
-    """
-    if isinstance(gen_versions, (str,)):
-        gen_versions = [gen_versions]
-    gen_versions = [str(gv).lower() for gv in gen_versions]
-    assert imgs.dim() == 4 and imgs.size(1) == 1, "Expecting [B,1,H,W] images before appending"
-
-    B, _, H, W = imgs.shape
-    fns_str = list(map(str, fns))
-
-    # Call the taper once per version; record which filenames survived and the plane per file.
-    kept_sets = {}
-    planes_by_fn = {}
-    removed_by_version = {}
-
-    for gv in gen_versions:
-        tapered, keep_mask, kept_fns, skipped = apply_taper_to_tensor(
-            imgs, gv, filenames=fns_str,
-            crop_size=crop_size,
-            downsample_size=downsample_size,
-            percentile_lo=percentile_lo, percentile_hi=percentile_hi,
-            do_stretch=STRETCH, require_fixed_header=FIXED_ANCHOR
-        )
-        kept_sets[gv] = set(kept_fns)
-        removed_by_version[gv] = len(skipped)
-
-        # Map filename -> tapered plane tensor [1,H,W]
-        planes_by_fn[gv] = {fn: tapered[i] for i, fn in enumerate(kept_fns)}
-
-    # Keep only samples that have *all* requested versions
-    if gen_versions:
-        keep_fns = [fn for fn in fns_str if all(fn in kept_sets[gv] for gv in gen_versions)]
-    else:
-        keep_fns = fns_str[:]  # nothing to filter
-
-    # Indices in the original order
-    keep_idx = [i for i, fn in enumerate(fns_str) if fn in keep_fns]
-    removed_total = B - len(keep_idx)
-
-    # Filter base images/labels/fns
-    imgs_kept = imgs[keep_idx]
-    labels_kept = labels[keep_idx] if labels is not None else None
-    fns_kept = [fns[i] for i in keep_idx]
-
-    # Gather tapered planes in the same order as fns_kept
-    extra_planes = []
-    for gv in gen_versions:
-        if len(keep_fns) == 0:
-            # preserve shape/device/dtype even if empty
-            plane_stack = torch.empty((0, 1, H, W), device=imgs.device, dtype=imgs.dtype)
-        else:
-            # stack [B_kept, 1, H, W] in filename order
-            plane_stack = torch.stack([planes_by_fn[gv][str(fn)] for fn in fns_kept], dim=0)
-            plane_stack = plane_stack.to(device=imgs_kept.device, dtype=imgs_kept.dtype)
-        extra_planes.append(plane_stack)
-
-    # Concatenate base + all tapered planes along channel dim
-    planes = [imgs_kept] + extra_planes
-    imgs_out = torch.cat(planes, dim=1) if planes else imgs_kept
-
-    info = {
-        "initial": B,
-        "kept": len(keep_idx),
-        "removed_total": removed_total,
-        "removed_by_version": removed_by_version
-    }
-
-    # Human-readable log
-    if gen_versions:
-        per_ver = ", ".join(f"{gv}:{removed_by_version.get(gv,0)}" for gv in gen_versions)
-        print(f"[rt-append] Removed {removed_total} / {B} due to missing tapers "
-              f"(per-version: {per_ver}). Kept {len(keep_idx)}.")
-    else:
-        print(f"[rt-append] No taper versions requested. Kept all {B} samples.")
-
-    return imgs_out, labels_kept, fns_kept, info
-
-def _first(pattern: str):
-    hits = sorted(glob.glob(pattern))
-    return hits[0] if hits else None
-
-# After you get tapered images back:
-def bg_sigma(t):
-    m = _background_ring_mask(t.shape[-2], t.shape[-1], inner=64)
-    return _robust_sigma(t.squeeze(1)[..., m])  # [B] robust σ
-
-
-def _pixscale_arcsec(hdr):
-    if 'CDELT1' in hdr:  # deg/pix
-        return abs(hdr['CDELT1']) * 3600.0
-    cd11 = hdr.get('CD1_1'); cd12 = hdr.get('CD1_2', 0.0)
-    if cd11 is not None:
-        return float(np.hypot(cd11, cd12)) * 3600.0
-    raise KeyError("No CDELT* or CD* keywords in FITS header")
-
-def fwhm_to_sigma_rad(fwhm_arcsec):
-    return (fwhm_arcsec*ARCSEC) / (2*np.sqrt(2*np.log(2)))
-
-def _cov_from_beam(bmaj_as, bmin_as, pa_deg):
-    sx = fwhm_to_sigma_rad(bmaj_as)   # radians
-    sy = fwhm_to_sigma_rad(bmin_as)
-    th = np.deg2rad(pa_deg)
-    R = np.array([[np.cos(th), -np.sin(th)],
-                  [np.sin(th),  np.cos(th)]], dtype=float)
-    S = np.diag([sx*sx, sy*sy])
-    return R @ S @ R.T
-
-def _kernel_from_headers(raw_hdr, targ_hdr, _pixscale_arcsec_unused=None):
-    """
-    Build the Gaussian2DKernel that converts the RAW beam into the TARGET beam,
-    using the full WCS CD/PC matrix (handles rotation & anisotropy). Returns
-    None if no additional blur is needed.
-    """
-    if targ_hdr is None:
-        return None
-
-    def _beam_cov_matrix(bmaj_as, bmin_as, pa_deg):
-        ARCSEC = np.deg2rad(1/3600.0)
-        sx = (bmaj_as*ARCSEC) / (2*np.sqrt(2*np.log(2)))
-        sy = (bmin_as*ARCSEC) / (2*np.sqrt(2*np.log(2)))
-        th = np.deg2rad(pa_deg)
-        R = np.array([[np.cos(th), -np.sin(th)],
-                      [np.sin(th),  np.cos(th)]], dtype=float)
-        S = np.diag([sx*sx, sy*sy])
-        return R @ S @ R.T
-
-    def _cd_matrix_rad(hdr):
-        # Return 2×2 CD in radians per pixel (supports CD or PC+CDELT)
-        if 'CD1_1' in hdr:
-            CD = np.array([[hdr['CD1_1'], hdr.get('CD1_2', 0.0)],
-                           [hdr.get('CD2_1', 0.0), hdr['CD2_2']]], dtype=float)
-        else:
-            pc11 = hdr.get('PC1_1', 1.0); pc12 = hdr.get('PC1_2', 0.0)
-            pc21 = hdr.get('PC2_1', 0.0); pc22 = hdr.get('PC2_2', 1.0)
-            cdelt1 = hdr.get('CDELT1', 1.0); cdelt2 = hdr.get('CDELT2', 1.0)
-            CD = np.array([[pc11, pc12],[pc21, pc22]], dtype=float) @ np.diag([cdelt1, cdelt2])
-        return CD * (np.pi/180.0)
-
-    # Beams in arcsec (+ PA in deg)
-    bmaj_r = float(raw_hdr['BMAJ'])*3600.0
-    bmin_r = float(raw_hdr['BMIN'])*3600.0
-    pa_r   = float(raw_hdr.get('BPA', 0.0))
-
-    bmaj_t = float(targ_hdr['BMAJ'])*3600.0
-    bmin_t = float(targ_hdr['BMIN'])*3600.0
-    pa_t   = float(targ_hdr.get('BPA', pa_r))
-
-    # Covariances in radians^2 (world coords)
-    C_raw = _beam_cov_matrix(bmaj_r, bmin_r, pa_r)
-    C_tgt = _beam_cov_matrix(bmaj_t, bmin_t, pa_t)
-
-    # Desired kernel covariance: C_ker = C_tgt - C_raw
-    C_ker = C_tgt - C_raw
-    w, V = np.linalg.eigh(C_ker)
-    w = np.clip(w, 0.0, None)        # numerical guard
-    C_ker = (V * w) @ V.T
-    if not np.any(w > 0):
-        return None  # nothing to blur
-
-    # Transform to pixel coords on the RAW grid: C_pix = J^{-1} C_ker J^{-T}
-    J = _cd_matrix_rad(raw_hdr)
-    Jinv = np.linalg.inv(J)
-    C_pix = Jinv @ C_ker @ Jinv.T
-
-    # Eigen-decompose in pixels
-    w_pix, V_pix = np.linalg.eigh(C_pix)
-    w_pix = np.clip(w_pix, 0.0, None)
-    if not np.any(w_pix > 0):
-        return None
-    sx_pix = float(np.sqrt(w_pix[1]))  # major
-    sy_pix = float(np.sqrt(w_pix[0]))  # minor
-    theta  = float(np.arctan2(V_pix[1,1], V_pix[0,1]))
-
-    if sx_pix == 0.0 and sy_pix == 0.0:
-        return None
-
-    return Gaussian2DKernel(x_stddev=sx_pix, y_stddev=sy_pix, theta=theta)
-
-def _beam_solid_angle_sr(hdr):
-    """Gaussian beam solid angle in steradians; BMAJ/BMIN in degrees."""
-    bmaj = float(hdr['BMAJ']) * (np.pi/180.0)
-    bmin = float(hdr['BMIN']) * (np.pi/180.0)
-    return (np.pi / (4.0*np.log(2.0))) * bmaj * bmin
-
-
-@lru_cache(maxsize=None)
-def _headers_for_name(base_name: str):
-    """
-    Return (raw_hdr, t25_hdr, t50_hdr, t100_hdr, pix_native_arcsec, raw_fits_path)
-    """
-    base_dir = _first(f"{PSZ2_ROOT}/fits/{base_name}*") or f"{PSZ2_ROOT}/fits/{base_name}"
-    raw_path = _first(f"{base_dir}/{os.path.basename(base_dir)}.fits") \
-            or _first(f"{base_dir}/{os.path.basename(base_dir)}*.fits")
-    if raw_path is None:
-        raise FileNotFoundError(f"RAW FITS not found under {base_dir}")
-
-    # look beside RAW first
-    t25_path  = _first(f"{base_dir}/{base_name}T25kpc*.fits")
-    t50_path  = _first(f"{base_dir}/{base_name}T50kpc*.fits")
-    t100_path = _first(f"{base_dir}/{base_name}T100kpc*.fits")
-
-    # fallbacks to 'classified' trees
-    if t25_path is None:
-        t25_path = _first(f"{PSZ2_ROOT}/classified/T25kpc/*/{base_name}.fits") or \
-                   _first(f"{PSZ2_ROOT}/classified/T25kpcSUB/*/{base_name}.fits")
-    if t50_path is None:
-        t50_path = _first(f"{PSZ2_ROOT}/classified/T50kpc/*/{base_name}.fits") or \
-                   _first(f"{PSZ2_ROOT}/classified/T50kpcSUB/*/{base_name}.fits")
-    if t100_path is None:
-        t100_path = _first(f"{PSZ2_ROOT}/classified/T100kpc/*/{base_name}.fits") or \
-                    _first(f"{PSZ2_ROOT}/classified/T100kpcSUB/*/{base_name}.fits")
-
-    raw_hdr  = fits.getheader(raw_path)
-    t25_hdr  = fits.getheader(t25_path)  if t25_path  else None
-    t50_hdr  = fits.getheader(t50_path)  if t50_path  else None
-    t100_hdr = fits.getheader(t100_path) if t100_path else None
-    pix_native = _pixscale_arcsec(raw_hdr)
-    return raw_hdr, t25_hdr, t50_hdr, t100_hdr, pix_native, raw_path
-
-
-def plot_raw_vs_fake_taper(raw_imgs, tapered_imgs, filenames, taper_mode,
-                           save_dir="./classifier", max_n=4):
-    n = min(max_n, raw_imgs.size(0), tapered_imgs.size(0), len(filenames))
-    fig, axes = plt.subplots(2, n, figsize=(3*n, 6), constrained_layout=True)
-    for i in range(n):
-        r = raw_imgs[i, 0].detach().cpu().numpy()
-        t = tapered_imgs[i, 0].detach().cpu().numpy()
-        axes[0, i].imshow(r, cmap="viridis", origin="lower", vmin=0, vmax=1)
-        axes[0, i].axis("off"); axes[0, i].set_title(str(filenames[i]), fontsize=8)
-        axes[1, i].imshow(t, cmap="viridis", origin="lower", vmin=0, vmax=1)
-        axes[1, i].axis("off")
-    axes[0, 0].set_ylabel("RAW", fontsize=11)
-    axes[1, 0].set_ylabel("RAW → " + ("50 kpc" if taper_mode=="rt50" else "100 kpc"), fontsize=11)
-    os.makedirs(save_dir, exist_ok=True)
-    out = os.path.join(save_dir, f"raw_vs_{taper_mode}_eval_{n}x2_{raw_imgs.shape[-2]}x{raw_imgs.shape[-1]}.pdf")
-    plt.savefig(out, dpi=150, bbox_inches="tight"); plt.close(fig)
-    print(f"Saved {out}")
+def _as_5d(x):
+    return x if x.dim() == 5 else x.unsqueeze(1)  # [B,1,H,W] -> [B,1,1,H,W]
 
 def permute_like(x, perm):
     if x is None: return None
@@ -574,194 +210,6 @@ def collapse_logits(logits, num_classes, multilabel):
         logits = torch.cat([-logits, logits], dim=1)
     return logits
 
-
-def _maybe_resize_center(img_chw, out_hw):
-    """Center-crop + resize but skips resize if shape already matches (C)."""
-    # img_chw: [1,H,W] torch; out_hw: (Hout, Wout)
-    C, H0, W0 = img_chw.shape
-    Hout, Wout = out_hw
-    # center-crop to requested crop_size (same as your apply_formatting logic)
-    y0, x0 = H0//2, W0//2
-    y1, y2 = y0 - Hout//2, y0 + (Hout - Hout//2)
-    x1, x2 = x0 - Wout//2, x0 + (Wout - Wout//2)
-    y1, y2 = max(0, y1), min(H0, y2)
-    x1, x2 = max(0, x1), min(W0, x2)
-    crop = img_chw[:, y1:y2, x1:x2]
-    if crop.shape[-2:] == (Hout, Wout):
-        return crop
-    return torch.nn.functional.interpolate(
-        crop.unsqueeze(0), size=(Hout, Wout), mode='bilinear', align_corners=False
-    ).squeeze(0)
-    
-
-def _background_ring_mask(h, w, inner=64, pad=8):
-    yy, xx = torch.meshgrid(torch.arange(h), torch.arange(w), indexing='ij')
-    cy, cx = h//2, w//2
-    half = inner//2
-    # guard band
-    mask_c = (yy >= cy-(half+pad)) & (yy <= cy+(half+pad)) & (xx >= cx-(half+pad)) & (xx <= cx+(half+pad))
-    return ~mask_c
-
-def _robust_sigma(x2d):
-    x = torch.as_tensor(x2d, dtype=torch.float32)
-    med = x.median()
-    return 1.4826 * (x - med).abs().median()
-
-def build_ref_sigma_map(real_imgs, filenames, inner=64):
-    """Measure background σ on the already-loaded images (top row)."""
-    ref = {}
-    for img, name in zip(real_imgs, filenames):
-        im = torch.as_tensor(img, dtype=torch.float32).squeeze(0)  # [H,W]
-        mask = _background_ring_mask(*im.shape, inner=inner)
-        ref[str(name)] = _robust_sigma(im[mask]).item()
-    return ref
-
-def _per_image_percentile_stretch(x2d, lo=60, hi=95):
-    t = torch.as_tensor(x2d, dtype=torch.float32)
-    pl = torch.quantile(t.reshape(-1), lo/100.0)
-    ph = torch.quantile(t.reshape(-1), hi/100.0)
-    y = (t - pl) / (ph - pl + 1e-6)
-    return y.clamp(0, 1)
-
-def apply_taper_to_tensor(
-    imgs, mode, filenames,
-    crop_size=(1,512,512), downsample_size=(1,128,128),
-    percentile_lo=60, percentile_hi=95,
-    do_stretch=True, use_asinh=True,
-    require_fixed_header=False,
-    ref_sigma_map=None, bg_inner=64,
-    debug_dir=None
-):
-    mode = str(mode).lower()
-    m = re.fullmatch(r'rt(\d+)', mode)
-    want_kpc = int(m.group(1)) if m else None
-    if want_kpc is None:
-        keep_mask = torch.ones(len(filenames), dtype=torch.bool)
-        return (imgs if imgs.dim()==4 else imgs.unsqueeze(1)), keep_mask, list(map(str, filenames)), []
-
-    device = imgs.device if torch.is_tensor(imgs) else torch.device('cpu')
-    dtype  = imgs.dtype  if torch.is_tensor(imgs) else torch.float32
-    Hout, Wout = downsample_size[-2], downsample_size[-1]
-
-    out, kept_fns, kept_flags, skipped = [], [], [], []
-    for base in map(str, filenames):
-        # NOTE: your _headers_for_name returns in this order:
-        raw_hdr, t25_hdr, t50_hdr, t100_hdr, pix_native_as, raw_path = _headers_for_name(base)
-
-        # Choose (or synthesize) the target header
-        if   want_kpc == 25:   targ_hdr = t25_hdr
-        elif want_kpc == 50:   targ_hdr = t50_hdr
-        elif want_kpc == 100:  targ_hdr = t100_hdr
-        else:
-            # Off-grid (e.g. rt60): build a synthetic target by interpolating the beam
-            # between the nearest fixed tapers that exist. Falls back to nearest neighbour.
-            def _interp_hdr(k_lo, h_lo, k_hi, h_hi, k_want):
-                if h_lo is None and h_hi is None:
-                    return None
-                if h_lo is None or h_hi is None:
-                    return (h_lo or h_hi).copy()
-                w = (k_want - k_lo) / float(k_hi - k_lo)
-                out = h_lo.copy()
-                for key in ("BMAJ", "BMIN"):
-                    v_lo = float(h_lo[key])
-                    v_hi = float(h_hi[key])
-                    out[key] = v_lo * (1.0 - w) + v_hi * w
-                # Use BPA from the closer endpoint when available
-                bpa_lo = float(h_lo.get("BPA", h_hi.get("BPA", 0.0)))
-                bpa_hi = float(h_hi.get("BPA", h_lo.get("BPA", 0.0)))
-                out["BPA"] = bpa_lo if (k_want - k_lo) <= (k_hi - k_want) else bpa_hi
-                return out
-
-            if want_kpc < 50:
-                targ_hdr = _interp_hdr(25, t25_hdr, 50, t50_hdr, want_kpc)
-            elif want_kpc < 100:
-                targ_hdr = _interp_hdr(50, t50_hdr, 100, t100_hdr, want_kpc)
-            else:
-                # ≥100 kpc: extrapolate from (50,100) if both exist, else nearest
-                targ_hdr = _interp_hdr(50, t50_hdr, 100, t100_hdr, want_kpc)
-
-        # Try to synthesize a target header if the exact fixed one is missing
-        if targ_hdr is None:
-            try:
-                targ_hdr = _synthetic_taper_header(raw_hdr, t25_hdr, t50_hdr, t100_hdr, want_kpc)
-            except Exception:
-                targ_hdr = None
-
-        # Parity enforcement only when the loader is anchored on a fixed set
-        if require_fixed_header and want_kpc in (25, 50, 100) and targ_hdr is None:
-            skipped.append(base); kept_flags.append(False); continue
-        # Otherwise, at least one fixed header must exist to calibrate; if none exist, skip
-        if (t25_hdr is None) and (t50_hdr is None) and (t100_hdr is None) and targ_hdr is None:
-            skipped.append(base); kept_flags.append(False); continue
-
-        # 1) Load RAW
-        raw_native = np.squeeze(fits.getdata(raw_path)).astype(float)
-        raw_native = np.nan_to_num(raw_native, copy=False)
-
-        # 2) PSF kernel; if it degenerates, skip (no raw-through)
-        ker = _kernel_from_headers(raw_hdr, targ_hdr, pix_native_as)
-        if ker is None:
-            # No extra blur needed — do NOT drop; just use raw map.
-            matched = raw_native.copy()
-        else:
-            matched = convolve_fft(
-                raw_native, ker, boundary='fill', fill_value=np.nan,
-                nan_treatment='interpolate', normalize_kernel=True
-            )
-
-        # Convert Jy/beam_native → Jy/beam_target
-        try:
-            omega_raw = _beam_solid_angle_sr(raw_hdr)
-            omega_tgt = _beam_solid_angle_sr(targ_hdr)
-            matched = matched * (omega_tgt / omega_raw)
-        except Exception:
-            pass
-
-        matched = np.nan_to_num(matched, copy=False)
-
-        # 3) center-crop + resize
-        t = torch.from_numpy(matched).float().unsqueeze(0)
-        formatted = apply_formatting(t, crop_size=(1, crop_size[-2], crop_size[-1]),
-                                     downsample_size=(1, Hout, Wout)).squeeze(0)
-
-        # 4) percentile stretch
-        stretched = _per_image_percentile_stretch(formatted.squeeze(0), percentile_lo, percentile_hi).unsqueeze(0) if do_stretch else formatted
-
-        # 5) asinh
-        if use_asinh:
-            stretched = torch.asinh(10.0 * stretched) / math.asinh(10.0)
-
-        # 6) optional noise-match
-        if ref_sigma_map is not None and base in ref_sigma_map:
-            mask = _background_ring_mask(Hout, Wout, inner=bg_inner)
-            sig_fake = _robust_sigma(stretched.squeeze(0)[mask])
-            sig_want = torch.tensor(ref_sigma_map[base], dtype=stretched.dtype)
-            add = torch.clamp(sig_want - sig_fake, min=0.0)
-            if add > 1e-8:
-                noise = torch.randn_like(stretched)
-                s = stretched.clone()
-                s[:, 0][mask] = (s[:, 0][mask] + noise[:, 0][mask]*add).clamp(0, 1)
-                stretched = s
-
-        out.append(stretched)
-        kept_fns.append(base)
-        kept_flags.append(True)
-
-        if debug_dir:
-            os.makedirs(debug_dir, exist_ok=True)
-            fig, ax = plt.subplots(1,2, figsize=(6,3))
-            ax[0].imshow(formatted.squeeze(0), cmap='viridis', origin='lower'); ax[0].axis('off'); ax[0].set_title('PSF-matched')
-            ax[1].imshow(stretched.squeeze(0), cmap='viridis', origin='lower'); ax[1].axis('off'); ax[1].set_title('final')
-            fig.suptitle(base); fig.tight_layout()
-            fig.savefig(os.path.join(debug_dir, f"{base}_rt{want_kpc}.pdf"), dpi=140)
-            plt.close(fig)
-
-    keep_mask = torch.tensor(kept_flags, dtype=torch.bool)
-    out = torch.stack(out, dim=0).to(device=device, dtype=dtype) if out else torch.empty((0,1,Hout,Wout), device=device, dtype=dtype)
-    return out, keep_mask, kept_fns, skipped
-
-
-
 def replicate_list(x, n):
     return [v for v in x for _ in range(int(n))]
 
@@ -785,35 +233,23 @@ def late_augment(images, labels, filenames=None, *, st_aug=False):
     return imgs_aug, labels_aug, filenames
 
 
-
 ###############################################
 ########### DATA STORING FUNCTIONS ###############
 ###############################################
-
 
 def initialize_metrics(metrics,
                     model_name, subset_size, fold, experiment,
                     lr, reg, lam,
                     crop, down, ver):
-    # make a short stable string for each hyperparam
     cs = f"{crop[0]}x{crop[1]}"
     ds = f"{down[0]}x{down[1]}"
     key_base = (
-    f"{model_name}"
-    f"_ss{subset_size}"
-    f"_f{fold}"
-    f"_lr{lr}"
-    f"_reg{reg}"
-    f"_lam{lam}"
-    f"_cs{cs}"
-    f"_ds{ds}"
-    f"_ver{ver}"
+        f"{model_name}_ss{subset_size}_f{fold}_lr{lr}_reg{reg}_lam{lam}_cs{cs}_ds{ds}_ver{ver}"
     )
     metrics.setdefault(f"{key_base}_accuracy", [])
     metrics.setdefault(f"{key_base}_precision", [])
     metrics.setdefault(f"{key_base}_recall", [])
     metrics.setdefault(f"{key_base}_f1_score", [])
-    metrics[f"{key_base}_f1_score"]   = []
 
 def update_metrics(metrics,
                 model_name, subset_size, fold, experiment,
@@ -903,7 +339,7 @@ for gen_model_name in gen_model_names:
     vae_latent_dim = 64
     
     _out  = load_galaxies(galaxy_classes=galaxy_classes,
-                versions=_versions_to_load or ['raw'], 
+                versions=versions, 
                 fold=max(folds), #Any fold other than 5 gives me the test data for the five fold cross validation
                 crop_size=crop_size,
                 downsample_size=downsample_size,
@@ -929,6 +365,7 @@ for gen_model_name in gen_model_names:
     elif len(_out) == 6:
         train_images, train_labels, test_images, test_labels, train_fns, test_fns = _out
         test_images, test_labels, test_fns = shuffle_with_filenames(test_images, test_labels, test_fns)
+
     else:
         raise ValueError(f"load_galaxies returned {len(_out)} values, expected 4 or 6")
 
@@ -937,39 +374,17 @@ for gen_model_name in gen_model_names:
     if not MULTILABEL:
         unique_labels, counts = torch.unique(as_index_labels(test_labels), return_counts=True)
 
-
-    # --- PSF matching for the test/eval set only (RAW → 50/100) ---
-    if _gen_versions:
-        if test_fns is None:
-            raise RuntimeError("versions includes rt*, but filenames were not returned. Set PRINTFILENAMES=True.")
-        test_images, test_labels, test_fns, info_test = _append_rt_versions(test_images, test_fns, _gen_versions, labels=test_labels)
-        print(f"[TEST] dropped {info_test['removed_total']} (kept {info_test['kept']}/{info_test['initial']})")
-        if FIXED_ANCHOR and info_test['removed_total'] != 0:
-            raise AssertionError(
-                       f"RT alignment error (TEST): expected 0 drops with {_versions_to_load} "
-                       f"as anchor, but dropped {info_test['removed_total']} out of {info_test['initial']}."
-                   )
-        elif info_test['removed_total'] != 0:
-            print(f"[TEST][warn] dropped {info_test['removed_total']} because no T* header; continuing (RAW anchor).")
-
-        if REPLACE_WITH_RT:
-            test_images = test_images[:, 1:2]  # keep only the runtime-tapered plane
-            print(f"[TEST] after replacing with RT: {test_images.size(0)} images")
-
-        if LATE_AUG:
-            test_images, test_labels, test_fns = late_augment(test_images, test_labels, test_fns)
-            print(f"[TEST] after late augmentation: {test_images.size(0)} images")
-
-
     # ——— Data sanity checks ———
     for i, cls in enumerate(galaxy_classes):
-        cls_mask = (train_labels == i)
-        cls_images = train_images[cls_mask]
-        check_tensor(f"Train images for class {cls} (idx={i})", cls_images)
-        cls_mask = (test_labels == i)
-        cls_images = test_images[cls_mask]
-        check_tensor(f"Test images for class {cls} (idx={i})", cls_images)
+        if MULTILABEL:
+            train_mask = train_labels[:, i] > 0.5
+            test_mask  = test_labels[:,  i] > 0.5
+        else:
+            train_mask = as_index_labels(train_labels) == i
+            test_mask  = as_index_labels(test_labels)  == i
 
+        check_tensor(f"Train images for class {cls} (idx={i})", train_images[train_mask])
+        check_tensor(f"Test images for class {cls} (idx={i})",  test_images[test_mask])
 
     def img_hash(img: torch.Tensor) -> str:
         # ensure CPU & contiguous
@@ -1013,12 +428,11 @@ for gen_model_name in gen_model_names:
     else:
         if test_images.dim() == 5:
             test_images = fold_T_axis(test_images)  # [B,T,1,H,W] -> [B,T,H,W]
-        mock_tensor = torch.zeros_like(test_images)
         assert test_images.dim() == 4, f"test_images should be [B,C,H,W], got {tuple(test_images.shape)}"
         test_dataset = TensorDataset(test_images, mock_tensor, test_labels)
 
                             
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=custom_collate, drop_last=False)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=0, collate_fn=custom_collate, drop_last=False)
 
     ###############################################
     ########### LOOP OVER DATA FOLD ###############
@@ -1041,37 +455,42 @@ for gen_model_name in gen_model_names:
             train_labels = torch.empty((0,), dtype=torch.long, device=DEVICE)
             _out = load_galaxies(
                 galaxy_classes=galaxy_classes,
-                versions=_versions_to_load or ['raw'],
+                versions=versions,
                 fold=fold,
                 crop_size=crop_size,
                 downsample_size=downsample_size,
                 sample_size=max_num_galaxies,
                 REMOVEOUTLIERS=FILTERED,
-                BALANCE=BALANCE,           # Reduce the larger classes to the size of the smallest class
-                AUGMENT=False,   
+                BALANCE=BALANCE,
+                AUGMENT=False,
                 NORMALISE=NORMALISEIMGS,
                 NORMALISETOPM=NORMALISEIMGSTOPM,
                 USE_GLOBAL_NORMALISATION=USE_GLOBAL_NORMALISATION,
                 GLOBAL_NORM_MODE=GLOBAL_NORM_MODE,
-                train=True)
-            
+                train=True,
+                PRINTFILENAMES=PRINTFILENAMES,
+            )
+
             if len(_out) == 4:
                 _, _, valid_images, valid_labels = _out
-                valid_data = None
+                train_fns = valid_fns = None
             elif len(_out) == 6:
-                _, _, valid_images, valid_labels, _, valid_data = _out
+                _, _, valid_images, valid_labels, train_fns, valid_fns = _out
+            else:
+                raise ValueError(f"load_galaxies returned {len(_out)} values, expected 4 or 6")
 
             # Relabel and shuffle validation data
-            valid_labels = relabel(valid_labels)  # [0,1,2,...] for classes [50,51,...]
+            valid_labels = relabel(valid_labels)
             perm_valid = torch.randperm(valid_images.size(0))
             valid_images, valid_labels = valid_images[perm_valid], valid_labels[perm_valid]
-            if PRINTFILENAMES: valid_fns = permute_like(valid_fns, perm_valid)
+            if PRINTFILENAMES and (valid_fns is not None):
+                valid_fns = permute_like(valid_fns, perm_valid)
 
         else:
             # real train + valid
             _out = load_galaxies(
                 galaxy_classes=galaxy_classes,
-                versions=_versions_to_load or ['raw'],
+                versions=versions,
                 fold=max(folds),
                 crop_size=crop_size,
                 downsample_size=downsample_size,
@@ -1104,28 +523,6 @@ for gen_model_name in gen_model_names:
                     train_images, train_labels, valid_images, valid_labels, train_fns, valid_fns = _out
                 else:
                     print("Not implemented extradata yet")
-
-                # --- PSF matching for train/valid when requested ---
-                if _gen_versions:
-                    if train_fns is None or valid_fns is None:
-                        raise RuntimeError("versions includes rt*, but train/valid filenames were not returned.")
-                    
-                    train_images, train_labels, train_fns, info_tr = _append_rt_versions(train_images, train_fns, _gen_versions, labels=train_labels)
-                    valid_images, valid_labels, valid_fns, info_va = _append_rt_versions(valid_images, valid_fns, _gen_versions, labels=valid_labels)
-                    print(f"[TRAIN] dropped {info_tr['removed_total']} (kept {info_tr['kept']}/{info_tr['initial']})")
-                    print(f"[VALID] dropped {info_va['removed_total']} (kept {info_va['kept']}/{info_va['initial']})")
-                    if FIXED_ANCHOR and info_tr['removed_total'] != 0:
-                        raise AssertionError(f"RT alignment error (TRAIN): expected 0 drops with {_versions_to_load} as anchor, but dropped {info_tr['removed_total']} out of {info_tr['initial']}.")
-                    elif info_tr['removed_total'] != 0:
-                        print(f"[TRAIN][warn] dropped {info_tr['removed_total']} (RAW anchor).")
-                    if FIXED_ANCHOR and info_va['removed_total'] != 0:
-                        raise AssertionError(f"RT alignment error (VALID): expected 0 drops with {_versions_to_load} as anchor, but dropped {info_va['removed_total']} out of {info_va['initial']}.")
-                    elif info_va['removed_total'] != 0:
-                        print(f"[VALID][warn] dropped {info_va['removed_total']} (RAW anchor).")
-                    
-                    if REPLACE_WITH_RT:
-                        train_images = train_images[:, 1:2]
-                        valid_images = valid_images[:, 1:2]
                     
                 if LATE_AUG:
                     before = len(train_images)
@@ -1275,11 +672,11 @@ for gen_model_name in gen_model_names:
         if classifier in ['Rustige', 'CNNSqueezeNet', 'SCNN', 'ScatterSqueezeNet', 'ScatterSqueezeNet2', 'Binary']:
             if lambda_generate not in [0, 8]:
                 # 1. concatenate images
-                img_splits = [
-                    pristine_train_images.to(DEVICE),
-                    generated_images.to(DEVICE),
-                    valid_images.to(DEVICE)
-                ]
+                p = _as_5d(pristine_train_images).to(DEVICE)
+                g = _as_5d(generated_images).to(DEVICE)
+                v = _as_5d(valid_images).to(DEVICE)
+
+                img_splits = [p, g, v]
                 img_lengths = [len(t) for t in img_splits]
                 all_images = torch.cat(img_splits, dim=0)
 
@@ -1315,10 +712,10 @@ for gen_model_name in gen_model_names:
 
             else:
                 # same idea if lambda_generate == 0 (i.e. only real train+valid)
-                img_splits = [
-                    train_images.to(DEVICE),
-                    valid_images.to(DEVICE)
-                ]
+                a = _as_5d(train_images).to(DEVICE)
+                b = _as_5d(valid_images).to(DEVICE)
+
+                img_splits = [a, b]
                 img_lengths = [len(t) for t in img_splits]
                 all_images = torch.cat(img_splits, dim=0)
 
@@ -1343,18 +740,32 @@ for gen_model_name in gen_model_names:
         
         # ── SANITY-CHECK PLOTS ON FIRST FOLD ONLY ──
         if fold == folds[0] and SHOWIMGS and downsample_size == (1, 128, 128):
-            
+
+            def _mask_for_class(labels: torch.Tensor, cls_val: int) -> torch.Tensor:
+                """
+                Return a 1-D boolean mask of shape [B] selecting samples of class `cls_val`.
+                In multi-label mode (RH/RR), use the corresponding column; otherwise use indices.
+                """
+                if MULTILABEL:
+                    # Map class value (e.g. 52 or 53) to column 0 (RH) or 1 (RR)
+                    col = 0 if cls_val == galaxy_classes[0] else 1
+                    return labels[:, col] > 0.5
+                else:
+                    return as_index_labels(labels) == (cls_val - min(galaxy_classes))
+
+            def _to_4d(x: torch.Tensor) -> torch.Tensor:
+                # For plotting, make sure images are [N, C, H, W]
+                return fold_T_axis(x) if x.dim() == 5 else x
+
             if len(galaxy_classes) == 2:
-                # Plot histograms for the two classes
-                train_images_cls1 = train_images[train_labels == galaxy_classes[0] - min(galaxy_classes)]
-                train_images_cls2 = train_images[train_labels == galaxy_classes[1] - min(galaxy_classes)]
-                
-                #Make sure the images are not tupples
-                if isinstance(train_images_cls1, tuple):
-                    train_images_cls1 = train_images_cls1[0]
-                if isinstance(train_images_cls2, tuple):
-                    train_images_cls2 = train_images_cls2[0]
-                
+                # Build per-class views
+                train_images_cls1 = _to_4d(train_images[_mask_for_class(train_labels, galaxy_classes[0])])
+                train_images_cls2 = _to_4d(train_images[_mask_for_class(train_labels, galaxy_classes[1])])
+
+                # Make sure the images are not tuples
+                if isinstance(train_images_cls1, tuple): train_images_cls1 = train_images_cls1[0]
+                if isinstance(train_images_cls2, tuple): train_images_cls2 = train_images_cls2[0]
+
                 plot_histograms(
                     train_images_cls1.cpu(),
                     train_images_cls2.cpu(),
@@ -1364,17 +775,17 @@ for gen_model_name in gen_model_names:
                 )
 
                 plot_background_histogram(
-                    train_images_cls1.cpu(),        # shape (936, 1, 128, 128)
-                    train_images_cls2.cpu(),        # shape (720, 1, 128, 128)
+                    train_images_cls1.cpu(),
+                    train_images_cls2.cpu(),
                     img_shape=(1, 128, 128),
                     title="Background histograms",
                     save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_background_hist.pdf"
                 )
 
                 for cls in galaxy_classes:
-                    orig_imgs = train_images[train_labels == (cls - min(galaxy_classes))][:36]
-                    test_imgs = test_images[test_labels == (cls - min(galaxy_classes))][:36]
-                                
+                    orig_imgs = _to_4d(train_images[_mask_for_class(train_labels, cls)])[:36]
+                    test_imgs = _to_4d(test_images[_mask_for_class(test_labels, cls)])[:36]
+
                     plot_image_grid(
                         orig_imgs.cpu(),
                         num_images=36,
@@ -1385,35 +796,29 @@ for gen_model_name in gen_model_names:
                         num_images=36,
                         save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_test_grid.pdf"
                     )
+
+                    # summed-intensity histogram helper unchanged...
                     tag_to_desc = { d["tag"]: d["description"] for d in get_classes() }
-                    
-                    # helper to plot summed‐intensity histogram with dynamic labels
                     def plot_intensity_histogram(tensor1, tensor2, label1, label2, save_path, bins=30):
                         vals1 = tensor1.sum(dim=tuple(range(1, tensor1.ndim))).cpu().numpy()
                         vals2 = tensor2.sum(dim=tuple(range(1, tensor2.ndim))).cpu().numpy()
                         plt.figure(figsize=(10,5))
                         plt.hist(vals1, bins=bins, alpha=0.6, label=label1, color='C1')
                         plt.hist(vals2, bins=bins, alpha=0.6, label=label2, color='C0')
-                        plt.xlabel('Total Intensity')
-                        plt.ylabel('Count')
+                        plt.xlabel('Total Intensity'); plt.ylabel('Count')
                         plt.title(f'Total Intensity per Image: {label1} vs {label2}')
-                        plt.legend()
-                        plt.savefig(save_path)
-                        plt.close()
+                        plt.legend(); plt.savefig(save_path); plt.close()
 
-                    # now call it using your class descriptions
                     plot_intensity_histogram(
                         train_images_cls1.cpu(),
                         train_images_cls2.cpu(),
-                        label1=tag_to_desc[classes[galaxy_classes[0]]['tag']],
-                        label2=tag_to_desc[classes[galaxy_classes[1]]['tag']],
+                        label1=tag_to_desc[get_classes()[galaxy_classes[0]]['tag']],
+                        label2=tag_to_desc[get_classes()[galaxy_classes[1]]['tag']],
                         save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_summed_intensity_histogram.pdf"
                     )
-                    
-        
+
                     if lambda_generate not in [0, 8]:
                         gen_imgs = generated_by_class[cls][:36]
-
                         plot_image_grid(
                             gen_imgs,
                             num_images=36,
@@ -1431,7 +836,9 @@ for gen_model_name in gen_model_names:
                             gen_imgs,
                             img_shape=(1, 128, 128),
                             title="Background histograms",
-                            save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_background_hist.pdf")
+                            save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_background_hist.pdf"
+                        )
+
         
         if MULTILABEL:
             # labels are 2-hot; compute per-label pos_weight for BCE
@@ -1453,9 +860,14 @@ for gen_model_name in gen_model_names:
 
         if fold in [0, 5] and SHOWIMGS:
             imgs = train_images.detach().cpu().numpy()
-            lbls = (train_labels + min(galaxy_classes)).detach().cpu().numpy() # This is to match the original class labels
-            plot_images_by_class(imgs, labels=lbls, num_images=5, save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_example_train_data.pdf")
-        
+            # Make labels 1-D: 0 for first class, 1 for second; then shift to 52/53
+            lbls = (as_index_labels(train_labels) + min(galaxy_classes)).detach().cpu().numpy()
+            plot_images_by_class(
+                imgs,
+                labels=lbls,
+                num_images=5,
+                save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_example_train_data.pdf"
+            )
         # Prepare input data
         mock_tensor = torch.zeros_like(train_images)
         valid_mock_tensor = torch.zeros_like(valid_images)
@@ -1529,8 +941,10 @@ for gen_model_name in gen_model_names:
             train_dataset = TensorDataset(train_images, mock_train, train_labels)
             valid_dataset = TensorDataset(valid_images, mock_valid, valid_labels)
 
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=custom_collate, drop_last=False)
-        valid_loader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=custom_collate, drop_last=False)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, num_workers=0, collate_fn=custom_collate, drop_last=False)
+        valid_loader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=False, num_workers=0, collate_fn=custom_collate, drop_last=False)
+        
+        print("Length of train dataset: ", len(train_dataset))
 
         if SHOWIMGS and lambda_generate not in [0, 8]: 
             if classifier in ['TinyCNN', 'SCNN', 'CNNSqueezeNet', 'Rustige', 'ScatterSqueezeNet', 'ScatterSqueezeNet2', 'Binary']:
@@ -1552,11 +966,6 @@ for gen_model_name in gen_model_names:
             models = {"DualCNNSqueezeNet": {"model": DualCNNSqueezeNet(input_shape=tuple(valid_images.shape[1:]), num_classes=num_classes).to(DEVICE)}}
         elif classifier == "TinyCNN":
             models = {"TinyCNN": {"model": TinyCNN(input_shape=tuple(valid_images.shape[1:]), num_classes=num_classes).to(DEVICE)}} 
-        elif classifier == 'CloudNet':
-            cloud_model = CloudNet()  
-            cloud_model.load_weights(os.path.join(sys.path[0],
-                'Cloud-Net_trained_on_38-Cloud_training_patches.h5'))
-            cloud_model.trainable = True   # now you can fine-tune it on your radio maps
         elif classifier == "DANN":
             models = {"DANN": {"model": DANNClassifier(input_shape=tuple(valid_images.shape[1:]), num_classes=num_classes).to(DEVICE)}}
         elif classifier == "ScatterNet":
@@ -1633,7 +1042,7 @@ for gen_model_name in gen_model_names:
                     subset_indices = torch.randperm(len(train_dataset))[:subset_size].tolist() # Randomly select indices to include generated samples
                     subset_train_dataset = Subset(train_dataset, subset_indices)
                     eff_bs = max(2, min(batch_size, len(subset_train_dataset)))
-                    subset_train_loader = DataLoader(subset_train_dataset, batch_size=eff_bs, shuffle=True, num_workers=0, collate_fn=custom_collate, drop_last=True)
+                    subset_train_loader = DataLoader(subset_train_dataset, batch_size=eff_bs, shuffle=False, num_workers=0, collate_fn=custom_collate, drop_last=True)
 
                     early_stopping = EarlyStopping(patience=patience, verbose=False) if ES else None
 
@@ -1648,7 +1057,12 @@ for gen_model_name in gen_model_names:
                                 meta = meta.to(DEVICE)  # Send metadata to device
                             else:
                                 labels = _rest
-                            images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE) # Send to device
+                            #images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE) # Send to device
+                            images  = images.to(DEVICE, non_blocking=True)
+                            scat    = scat.to(DEVICE, non_blocking=True)
+                            labels  = labels.to(DEVICE, non_blocking=True)
+
+                            
                             optimizer.zero_grad()
                             if classifier == "DANN":
                                 class_logits, domain_logits = model(images, alpha=1.0)
@@ -1666,6 +1080,7 @@ for gen_model_name in gen_model_names:
                             loss = criterion(logits, labels)
 
                             loss.backward()
+                            scheduler.step() if SCHEDULER else None
                             optimizer.step()
                             total_loss += float(loss.item() * images.size(0))
                             total_images += float(images.size(0))
@@ -1688,7 +1103,11 @@ for gen_model_name in gen_model_names:
                                     meta = meta.to(DEVICE)  # Send metadata to device
                                 else:
                                     labels = _rest
-                                images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE)
+                                #images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE)
+                                images  = images.to(DEVICE, non_blocking=True)
+                                scat    = scat.to(DEVICE, non_blocking=True)
+                                labels  = labels.to(DEVICE, non_blocking=True)
+
                                 if classifier == "DANN":
                                     logits, _ = model(images, alpha=1.0)
                                 else:
@@ -1701,10 +1120,10 @@ for gen_model_name in gen_model_names:
 
                                 logits = collapse_logits(logits, num_classes, MULTILABEL)
                                 labels = labels.float() if MULTILABEL else labels.long()
+                                if not MULTILABEL:
+                                    assert labels.dtype == torch.long, f"labels dtype {labels.dtype} must be long"
                                 loss = criterion(logits, labels)
-        
-                                # inside the training loop, just before loss = criterion(outputs, labels)
-                                assert labels.dtype == torch.long, f"labels dtype {labels.dtype} must be long"
+
                                 mn, mx = int(labels.min()), int(labels.max())
                                 assert 0 <= mn and mx < num_classes, f"label range [{mn},{mx}] not in [0,{num_classes-1}]"
 
@@ -1736,7 +1155,11 @@ for gen_model_name in gen_model_names:
                                 meta = meta.to(DEVICE)  # Send metadata to device
                             else:
                                 labels = _rest
-                            images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE)
+                            #images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE)
+                            images  = images.to(DEVICE, non_blocking=True)
+                            scat    = scat.to(DEVICE, non_blocking=True)
+                            labels  = labels.to(DEVICE, non_blocking=True)
+
                             if classifier == "DANN":
                                 logits, _ = model(images, alpha=1.0)
                             else:
@@ -1764,24 +1187,15 @@ for gen_model_name in gen_model_names:
                                 all_pred_labels[key].extend(preds)
                                 all_true_labels[key].extend(trues)
 
-                            
+                            # collect misclassified examples (final experiment only)
                             if SHOWIMGS and experiment == num_experiments - 1:
-                                mask = pred_labels != true_labels
-                                mis_images.append(images.cpu()[mask])
-                                mis_trues .append(true_labels[mask])
-                                mis_preds .append(pred_labels[mask])
-                                
-                                if galaxy_classes == [52, 53]:
-                                    cm = confusion_matrix(all_true_labels[key], all_pred_labels[key], labels=[0,1])
-                                    plt.figure(figsize=(4,4))
-                                    sns.heatmap(cm, annot=True, fmt='d',
-                                                xticklabels=['RH (52)','RR (53)'],
-                                                yticklabels=['RH (52)','RR (53)'])
-                                    plt.xlabel('Predicted')
-                                    plt.ylabel('True')
-                                    plt.title(f'Confusion Matrix — {classifier_name}')
-                                    plt.savefig(f"./{galaxy_classes}_{classifier_name}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_confusion_matrix.pdf", dpi=150)
-                                    plt.close()
+                                wrong_mask = (preds != trues).any(axis=1) if MULTILABEL else (preds != trues)
+                                if np.any(wrong_mask):
+                                    mask_t = torch.as_tensor(wrong_mask, dtype=torch.bool)
+                                    mis_images.append(images.detach().cpu()[mask_t])
+                                    mis_trues.append(trues[wrong_mask])
+                                    mis_preds.append(preds[wrong_mask])
+
 
                         y_true = np.array(all_true_labels[key])
                         y_pred = np.array(all_pred_labels[key])
@@ -1861,13 +1275,16 @@ for gen_model_name in gen_model_names:
             
             generated_features = []
             with torch.no_grad():
-                for images, scat, _ in test_loader:
+                for images, scat, _rest in test_loader:
                     if EXTRAVARS:
                         meta, labels = _rest
-                        meta = meta.to(DEVICE)  # Send metadata to device
                     else:
                         labels = _rest
-                    images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE)
+                    images  = images.to(DEVICE, non_blocking=True)
+                    scat    = scat.to(DEVICE, non_blocking=True)
+                    labels  = labels.to(DEVICE, non_blocking=True)
+                    #images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE)
+
                     if classifier == "DANN":
                         class_logits, _ = model(images, alpha=1.0)
                         outputs = class_logits.cpu().detach().numpy()

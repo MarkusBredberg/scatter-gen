@@ -1,32 +1,33 @@
+import os, sys, time, re, random, itertools, hashlib, pickle
 import numpy as np
-import torch, math, time, random
-import torch.nn as nn
-from torch.utils.data import TensorDataset, DataLoader, Subset, Dataset
-from torchsummary import summary
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score 
-from utils.data_loader2 import load_galaxies, get_classes,  get_synthetic, augment_images, apply_formatting
-from utils.classifiers import RustigeClassifier, TinyCNN, MLPClassifier, SCNN, CNNSqueezeNet, ScatterResNet, DANNClassifier, BinaryClassifier, ScatterSqueezeNet, ScatterSqueezeNet2, DualCNNSqueezeNet
-from utils.training_tools import EarlyStopping, reset_weights
-from utils.calc_tools import cluster_metrics, normalise_images, check_tensor, fold_T_axis, compute_scattering_coeffs, custom_collate
-from utils.plotting import plot_histograms, plot_images_by_class, plot_image_grid, plot_background_histogram
-from torchvision.utils import make_grid, save_image
-from kymatio.torch import Scattering2D
-from scipy.ndimage import gaussian_filter
-from collections import defaultdict, Counter
-from astropy.io import fits
-from astropy.convolution import convolve_fft, Gaussian2DKernel
-from functools import lru_cache
 import pandas as pd
-import pickle
-from tqdm import tqdm
+import torch
+import torch.nn as nn
+from torch.utils.data import TensorDataset, DataLoader, Subset
 from torch.optim import AdamW
-import itertools
-from itertools import product
-from sklearn.metrics import confusion_matrix
-import seaborn as sns
-import matplotlib 
+from torchsummary import summary
+from kymatio.torch import Scattering2D
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
+from tqdm import tqdm
+from utils.data_loader2 import load_galaxies, get_classes, get_synthetic, augment_images
+from utils.classifiers import (
+    RustigeClassifier, TinyCNN, MLPClassifier, SCNN, CNNSqueezeNet,
+    ScatterResNet, DANNClassifier, BinaryClassifier, ScatterSqueezeNet,
+    ScatterSqueezeNet2, DualCNNSqueezeNet
+)
+from utils.training_tools import EarlyStopping, reset_weights
+from utils.calc_tools import (
+    cluster_metrics, normalise_images, check_tensor,
+    fold_T_axis, compute_scattering_coeffs, custom_collate
+)
+from utils.plotting import (
+    plot_histograms, plot_images_by_class, plot_image_grid, plot_background_histogram
+)
+import matplotlib
+matplotlib.use('Agg')  # set backend before importing pyplot
 import matplotlib.pyplot as plt
-import sys, os, glob
+from matplotlib import cm
+import seaborn as sns
 
 SEED = 42  # Set a seed for reproducibility
 def set_seed(seed):
@@ -101,6 +102,8 @@ FILTERGEN = False  # Remove generated images that are too similar to other gener
 HISTOGRAMMATCHING = False  # Histogram matching for generated images
 USE_MEMMAP = False  # Use memmap for scattering coefficients
 SIGMACLIPPONDDPM = False  # Apply sigma clipping to DDPM data
+LATE_AUG = False  # Apply augmentations after PSF matching
+PRINTFILENAMES = False  # Print filenames when loading data
 
 
 # -------------------------- GAN CONFIGURATION --------------------------
@@ -158,10 +161,6 @@ else:
 ARCSEC = np.deg2rad(1/3600.0)
 PSZ2_ROOT = "/users/mbredber/scratch/data/PSZ2"  # FITS root used below
 
-# parse versions
-# add near the imports
-import re
-
 def _split_versions(v):
     v = v if isinstance(v, (list, tuple)) else [v]
     v = [str(x).lower() for x in v]
@@ -173,19 +172,6 @@ def _split_versions(v):
 _load_versions, _gen_versions = _split_versions(versions)
 _versions_to_load = _load_versions if _load_versions else ['raw']   # or ['RAW'] if your loader uses that
 print(f"_versions_to_load={_versions_to_load}, _gen_versions={_gen_versions}")
-
-
-REPLACE_WITH_RT = (
-    (isinstance(versions, str) and versions.lower().startswith('rt')) or
-    (isinstance(versions, (list, tuple)) and len(versions) == 1
-     and isinstance(versions[0], str) and versions[0].lower().startswith('rt'))
-)
-
-
-# drive augmentation/filenames solely from presence of rt*
-LATE_AUG = bool(_gen_versions) # True if any(v.startswith('rt') for v in _gen_versions)
-PRINTFILENAMES = bool(_gen_versions)
-EXTRAVARS = False  # Use extra features (redshift, mass, size) for the classifier. Will automatically be true if test_meta is not None.
 
 if set(galaxy_classes) & {18} or set(galaxy_classes) & {19}:
     galaxy_classes = [20, 21, 21, 22, 23, 24, 25, 26, 27, 28, 29]  # Include all digits if 18 or 19 is in target_classes
@@ -203,250 +189,45 @@ ver_key = _verkey(versions)
 ##################### HELPER FUNCTIONS #################################
 ########################################################################
 
-def _synthetic_taper_header(raw_hdr, t25_hdr, t50_hdr, t100_hdr, desired_kpc):
+def plot_red_histogram(imgs1, imgs2, title1, title2, save_path, bins=50, cmap_name='viridis'):
     """
-    Build a minimal 'target header' dict with BMAJ/BMIN/BPA (deg) for an
-    arbitrary desired_kpc. We calibrate kpc/arcsec from any of the available
-    T25/T50/T100 headers (preferring T50, then T100, then T25).
-    The target beam is circular and never sharper than RAW.
+    Plots a histogram of the RED channel. If images are single-channel,
+    they are first mapped to RGBA via the chosen matplotlib colormap, and
+    the RED component is histogrammed.
+    imgs*: torch tensors shaped [B, C, H, W] with C=1 or C=3.
     """
-    # choose a calibrator in priority order
-    k_cal, hdr_cal = None, None
-    if t50_hdr is not None:
-        k_cal, hdr_cal = 50.0, t50_hdr
-    elif t100_hdr is not None:
-        k_cal, hdr_cal = 100.0, t100_hdr
-    elif t25_hdr is not None:
-        k_cal, hdr_cal = 25.0, t25_hdr
-    else:
-        raise RuntimeError("No T25/T50/T100 header available for synthetic taper calibration.")
+    def _to_red_values(batch):
+        x = batch.detach().cpu()
+        if x.dim() != 4:
+            raise ValueError(f"Expected [B,C,H,W], got {tuple(x.shape)}")
+        # If RGB, take channel 0 directly
+        if x.size(1) == 3:
+            r = x[:, 0]                                   # [B,H,W]
+            return r.reshape(-1).numpy()
+        # If single-channel, normalize per-image and map through colormap → take RED
+        if x.size(1) == 1:
+            x = x[:, 0]                                   # [B,H,W]
+            reds = []
+            cmap = cm.get_cmap(cmap_name)
+            for im in x:
+                im = (im - im.min()) / (im.max() - im.min() + 1e-6)
+                rgba = cmap(im.numpy())                   # [H,W,4]
+                reds.append(rgba[..., 0].reshape(-1))     # RED
+            return np.concatenate(reds, axis=0)
+        raise ValueError(f"Unsupported channel count: {x.size(1)}")
 
-    # angular size (arcsec) that corresponded to the calibrator kpc
-    bmaj_cal_as = float(hdr_cal['BMAJ'] * 3600.0)
-    # kpc per arcsec from the calibrator
-    kpc_per_arcsec = k_cal / bmaj_cal_as
+    r1 = _to_red_values(imgs1)
+    r2 = _to_red_values(imgs2)
 
-    # desired target FWHM in arcsec for desired_kpc
-    theta_des_as = float(desired_kpc) / kpc_per_arcsec
-
-    # do not request a target finer than the raw beam
-    bmaj_raw_as = float(raw_hdr['BMAJ'] * 3600.0)
-    bmin_raw_as = float(raw_hdr['BMIN'] * 3600.0)
-    theta_des_as = max(theta_des_as, max(bmaj_raw_as, bmin_raw_as))
-
-    # make a circular target beam at theta_des_as
-    bmaj_deg = theta_des_as / 3600.0
-    bmin_deg = theta_des_as / 3600.0
-    bpa_deg  = float(raw_hdr.get('BPA', 0.0))  # arbitrary if circular
-
-    return {'BMAJ': bmaj_deg, 'BMIN': bmin_deg, 'BPA': bpa_deg}
-
-
-
-def _append_rt_versions(imgs, fns, gen_versions, labels=None):
-    """
-    Append runtime-tapered planes to the loaded images and drop samples
-    that are missing any requested taper.
-
-    Inputs
-    ------
-    imgs: torch.Tensor [B, 1, H, W]
-    fns:  list[str] length B
-    gen_versions: e.g. ['rt50'] or ['rt50','rt100']
-    labels: optional torch.Tensor [B] (kept in sync if provided)
-
-    Returns
-    -------
-    imgs_out:   [B_kept, 1+len(gen_versions), H, W]
-    labels_out: [B_kept] or None if labels=None
-    fns_out:    list[str] of length B_kept
-    info:       dict with removal counts
-    """
-    if isinstance(gen_versions, (str,)):
-        gen_versions = [gen_versions]
-    gen_versions = [str(gv).lower() for gv in gen_versions]
-    assert imgs.dim() == 4 and imgs.size(1) == 1, "Expecting [B,1,H,W] images before appending"
-
-    B, _, H, W = imgs.shape
-    fns_str = list(map(str, fns))
-
-    # Call the taper once per version; record which filenames survived and the plane per file.
-    kept_sets = {}
-    planes_by_fn = {}
-    removed_by_version = {}
-
-    for gv in gen_versions:
-        tapered, keep_mask, kept_fns, skipped = apply_taper_to_tensor(
-            imgs, gv, filenames=fns_str,
-            crop_size=crop_size,
-            downsample_size=downsample_size,
-            percentile_lo=percentile_lo, percentile_hi=percentile_hi,
-            do_stretch=STRETCH
-        )
-        kept_sets[gv] = set(kept_fns)
-        removed_by_version[gv] = len(skipped)
-
-        # Map filename -> tapered plane tensor [1,H,W]
-        planes_by_fn[gv] = {fn: tapered[i] for i, fn in enumerate(kept_fns)}
-
-    # Keep only samples that have *all* requested versions
-    if gen_versions:
-        keep_fns = [fn for fn in fns_str if all(fn in kept_sets[gv] for gv in gen_versions)]
-    else:
-        keep_fns = fns_str[:]  # nothing to filter
-
-    # Indices in the original order
-    keep_idx = [i for i, fn in enumerate(fns_str) if fn in keep_fns]
-    removed_total = B - len(keep_idx)
-
-    # Filter base images/labels/fns
-    imgs_kept = imgs[keep_idx]
-    labels_kept = labels[keep_idx] if labels is not None else None
-    fns_kept = [fns[i] for i in keep_idx]
-
-    # Gather tapered planes in the same order as fns_kept
-    extra_planes = []
-    for gv in gen_versions:
-        if len(keep_fns) == 0:
-            # preserve shape/device/dtype even if empty
-            plane_stack = torch.empty((0, 1, H, W), device=imgs.device, dtype=imgs.dtype)
-        else:
-            # stack [B_kept, 1, H, W] in filename order
-            plane_stack = torch.stack([planes_by_fn[gv][str(fn)] for fn in fns_kept], dim=0)
-            plane_stack = plane_stack.to(device=imgs_kept.device, dtype=imgs_kept.dtype)
-        extra_planes.append(plane_stack)
-
-    # Concatenate base + all tapered planes along channel dim
-    planes = [imgs_kept] + extra_planes
-    imgs_out = torch.cat(planes, dim=1) if planes else imgs_kept
-
-    info = {
-        "initial": B,
-        "kept": len(keep_idx),
-        "removed_total": removed_total,
-        "removed_by_version": removed_by_version
-    }
-
-    # Human-readable log
-    if gen_versions:
-        per_ver = ", ".join(f"{gv}:{removed_by_version.get(gv,0)}" for gv in gen_versions)
-        print(f"[rt-append] Removed {removed_total} / {B} due to missing tapers "
-              f"(per-version: {per_ver}). Kept {len(keep_idx)}.")
-    else:
-        print(f"[rt-append] No taper versions requested. Kept all {B} samples.")
-
-    return imgs_out, labels_kept, fns_kept, info
-
-
-def _first(pattern: str):
-    hits = sorted(glob.glob(pattern))
-    return hits[0] if hits else None
-
-# After you get tapered images back:
-def bg_sigma(t):
-    m = _background_ring_mask(t.shape[-2], t.shape[-1], inner=64)
-    return _robust_sigma(t.squeeze(1)[..., m])  # [B] robust σ
-
-
-def _pixscale_arcsec(hdr):
-    if 'CDELT1' in hdr:  # deg/pix
-        return abs(hdr['CDELT1']) * 3600.0
-    cd11 = hdr.get('CD1_1'); cd12 = hdr.get('CD1_2', 0.0)
-    if cd11 is not None:
-        return float(np.hypot(cd11, cd12)) * 3600.0
-    raise KeyError("No CDELT* or CD* keywords in FITS header")
-
-def fwhm_to_sigma_rad(fwhm_arcsec):
-    return (fwhm_arcsec*ARCSEC) / (2*np.sqrt(2*np.log(2)))
-
-def _cov_from_beam(bmaj_as, bmin_as, pa_deg):
-    sx = fwhm_to_sigma_rad(bmaj_as)   # radians
-    sy = fwhm_to_sigma_rad(bmin_as)
-    th = np.deg2rad(pa_deg)
-    R = np.array([[np.cos(th), -np.sin(th)],
-                  [np.sin(th),  np.cos(th)]], dtype=float)
-    S = np.diag([sx*sx, sy*sy])
-    return R @ S @ R.T
-
-def _kernel_from_headers(raw_hdr, targ_hdr, pixscale_arcsec):
-    # if target missing or already broader → return delta kernel (no blur)
-    if targ_hdr is None:
-        return None
-    bmaj_r = float(raw_hdr['BMAJ']*3600.0);  bmin_r = float(raw_hdr['BMIN']*3600.0);  pa_r = float(raw_hdr.get('BPA', 0.0))
-    bmaj_t = float(targ_hdr['BMAJ']*3600.0); bmin_t = float(targ_hdr['BMIN']*3600.0); pa_t = float(targ_hdr.get('BPA', pa_r))
-    C_raw = _cov_from_beam(bmaj_r, bmin_r, pa_r)
-    C_tgt = _cov_from_beam(bmaj_t, bmin_t, pa_t)
-    C_ker = C_tgt - C_raw  # in radians^2
-    # clip tiny negatives from numerical roundoff
-    w, V = np.linalg.eigh(C_ker)
-    w = np.clip(w, 0.0, None)
-    C_ker = (V * w) @ V.T
-
-    # convert covariance to **pixels** of the downsampled arrays we operate on
-    pixrad = pixscale_arcsec * ARCSEC
-    C_pix = C_ker / (pixrad**2)
-    w_pix, V_pix = np.linalg.eigh(C_pix)
-    sx_pix = np.sqrt(max(w_pix[1], 0.0))
-    sy_pix = np.sqrt(max(w_pix[0], 0.0))
-    theta  = np.arctan2(V_pix[1,1], V_pix[0,1])  # PA of major axis
-    if sx_pix == 0 and sy_pix == 0:
-        return None
-    return Gaussian2DKernel(x_stddev=sx_pix, y_stddev=sy_pix, theta=theta)
-
-
-@lru_cache(maxsize=None)
-def _headers_for_name(base_name: str):
-    """
-    Return (raw_hdr, t50_hdr, t100_hdr, t25_hdr, pix_native_arcsec, raw_fits_path)
-    """
-    base_dir = _first(f"{PSZ2_ROOT}/fits/{base_name}*") or f"{PSZ2_ROOT}/fits/{base_name}"
-    raw_path = _first(f"{base_dir}/{os.path.basename(base_dir)}.fits") \
-            or _first(f"{base_dir}/{os.path.basename(base_dir)}*.fits")
-    if raw_path is None:
-        raise FileNotFoundError(f"RAW FITS not found under {base_dir}")
-
-    # look beside RAW first
-    t25_path  = _first(f"{base_dir}/{base_name}T25kpc*.fits")
-    t50_path  = _first(f"{base_dir}/{base_name}T50kpc*.fits")
-    t100_path = _first(f"{base_dir}/{base_name}T100kpc*.fits")
-
-    # fallbacks to 'classified' trees
-    if t25_path is None:
-        t25_path = _first(f"{PSZ2_ROOT}/classified/T25kpc/*/{base_name}.fits") or \
-                   _first(f"{PSZ2_ROOT}/classified/T25kpcSUB/*/{base_name}.fits")
-    if t50_path is None:
-        t50_path = _first(f"{PSZ2_ROOT}/classified/T50kpc/*/{base_name}.fits") or \
-                   _first(f"{PSZ2_ROOT}/classified/T50kpcSUB/*/{base_name}.fits")
-    if t100_path is None:
-        t100_path = _first(f"{PSZ2_ROOT}/classified/T100kpc/*/{base_name}.fits") or \
-                    _first(f"{PSZ2_ROOT}/classified/T100kpcSUB/*/{base_name}.fits")
-
-    raw_hdr  = fits.getheader(raw_path)
-    t25_hdr  = fits.getheader(t25_path)  if t25_path  else None
-    t50_hdr  = fits.getheader(t50_path)  if t50_path  else None
-    t100_hdr = fits.getheader(t100_path) if t100_path else None
-    pix_native = _pixscale_arcsec(raw_hdr)
-    return raw_hdr, t50_hdr, t100_hdr, t25_hdr, pix_native, raw_path
-
-
-
-def plot_raw_vs_fake_taper(raw_imgs, tapered_imgs, filenames, taper_mode,
-                           save_dir="./classifier", max_n=4):
-    n = min(max_n, raw_imgs.size(0), tapered_imgs.size(0), len(filenames))
-    fig, axes = plt.subplots(2, n, figsize=(3*n, 6), constrained_layout=True)
-    for i in range(n):
-        r = raw_imgs[i, 0].detach().cpu().numpy()
-        t = tapered_imgs[i, 0].detach().cpu().numpy()
-        axes[0, i].imshow(r, cmap="viridis", origin="lower", vmin=0, vmax=1)
-        axes[0, i].axis("off"); axes[0, i].set_title(str(filenames[i]), fontsize=8)
-        axes[1, i].imshow(t, cmap="viridis", origin="lower", vmin=0, vmax=1)
-        axes[1, i].axis("off")
-    axes[0, 0].set_ylabel("RAW", fontsize=11)
-    axes[1, 0].set_ylabel("RAW → " + ("50 kpc" if taper_mode=="rt50" else "100 kpc"), fontsize=11)
-    os.makedirs(save_dir, exist_ok=True)
-    out = os.path.join(save_dir, f"raw_vs_{taper_mode}_eval_{n}x2_{raw_imgs.shape[-2]}x{raw_imgs.shape[-1]}.png")
-    plt.savefig(out, dpi=150, bbox_inches="tight"); plt.close(fig)
-    print(f"Saved {out}")
+    plt.figure(figsize=(6,3))
+    plt.hist(r1, bins=bins, alpha=0.6, label=title1)
+    plt.hist(r2, bins=bins, alpha=0.6, label=title2)
+    plt.xlabel('Red channel value')
+    plt.ylabel('Count')
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150)
+    plt.close()
 
 def permute_like(x, perm):
     if x is None: return None
@@ -459,175 +240,6 @@ def permute_like(x, perm):
 base_cls = min(galaxy_classes)
 def relabel(y): 
     return (y - base_cls).long()
-
-
-def _maybe_resize_center(img_chw, out_hw):
-    """Center-crop + resize but skips resize if shape already matches (C)."""
-    # img_chw: [1,H,W] torch; out_hw: (Hout, Wout)
-    C, H0, W0 = img_chw.shape
-    Hout, Wout = out_hw
-    # center-crop to requested crop_size (same as your apply_formatting logic)
-    y0, x0 = H0//2, W0//2
-    y1, y2 = y0 - Hout//2, y0 + (Hout - Hout//2)
-    x1, x2 = x0 - Wout//2, x0 + (Wout - Wout//2)
-    y1, y2 = max(0, y1), min(H0, y2)
-    x1, x2 = max(0, x1), min(W0, x2)
-    crop = img_chw[:, y1:y2, x1:x2]
-    if crop.shape[-2:] == (Hout, Wout):
-        return crop
-    return torch.nn.functional.interpolate(
-        crop.unsqueeze(0), size=(Hout, Wout), mode='bilinear', align_corners=False
-    ).squeeze(0)
-    
-
-def _background_ring_mask(h, w, inner=64, pad=8):
-    yy, xx = torch.meshgrid(torch.arange(h), torch.arange(w), indexing='ij')
-    cy, cx = h//2, w//2
-    half = inner//2
-    # guard band
-    mask_c = (yy >= cy-(half+pad)) & (yy <= cy+(half+pad)) & (xx >= cx-(half+pad)) & (xx <= cx+(half+pad))
-    return ~mask_c
-
-def _robust_sigma(x2d):
-    x = torch.as_tensor(x2d, dtype=torch.float32)
-    med = x.median()
-    return 1.4826 * (x - med).abs().median()
-
-def build_ref_sigma_map(real_imgs, filenames, inner=64):
-    """Measure background σ on the already-loaded images (top row)."""
-    ref = {}
-    for img, name in zip(real_imgs, filenames):
-        im = torch.as_tensor(img, dtype=torch.float32).squeeze(0)  # [H,W]
-        mask = _background_ring_mask(*im.shape, inner=inner)
-        ref[str(name)] = _robust_sigma(im[mask]).item()
-    return ref
-
-def _per_image_percentile_stretch(x2d, lo=60, hi=95):
-    t = torch.as_tensor(x2d, dtype=torch.float32)
-    pl = torch.quantile(t.reshape(-1), lo/100.0)
-    ph = torch.quantile(t.reshape(-1), hi/100.0)
-    y = (t - pl) / (ph - pl + 1e-6)
-    return y.clamp(0, 1)
-
-def apply_taper_to_tensor(
-    imgs, mode, filenames,
-    crop_size=(1,512,512), downsample_size=(1,128,128),
-    percentile_lo=60, percentile_hi=95,
-    do_stretch=True, use_asinh=True,
-    ref_sigma_map=None, bg_inner=64,
-    debug_dir=None
-):
-    import re
-    mode = str(mode).lower()
-    _kpc = None
-    m = re.fullmatch(r'rt(\d+)(?:kpc)?', mode)
-    if m:
-        _kpc = int(m.group(1))      # e.g. rt75 → 75 kpc, rt40kpc → 40 kpc
-    want = None if _kpc is None else f'{_kpc}kpc'
-    if want is None:
-        # no tapering requested
-        keep_mask = torch.ones(len(filenames), dtype=torch.bool)
-        return (imgs if imgs.dim()==4 else imgs.unsqueeze(1)), keep_mask, list(map(str, filenames)), []
-
-    device = imgs.device if torch.is_tensor(imgs) else torch.device('cpu')
-    dtype  = imgs.dtype  if torch.is_tensor(imgs) else torch.float32
-    Hout, Wout = downsample_size[-2], downsample_size[-1]
-
-    out, kept_fns, kept_flags, skipped = [], [], [], []
-    for base in map(str, filenames):
-        raw_hdr, t50_hdr, t100_hdr, t25_hdr, pix_native_as, raw_path = _headers_for_name(base)
-
-        if _kpc is None:
-            # explicit "rt25/rt50/rt100"
-            if mode == 'rt25':
-                targ_hdr = t25_hdr
-            elif mode == 'rt50':
-                targ_hdr = t50_hdr
-            elif mode == 'rt100':
-                targ_hdr = t100_hdr
-            else:
-                targ_hdr = None
-        else:
-            # arbitrary rtXX[kpc]: derive from any of T50/T100/T25 headers
-            try:
-                targ_hdr = _synthetic_taper_header(raw_hdr, t25_hdr, t50_hdr, t100_hdr, desired_kpc=_kpc)
-            except Exception:
-                targ_hdr = None
-
-
-        # skip if we still don't have a target
-        if targ_hdr is None:
-            skipped.append(base)
-            kept_flags.append(False)
-            continue
-
-        # 1) load RAW
-        raw_native = np.squeeze(fits.getdata(raw_path)).astype(float)
-        raw_native = np.nan_to_num(raw_native, copy=False)
-
-        # 2) PSF-match on the native grid (kernel guaranteed to exist conceptually,
-        #     but we still guard against numerical degeneracy)
-        ker = _kernel_from_headers(raw_hdr, targ_hdr, pix_native_as)
-        if ker is not None:
-            matched = convolve_fft(raw_native, ker, boundary='fill', fill_value=0.0,
-                                   nan_treatment='interpolate', normalize_kernel=True)
-            matched = np.nan_to_num(matched, copy=False)
-        else:
-            # If kernel collapses numerically, also skip to avoid raw-through
-            skipped.append(base)
-            kept_flags.append(False)
-            continue
-
-        # 3) center-crop + resize
-        t = torch.from_numpy(matched).float().unsqueeze(0)  # [1,H,W]
-        formatted = apply_formatting(t, crop_size=(1, crop_size[-2], crop_size[-1]),
-                                     downsample_size=(1, Hout, Wout)).squeeze(0)
-
-        # 4) percentile stretch
-        if do_stretch:
-            stretched = _per_image_percentile_stretch(formatted.squeeze(0), percentile_lo, percentile_hi).unsqueeze(0)
-        else:
-            stretched = formatted
-
-        # 5) asinh (if mirroring loader)
-        if use_asinh:
-            stretched = torch.asinh(10.0 * stretched) / math.asinh(10.0)
-
-        # 6) noise-match to reference σ (background only)
-        if ref_sigma_map is not None and base in ref_sigma_map:
-            mask = _background_ring_mask(Hout, Wout, inner=bg_inner)
-            sig_fake = _robust_sigma(stretched.squeeze(0)[mask])
-            sig_want = torch.tensor(ref_sigma_map[base], dtype=stretched.dtype)
-            add = torch.clamp(sig_want - sig_fake, min=0.0)
-            if add > 1e-8:
-                noise = torch.randn_like(stretched)
-                s = stretched.clone()
-                s[:, 0][mask] = (s[:, 0][mask] + noise[:, 0][mask]*add).clamp(0, 1)
-                stretched = s
-
-        out.append(stretched)
-        kept_fns.append(base)
-        kept_flags.append(True)
-
-        # 7) optional quick diagnostics
-        if debug_dir:
-            os.makedirs(debug_dir, exist_ok=True)
-            fig, ax = plt.subplots(1,2, figsize=(6,3))
-            ax[0].imshow(formatted.squeeze(0), cmap='viridis', origin='lower')
-            ax[0].set_title('PSF-matched'); ax[0].axis('off')
-            ax[1].imshow(stretched.squeeze(0), cmap='viridis', origin='lower')
-            ax[1].set_title('final'); ax[1].axis('off')
-            fig.suptitle(base); fig.tight_layout()
-            fig.savefig(os.path.join(debug_dir, f"{base}_{want}.png"), dpi=140)
-            plt.close(fig)
-
-    keep_mask = torch.tensor(kept_flags, dtype=torch.bool)
-    out = torch.stack(out, dim=0).to(device=device, dtype=dtype) if out else \
-          torch.empty((0,1,Hout,Wout), device=device, dtype=dtype)
-    return out, keep_mask, kept_fns, skipped
-
-
-
 
 def replicate_list(x, n):
     return [v for v in x for _ in range(int(n))]
@@ -650,9 +262,6 @@ def late_augment(images, labels, filenames=None, *, st_aug=False):
     if filenames is not None:
         filenames = replicate_list(filenames, n_aug)
     return imgs_aug, labels_aug, filenames
-
-
-
 
 ###############################################
 ########### DATA STORING FUNCTIONS ###############
@@ -828,8 +437,6 @@ for gen_model_name in gen_model_names:
         cls_images = test_images[cls_mask]
         check_tensor(f"Test images for class {cls} (idx={i})", cls_images)
 
-    import hashlib
-
     def img_hash(img: torch.Tensor) -> str:
         # ensure CPU & contiguous
         arr = img.cpu().contiguous().numpy()
@@ -863,11 +470,7 @@ for gen_model_name in gen_model_names:
             mock_test = torch.zeros_like(test_images)  # images are ignored
             test_dataset = TensorDataset(mock_test, test_scat_coeffs, test_labels)
         elif classifier in ['ScatterSqueezeNet', 'ScatterSqueezeNet2']:
-            if EXTRAVARS:
-                print("Not implemented yet for ScatterSqueezeNet with extra variables")
-                exit(1)
-            else:
-                test_dataset = TensorDataset(test_images, test_scat_coeffs, test_labels)
+            test_dataset = TensorDataset(test_images, test_scat_coeffs, test_labels)
 
     else: 
         test_dataset = TensorDataset(test_images, mock_tensor, test_labels)
@@ -977,9 +580,6 @@ for gen_model_name in gen_model_names:
                     n_aug = len(train_images) // max(1, before)
                     print(f"[AUG] late_augment replicated train by ~x{n_aug} ({before} → {len(train_images)})")
                 
-                if EXTRAVARS:
-                    train_data = train_fns
-                    valid_data = valid_fns
             dataset_sizes[fold] = [max(2, int(len(train_images) * p)) for p in dataset_portions]
             
             train_labels = relabel(train_labels)  # [0,1,2,...] for classes [50,51,...]
@@ -1098,9 +698,6 @@ for gen_model_name in gen_model_names:
             perm = torch.randperm(train_images.size(0))
             train_images = train_images[perm]
             train_labels = train_labels[perm]
-            if EXTRAVARS:
-                print("Cannot use extra features with TRAINONGENERATED, setting EXTRAVARS to False")
-                EXTRAVARS = False
             
         unique_labels, counts = torch.unique(train_labels, return_counts=True)
 
@@ -1209,6 +806,14 @@ for gen_model_name in gen_model_names:
                     img_shape=(1, 128, 128),
                     title="Background histograms",
                     save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_background_hist.png"
+                )
+
+                plot_red_histogram(
+                    train_images_cls1.cpu(),
+                    train_images_cls2.cpu(),
+                    title1=f"Class {galaxy_classes[0]}",
+                    title2=f"Class {galaxy_classes[1]}",
+                    save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_red_hist.png"
                 )
 
                 for cls in galaxy_classes:
@@ -1347,16 +952,8 @@ for gen_model_name in gen_model_names:
                     train_dataset = TensorDataset(mock_train, train_scat_coeffs, train_labels)
                     valid_dataset = TensorDataset(mock_valid, valid_scat_coeffs, valid_labels)
                 else: # if classifier in ['ScatterSqueezeNet', 'ScatterSqueezeNet2']:
-                    if EXTRAVARS:
-                        print(train_images.shape)
-                        print(train_scat_coeffs.shape)
-                        print(train_data.shape)
-                        print(train_labels.shape)
-                        train_dataset = TensorDataset(train_images, train_scat_coeffs, train_data, train_labels)
-                        valid_dataset = TensorDataset(valid_images, valid_scat_coeffs, valid_data, valid_labels)
-                    else:
-                        train_dataset = TensorDataset(train_images, train_scat_coeffs, train_labels)
-                        valid_dataset = TensorDataset(valid_images, valid_scat_coeffs, valid_labels)
+                    train_dataset = TensorDataset(train_images, train_scat_coeffs, train_labels)
+                    valid_dataset = TensorDataset(valid_images, valid_scat_coeffs, valid_labels)
         else:
             mock_train = torch.zeros_like(train_images)
             mock_valid = torch.zeros_like(valid_images)
@@ -1398,10 +995,7 @@ for gen_model_name in gen_model_names:
         elif classifier == "ScatterResNet":
             models = {"ScatterResNet": {"model": ScatterResNet(scat_shape=scatdim, num_classes=num_classes).to(DEVICE)}}
         elif classifier == "ScatterSqueezeNet":
-            if EXTRAVARS:
-                models = {"ScatterSqueezeNet": {"model": MetaWrapper(ScatterSqueezeNet(img_shape=tuple(valid_images.shape[1:]), scat_shape=scatdim, num_classes=num_classes), meta_dim=test_meta.shape[1]).to(DEVICE)}}
-            else:
-                models = {"ScatterSqueezeNet": {"model": ScatterSqueezeNet(img_shape=tuple(valid_images.shape[1:]), scat_shape=scatdim, num_classes=num_classes).to(DEVICE)}}
+            models = {"ScatterSqueezeNet": {"model": ScatterSqueezeNet(img_shape=tuple(valid_images.shape[1:]), scat_shape=scatdim, num_classes=num_classes).to(DEVICE)}}
         elif classifier == "ScatterSqueezeNet2":
             models = {"ScatterSqueezeNet2": {"model": ScatterSqueezeNet2(img_shape=tuple(valid_images.shape[1:]), scat_shape=scatdim, num_classes=num_classes).to(DEVICE)}}
         elif classifier == 'Binary':
@@ -1478,11 +1072,7 @@ for gen_model_name in gen_model_names:
                         total_images = 0
 
                         for images, scat, _rest in subset_train_loader:
-                            if EXTRAVARS:
-                                meta, labels = _rest
-                                meta = meta.to(DEVICE)  # Send metadata to device
-                            else:
-                                labels = _rest
+                            labels = _rest
                             images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE) # Send to device
                             optimizer.zero_grad()
                             if classifier == "DANN":
@@ -1555,11 +1145,7 @@ for gen_model_name in gen_model_names:
                                 if images is None or len(images) == 0:
                                     print(f"Empty batch at index {i}. Skipping...")
                                     continue
-                                if EXTRAVARS:
-                                    meta, labels = _rest
-                                    meta = meta.to(DEVICE)  # Send metadata to device
-                                else:
-                                    labels = _rest
+                                labels = _rest
                                 images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE)
                                 if classifier == "DANN":
                                     logits, _ = model(images, alpha=1.0)
@@ -1614,11 +1200,7 @@ for gen_model_name in gen_model_names:
                         mis_preds  = []
                         
                         for images, scat, _rest in test_loader:
-                            if EXTRAVARS:
-                                meta, labels = _rest
-                                meta = meta.to(DEVICE)  # Send metadata to device
-                            else:
-                                labels = _rest
+                            labels = _rest
                             images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE)
                             if classifier == "DANN":
                                 logits, _ = model(images, alpha=1.0)
@@ -1690,7 +1272,6 @@ for gen_model_name in gen_model_names:
                             mis_trues  = np.concatenate(mis_trues)[:36]
                             mis_preds  = np.concatenate(mis_preds)[:36]
 
-                            import matplotlib.pyplot as plt
                             fig, axes = plt.subplots(6, 6, figsize=(12, 12))
                             axes = axes.flatten()
 
@@ -1738,11 +1319,7 @@ for gen_model_name in gen_model_names:
             generated_features = []
             with torch.no_grad():
                 for images, scat, _ in test_loader:
-                    if EXTRAVARS:
-                        meta, labels = _rest
-                        meta = meta.to(DEVICE)  # Send metadata to device
-                    else:
-                        labels = _rest
+                    labels = _rest
                     images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE)
                     if classifier == "DANN":
                         class_logits, _ = model(images, alpha=1.0)

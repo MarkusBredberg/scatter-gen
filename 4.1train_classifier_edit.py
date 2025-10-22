@@ -1,5 +1,5 @@
+import torch, math, time, random, re, sys, os, glob, pickle, itertools, matplotlib
 import numpy as np
-import torch, math, time, random
 import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader, Subset, Dataset
 from torchsummary import summary
@@ -17,16 +17,12 @@ from astropy.io import fits
 from astropy.convolution import convolve_fft, Gaussian2DKernel
 from functools import lru_cache
 import pandas as pd
-import pickle
 from tqdm import tqdm
 from torch.optim import AdamW
-import itertools
 from itertools import product
 from sklearn.metrics import confusion_matrix
 import seaborn as sns
-import matplotlib 
 import matplotlib.pyplot as plt
-import sys, os, glob
 
 SEED = 42  # Set a seed for reproducibility
 def set_seed(seed):
@@ -161,30 +157,6 @@ else:
 ARCSEC = np.deg2rad(1/3600.0)
 PSZ2_ROOT = "/users/mbredber/scratch/data/PSZ2"  # FITS root used below
 
-# parse versions
-# add near the imports
-import re
-
-def _split_versions(v):
-    v = v if isinstance(v, (list, tuple)) else [v]
-    v = [str(x).lower() for x in v]
-    # only these exact tokens are treated as runtime tapers
-    gen = [x for x in v if x in ('rt25', 'rt50', 'rt100')]
-    load = [x for x in v if x not in gen]
-    return load, gen
-
-_load_versions, _gen_versions = _split_versions(versions)
-_versions_to_load = _load_versions if _load_versions else ['raw']   # or ['RAW'] if your loader uses that
-print(f"_versions_to_load={_versions_to_load}, _gen_versions={_gen_versions}")
-
-
-REPLACE_WITH_RT = (
-    (isinstance(versions, str) and versions.lower().startswith('rt')) or
-    (isinstance(versions, (list, tuple)) and len(versions) == 1
-     and isinstance(versions[0], str) and versions[0].lower().startswith('rt'))
-)
-
-
 # drive augmentation/filenames solely from presence of rt*
 LATE_AUG = bool(_gen_versions) # True if any(v.startswith('rt') for v in _gen_versions)
 PRINTFILENAMES = bool(_gen_versions)
@@ -207,110 +179,73 @@ ver_key = _verkey(versions)
 ########################################################################
 
 
-def _append_rt_versions(imgs, fns, gen_versions, labels=None):
+def _to_base_name(fn):
+    return Path(str(fn)).stem.split('T', 1)[0]
+
+def _first_recursive(pattern: str):
+    hits = sorted(glob.glob(pattern, recursive=True))
+    return hits[0] if hits else None
+
+def plot_first_rows_by_source(images, filenames, versions, out_path, n_show=10):
     """
-    Append runtime-tapered planes to the loaded images and drop samples
-    that are missing any requested taper.
-
-    Inputs
-    ------
-    imgs: torch.Tensor [B, 1, H, W]
-    fns:  list[str] length B
-    gen_versions: e.g. ['rt50'] or ['rt50','rt100']
-    labels: optional torch.Tensor [B] (kept in sync if provided)
-
-    Returns
-    -------
-    imgs_out:   [B_kept, 1+len(gen_versions), H, W]
-    labels_out: [B_kept] or None if labels=None
-    fns_out:    list[str] of length B_kept
-    info:       dict with removal counts
+    Plot the first N rows titled by source name. If images are [B,T,1,H,W] or [B,T,H,W],
+    show 2 columns (left/right = first/second plane). If single version, plot 1 column.
     """
-    if isinstance(gen_versions, (str,)):
-        gen_versions = [gen_versions]
-    gen_versions = [str(gv).lower() for gv in gen_versions]
-    assert imgs.dim() == 4 and imgs.size(1) == 1, "Expecting [B,1,H,W] images before appending"
 
-    B, _, H, W = imgs.shape
-    fns_str = list(map(str, fns))
+    if isinstance(images, (list, tuple)):
+        images = torch.stack([torch.as_tensor(x) for x in images], dim=0)
 
-    # Call the taper once per version; record which filenames survived and the plane per file.
-    kept_sets = {}
-    planes_by_fn = {}
-    removed_by_version = {}
-
-    for gv in gen_versions:
-        tapered, keep_mask, kept_fns, skipped = apply_taper_to_tensor(
-            imgs, gv, filenames=fns_str,
-            crop_size=crop_size,
-            downsample_size=downsample_size,
-            percentile_lo=percentile_lo, percentile_hi=percentile_hi,
-            do_stretch=STRETCH
-        )
-        kept_sets[gv] = set(kept_fns)
-        removed_by_version[gv] = len(skipped)
-
-        # Map filename -> tapered plane tensor [1,H,W]
-        planes_by_fn[gv] = {fn: tapered[i] for i, fn in enumerate(kept_fns)}
-
-    # Keep only samples that have *all* requested versions
-    if gen_versions:
-        keep_fns = [fn for fn in fns_str if all(fn in kept_sets[gv] for gv in gen_versions)]
+    # Normalize shape to convenient form
+    if images.dim() == 5:                 # [B, T, 1, H, W]
+        images = images.flatten(2, 3)     # [B, T, H, W]
+    elif images.dim() == 4:               # [B, C, H, W]
+        pass
     else:
-        keep_fns = fns_str[:]  # nothing to filter
+        raise ValueError(f"Unsupported images ndim={images.ndim}")
 
-    # Indices in the original order
-    keep_idx = [i for i, fn in enumerate(fns_str) if fn in keep_fns]
-    removed_total = B - len(keep_idx)
+    B = images.shape[0]
+    n_show = min(n_show, B)
 
-    # Filter base images/labels/fns
-    imgs_kept = imgs[keep_idx]
-    labels_kept = labels[keep_idx] if labels is not None else None
-    fns_kept = [fns[i] for i in keep_idx]
+    # Row titles from filenames (strip trailing T*kpc or T*kpcSUB)
+    names = (filenames[:n_show] if filenames else [f"idx_{i}" for i in range(n_show)])
+    def _src_name(s):
+        b = os.path.splitext(os.path.basename(str(s)))[0]
+        return re.sub(r'(?:T\d+kpc(?:SUB)?)$', '', b)
+    row_titles = [_src_name(s) for s in names]
 
-    # Gather tapered planes in the same order as fns_kept
-    extra_planes = []
-    for gv in gen_versions:
-        if len(keep_fns) == 0:
-            # preserve shape/device/dtype even if empty
-            plane_stack = torch.empty((0, 1, H, W), device=imgs.device, dtype=imgs.dtype)
-        else:
-            # stack [B_kept, 1, H, W] in filename order
-            plane_stack = torch.stack([planes_by_fn[gv][str(fn)] for fn in fns_kept], dim=0)
-            plane_stack = plane_stack.to(device=imgs_kept.device, dtype=imgs_kept.dtype)
-        extra_planes.append(plane_stack)
-
-    # Concatenate base + all tapered planes along channel dim
-    planes = [imgs_kept] + extra_planes
-    imgs_out = torch.cat(planes, dim=1) if planes else imgs_kept
-
-    info = {
-        "initial": B,
-        "kept": len(keep_idx),
-        "removed_total": removed_total,
-        "removed_by_version": removed_by_version
-    }
-
-    # Human-readable log
-    if gen_versions:
-        per_ver = ", ".join(f"{gv}:{removed_by_version.get(gv,0)}" for gv in gen_versions)
-        print(f"[rt-append] Removed {removed_total} / {B} due to missing tapers "
-              f"(per-version: {per_ver}). Kept {len(keep_idx)}.")
+    is_two_cols = images.shape[1] >= 2      # have at least two planes (e.g., RT/T)
+    if is_two_cols:
+        fig, axes = plt.subplots(n_show, 2, figsize=(5.4, 2.6*n_show), constrained_layout=True)
+        if n_show == 1:
+            axes = np.array([axes])
+        for i in range(n_show):
+            left  = images[i, 0].detach().cpu().numpy()
+            right = images[i, 1].detach().cpu().numpy()
+            axes[i, 0].imshow(left, cmap="viridis", origin="lower")
+            axes[i, 0].set_title(f"{row_titles[i]} — {versions[0] if isinstance(versions,(list,tuple)) else 'v0'}")
+            axes[i, 0].axis('off')
+            axes[i, 1].imshow(right, cmap="viridis", origin="lower")
+            axes[i, 1].set_title(f"{row_titles[i]} — {versions[1] if isinstance(versions,(list,tuple)) else 'v1'}")
+            axes[i, 1].axis('off')
     else:
-        print(f"[rt-append] No taper versions requested. Kept all {B} samples.")
+        fig, axes = plt.subplots(n_show, 1, figsize=(2.7, 2.6*n_show), constrained_layout=True)
+        if n_show == 1:
+            axes = [axes]
+        for i in range(n_show):
+            img = images[i, 0].detach().cpu().numpy()   # first/only channel
+            ax = axes[i]
+            ax.imshow(img, cmap="viridis", origin="lower")
+            ax.set_title(f"{row_titles[i]} — {versions if not isinstance(versions,(list,tuple)) else versions[0]}")
+            ax.axis('off')
 
-    return imgs_out, labels_kept, fns_kept, info
-
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+    print(f"[quicklook] wrote {out_path}")
 
 def _first(pattern: str):
     hits = sorted(glob.glob(pattern))
     return hits[0] if hits else None
-
-# After you get tapered images back:
-def bg_sigma(t):
-    m = _background_ring_mask(t.shape[-2], t.shape[-1], inner=64)
-    return _robust_sigma(t.squeeze(1)[..., m])  # [B] robust σ
-
 
 def _pixscale_arcsec(hdr):
     if 'CDELT1' in hdr:  # deg/pix
@@ -320,97 +255,36 @@ def _pixscale_arcsec(hdr):
         return float(np.hypot(cd11, cd12)) * 3600.0
     raise KeyError("No CDELT* or CD* keywords in FITS header")
 
-def fwhm_to_sigma_rad(fwhm_arcsec):
-    return (fwhm_arcsec*ARCSEC) / (2*np.sqrt(2*np.log(2)))
+def collapse_logits(logits, num_classes, multilabel):
+    # [B,C,H,W] → [B,C]
+    if logits.ndim == 4:
+        logits = torch.nn.functional.adaptive_avg_pool2d(logits, (1, 1)).squeeze(-1).squeeze(-1)
+    elif logits.ndim == 3:
+        logits = logits.mean(dim=-1)
+    # ensure [B,C]
+    if logits.ndim == 1:
+        logits = logits.unsqueeze(1)
+    if not multilabel and logits.shape[1] == 1 and num_classes == 2:
+        logits = torch.cat([-logits, logits], dim=1)
+    return logits
 
-def _cov_from_beam(bmaj_as, bmin_as, pa_deg):
-    sx = fwhm_to_sigma_rad(bmaj_as)   # radians
-    sy = fwhm_to_sigma_rad(bmin_as)
-    th = np.deg2rad(pa_deg)
-    R = np.array([[np.cos(th), -np.sin(th)],
-                  [np.sin(th),  np.cos(th)]], dtype=float)
-    S = np.diag([sx*sx, sy*sy])
-    return R @ S @ R.T
+def compute_classification_metrics(y_true, y_pred, multilabel, num_classes):
+    acc = accuracy_score(y_true, y_pred)
+    if multilabel:
+        avg = 'macro'
+        return acc, precision_score(y_true, y_pred, average=avg, zero_division=0), \
+                     recall_score(y_true, y_pred, average=avg, zero_division=0), \
+                     f1_score(y_true, y_pred, average=avg, zero_division=0)
+    if num_classes == 2:
+        return acc, precision_score(y_true, y_pred, average='binary', zero_division=0), \
+                     recall_score(y_true, y_pred, average='binary', zero_division=0), \
+                     f1_score(y_true, y_pred, average='binary', zero_division=0)
+    avg = 'macro'
+    return acc, precision_score(y_true, y_pred, average=avg, zero_division=0), \
+                 recall_score(y_true, y_pred, average=avg, zero_division=0), \
+                 f1_score(y_true, y_pred, average=avg, zero_division=0)
 
-def _kernel_from_headers(raw_hdr, targ_hdr, pixscale_arcsec):
-    # if target missing or already broader → return delta kernel (no blur)
-    if targ_hdr is None:
-        return None
-    bmaj_r = float(raw_hdr['BMAJ']*3600.0);  bmin_r = float(raw_hdr['BMIN']*3600.0);  pa_r = float(raw_hdr.get('BPA', 0.0))
-    bmaj_t = float(targ_hdr['BMAJ']*3600.0); bmin_t = float(targ_hdr['BMIN']*3600.0); pa_t = float(targ_hdr.get('BPA', pa_r))
-    C_raw = _cov_from_beam(bmaj_r, bmin_r, pa_r)
-    C_tgt = _cov_from_beam(bmaj_t, bmin_t, pa_t)
-    C_ker = C_tgt - C_raw  # in radians^2
-    # clip tiny negatives from numerical roundoff
-    w, V = np.linalg.eigh(C_ker)
-    w = np.clip(w, 0.0, None)
-    C_ker = (V * w) @ V.T
-
-    # convert covariance to **pixels** of the downsampled arrays we operate on
-    pixrad = pixscale_arcsec * ARCSEC
-    C_pix = C_ker / (pixrad**2)
-    w_pix, V_pix = np.linalg.eigh(C_pix)
-    sx_pix = np.sqrt(max(w_pix[1], 0.0))
-    sy_pix = np.sqrt(max(w_pix[0], 0.0))
-    theta  = np.arctan2(V_pix[1,1], V_pix[0,1])  # PA of major axis
-    if sx_pix == 0 and sy_pix == 0:
-        return None
-    return Gaussian2DKernel(x_stddev=sx_pix, y_stddev=sy_pix, theta=theta)
-
-@lru_cache(maxsize=None)
-def _headers_for_name(base_name: str):
-    """
-    Return (raw_hdr, t25_hdr, t50_hdr, t100_hdr, pix_native_arcsec, raw_fits_path)
-    """
-    base_dir = _first(f"{PSZ2_ROOT}/fits/{base_name}*") or f"{PSZ2_ROOT}/fits/{base_name}"
-    raw_path = _first(f"{base_dir}/{os.path.basename(base_dir)}.fits") \
-            or _first(f"{base_dir}/{os.path.basename(base_dir)}*.fits")
-    if raw_path is None:
-        raise FileNotFoundError(f"RAW FITS not found under {base_dir}")
-
-    # look beside RAW first
-    t25_path  = _first(f"{base_dir}/{base_name}T25kpc*.fits")
-    t50_path  = _first(f"{base_dir}/{base_name}T50kpc*.fits")
-    t100_path = _first(f"{base_dir}/{base_name}T100kpc*.fits")
-
-    # fallbacks to 'classified' trees
-    if t25_path is None:
-        t25_path = _first(f"{PSZ2_ROOT}/classified/T25kpc/*/{base_name}.fits") or \
-                   _first(f"{PSZ2_ROOT}/classified/T25kpcSUB/*/{base_name}.fits")
-    if t50_path is None:
-        t50_path = _first(f"{PSZ2_ROOT}/classified/T50kpc/*/{base_name}.fits") or \
-                   _first(f"{PSZ2_ROOT}/classified/T50kpcSUB/*/{base_name}.fits")
-    if t100_path is None:
-        t100_path = _first(f"{PSZ2_ROOT}/classified/T100kpc/*/{base_name}.fits") or \
-                    _first(f"{PSZ2_ROOT}/classified/T100kpcSUB/*/{base_name}.fits")
-
-    raw_hdr  = fits.getheader(raw_path)
-    t25_hdr  = fits.getheader(t25_path)  if t25_path  else None
-    t50_hdr  = fits.getheader(t50_path)  if t50_path  else None
-    t100_hdr = fits.getheader(t100_path) if t100_path else None
-    pix_native = _pixscale_arcsec(raw_hdr)
-    return raw_hdr, t25_hdr, t50_hdr, t100_hdr, pix_native, raw_path
-
-
-def plot_raw_vs_fake_taper(raw_imgs, tapered_imgs, filenames, taper_mode,
-                           save_dir="./classifier", max_n=4):
-    n = min(max_n, raw_imgs.size(0), tapered_imgs.size(0), len(filenames))
-    fig, axes = plt.subplots(2, n, figsize=(3*n, 6), constrained_layout=True)
-    for i in range(n):
-        r = raw_imgs[i, 0].detach().cpu().numpy()
-        t = tapered_imgs[i, 0].detach().cpu().numpy()
-        axes[0, i].imshow(r, cmap="viridis", origin="lower", vmin=0, vmax=1)
-        axes[0, i].axis("off"); axes[0, i].set_title(str(filenames[i]), fontsize=8)
-        axes[1, i].imshow(t, cmap="viridis", origin="lower", vmin=0, vmax=1)
-        axes[1, i].axis("off")
-    axes[0, 0].set_ylabel("RAW", fontsize=11)
-    axes[1, 0].set_ylabel("RAW → " + ("50 kpc" if taper_mode=="rt50" else "100 kpc"), fontsize=11)
-    os.makedirs(save_dir, exist_ok=True)
-    out = os.path.join(save_dir, f"raw_vs_{taper_mode}_eval_{n}x2_{raw_imgs.shape[-2]}x{raw_imgs.shape[-1]}.pdf")
-    plt.savefig(out, dpi=150, bbox_inches="tight"); plt.close(fig)
-    print(f"Saved {out}")
-
-def permute_like(x, perm):
+def permute_like_old(x, perm, SEED=SEED):
     if x is None: return None
     idx = perm.cpu().tolist()
     if isinstance(x, torch.Tensor): return x[perm]
@@ -418,51 +292,43 @@ def permute_like(x, perm):
     if isinstance(x, (list, tuple)): return [x[i] for i in idx]
     return x
 
-base_cls = min(galaxy_classes)
-def relabel(y): 
-    return (y - base_cls).long()
+def permute_like(x, perm):
+    if x is None:
+        return None
 
+    # Torch tensors: deterministic gather via index_select and device-safe indices
+    if isinstance(x, torch.Tensor):
+        idx = perm.to(device=x.device, dtype=torch.long)
+        return x.index_select(0, idx)
 
-def _maybe_resize_center(img_chw, out_hw):
-    """Center-crop + resize but skips resize if shape already matches (C)."""
-    # img_chw: [1,H,W] torch; out_hw: (Hout, Wout)
-    C, H0, W0 = img_chw.shape
-    Hout, Wout = out_hw
-    # center-crop to requested crop_size (same as your apply_formatting logic)
-    y0, x0 = H0//2, W0//2
-    y1, y2 = y0 - Hout//2, y0 + (Hout - Hout//2)
-    x1, x2 = x0 - Wout//2, x0 + (Wout - Wout//2)
-    y1, y2 = max(0, y1), min(H0, y2)
-    x1, x2 = max(0, x1), min(W0, x2)
-    crop = img_chw[:, y1:y2, x1:x2]
-    if crop.shape[-2:] == (Hout, Wout):
-        return crop
-    return torch.nn.functional.interpolate(
-        crop.unsqueeze(0), size=(Hout, Wout), mode='bilinear', align_corners=False
-    ).squeeze(0)
-    
+    # Prepare a plain integer index array once for non-tensor cases
+    if isinstance(perm, torch.Tensor):
+        idx = perm.detach().cpu().to(torch.long).tolist()
+    elif isinstance(perm, np.ndarray):
+        idx = [int(i) for i in perm.tolist()]
+    else:
+        idx = [int(i) for i in perm]
 
-def _background_ring_mask(h, w, inner=64, pad=8):
-    yy, xx = torch.meshgrid(torch.arange(h), torch.arange(w), indexing='ij')
-    cy, cx = h//2, w//2
-    half = inner//2
-    # guard band
-    mask_c = (yy >= cy-(half+pad)) & (yy <= cy+(half+pad)) & (xx >= cx-(half+pad)) & (xx <= cx+(half+pad))
-    return ~mask_c
+    if isinstance(x, np.ndarray):
+        return x[np.asarray(idx, dtype=np.int64)]
+    if isinstance(x, list):
+        return [x[i] for i in idx]
+    if isinstance(x, tuple):
+        return tuple(x[i] for i in idx)
+    return x
 
-def _robust_sigma(x2d):
-    x = torch.as_tensor(x2d, dtype=torch.float32)
-    med = x.median()
-    return 1.4826 * (x - med).abs().median()
-
-def build_ref_sigma_map(real_imgs, filenames, inner=64):
-    """Measure background σ on the already-loaded images (top row)."""
-    ref = {}
-    for img, name in zip(real_imgs, filenames):
-        im = torch.as_tensor(img, dtype=torch.float32).squeeze(0)  # [H,W]
-        mask = _background_ring_mask(*im.shape, inner=inner)
-        ref[str(name)] = _robust_sigma(im[mask]).item()
-    return ref
+def relabel(y):
+    """
+    Convert raw single-class ids to 2-bit multi-label targets [RH, RR].
+    RH (52) -> [1,0]
+    RR (53) -> [0,1]
+    If you ever have 'both', set both bits to 1 *upstream*.
+    """
+    y = y.long()
+    out = torch.zeros((y.shape[0], 2), dtype=torch.float32, device=y.device)
+    out[:, 0] = (y == 52).float()  # RH
+    out[:, 1] = (y == 53).float()  # RR
+    return out    
 
 def _per_image_percentile_stretch(x2d, lo=60, hi=95):
     t = torch.as_tensor(x2d, dtype=torch.float32)
@@ -471,131 +337,71 @@ def _per_image_percentile_stretch(x2d, lo=60, hi=95):
     y = (t - pl) / (ph - pl + 1e-6)
     return y.clamp(0, 1)
 
-def apply_taper_to_tensor(
-    imgs, mode, filenames,
-    crop_size=(1,512,512), downsample_size=(1,128,128),
-    percentile_lo=60, percentile_hi=95,
-    do_stretch=True, use_asinh=True,
-    ref_sigma_map=None, bg_inner=64,
-    debug_dir=None
-):
-    mode = str(mode).lower()
-    want = {'rt25':'t25','rt50':'t50','rt100':'t100'}.get(mode)
-    if want is None:
-        # no tapering requested
-        keep_mask = torch.ones(len(filenames), dtype=torch.bool)
-        return (imgs if imgs.dim()==4 else imgs.unsqueeze(1)), keep_mask, list(map(str, filenames)), []
+def as_index_labels(y: torch.Tensor) -> torch.Tensor:
+    return y.argmax(dim=1) if y.ndim > 1 else y
 
-    device = imgs.device if torch.is_tensor(imgs) else torch.device('cpu')
-    dtype  = imgs.dtype  if torch.is_tensor(imgs) else torch.float32
-    Hout, Wout = downsample_size[-2], downsample_size[-1]
-
-    out, kept_fns, kept_flags, skipped = [], [], [], []
-    for base in map(str, filenames):
-        raw_hdr, t25_hdr, t50_hdr, t100_hdr, pix_native_as, raw_path = _headers_for_name(base)
-
-        # Select target header based on the requested taper mode
-        targ_hdr = None
-        if want == 't25':
-            targ_hdr = t25_hdr
-        elif want == 't50':
-            targ_hdr = t50_hdr
-        elif want == 't100':
-            targ_hdr = t100_hdr
-        # existing guard:
-        if targ_hdr is None:
-            skipped.append(base); kept_flags.append(False); continue
-
-        # 1) load RAW
-        raw_native = np.squeeze(fits.getdata(raw_path)).astype(float)
-        raw_native = np.nan_to_num(raw_native, copy=False)
-
-        # 2) Compute image-plane PSF kernel
-        ker = _kernel_from_headers(raw_hdr, targ_hdr, pix_native_as)
-        if ker is not None:
-            matched = convolve_fft(raw_native, ker, boundary='fill', fill_value=0.0,
-                                   nan_treatment='interpolate', normalize_kernel=True)
-            matched = np.nan_to_num(matched, copy=False)
-        else:
-            # If kernel collapses numerically, also skip to avoid raw-through
-            skipped.append(base)
-            kept_flags.append(False)
-            continue
-
-        # 3) center-crop + resize
-        t = torch.from_numpy(matched).float().unsqueeze(0)  # [1,H,W]
-        formatted = apply_formatting(t, crop_size=(1, crop_size[-2], crop_size[-1]),
-                                     downsample_size=(1, Hout, Wout)).squeeze(0)
-
-        # 4) percentile stretch
-        if do_stretch:
-            stretched = _per_image_percentile_stretch(formatted.squeeze(0), percentile_lo, percentile_hi).unsqueeze(0)
-        else:
-            stretched = formatted
-
-        # 5) asinh (if mirroring loader)
-        if use_asinh:
-            stretched = torch.asinh(10.0 * stretched) / math.asinh(10.0)
-
-        # 6) noise-match to reference σ (background only)
-        if ref_sigma_map is not None and base in ref_sigma_map:
-            mask = _background_ring_mask(Hout, Wout, inner=bg_inner)
-            sig_fake = _robust_sigma(stretched.squeeze(0)[mask])
-            sig_want = torch.tensor(ref_sigma_map[base], dtype=stretched.dtype)
-            add = torch.clamp(sig_want - sig_fake, min=0.0)
-            if add > 1e-8:
-                noise = torch.randn_like(stretched)
-                s = stretched.clone()
-                s[:, 0][mask] = (s[:, 0][mask] + noise[:, 0][mask]*add).clamp(0, 1)
-                stretched = s
-
-        out.append(stretched)
-        kept_fns.append(base)
-        kept_flags.append(True)
-
-        # 7) optional quick diagnostics
-        if debug_dir:
-            os.makedirs(debug_dir, exist_ok=True)
-            fig, ax = plt.subplots(1,2, figsize=(6,3))
-            ax[0].imshow(formatted.squeeze(0), cmap='viridis', origin='lower')
-            ax[0].set_title('PSF-matched'); ax[0].axis('off')
-            ax[1].imshow(stretched.squeeze(0), cmap='viridis', origin='lower')
-            ax[1].set_title('final'); ax[1].axis('off')
-            fig.suptitle(base); fig.tight_layout()
-            fig.savefig(os.path.join(debug_dir, f"{base}_{want}.png"), dpi=140)
-            plt.close(fig)
-
-    keep_mask = torch.tensor(kept_flags, dtype=torch.bool)
-    out = torch.stack(out, dim=0).to(device=device, dtype=dtype) if out else \
-          torch.empty((0,1,Hout,Wout), device=device, dtype=dtype)
-    return out, keep_mask, kept_fns, skipped
-
-
-
+def collapse_logits(logits, num_classes, multilabel):
+    if logits.ndim == 4:
+        logits = torch.nn.functional.adaptive_avg_pool2d(logits, (1, 1)).squeeze(-1).squeeze(-1)
+    elif logits.ndim == 3:
+        logits = logits.mean(dim=-1)
+    if logits.ndim == 1:
+        logits = logits.unsqueeze(1)
+    if not multilabel and logits.shape[1] == 1 and num_classes == 2:
+        logits = torch.cat([-logits, logits], dim=1)
+    return logits
 
 def replicate_list(x, n):
     return [v for v in x for _ in range(int(n))]
-
-def shuffle_with_filenames(images, labels, filenames=None):
-    perm = torch.randperm(images.size(0))
-    images, labels = images[perm], labels[perm]
-    if filenames is not None:
-        filenames = [filenames[i] for i in perm.tolist()]
-    return images, labels, filenames
 
 def late_augment(images, labels, filenames=None, *, st_aug=False):
     """
     Apply your normal augmentations AFTER tapering.
     Returns (imgs_aug, labels_aug, filenames_aug).
-    The replication factor n_aug is inferred from sizes.
+    If images is empty, this is a no-op.
     """
+    if images is None or (isinstance(images, torch.Tensor) and images.numel() == 0):
+        return images, labels, filenames
     imgs_aug, labels_aug = augment_images(images, labels, ST_augmentation=st_aug)
-    n_aug = imgs_aug.size(0) // max(1, images.size(0))     # infer n_aug (e.g. 8 for 4 rotations × 2 flips)
+    n_aug = imgs_aug.size(0) // max(1, images.size(0))
     if filenames is not None:
         filenames = replicate_list(filenames, n_aug)
     return imgs_aug, labels_aug, filenames
 
+def _name_base_from_fn(fn):
+    stem = Path(str(fn)).stem
+    return stem.split('T', 1)[0]
 
+def _z_from_meta(name):                 # base like "PSZ2G192.18+56.12"
+    return CLUSTER_META.get(name)
+
+# put near your other helpers
+def _ensure_4d(x: torch.Tensor) -> torch.Tensor:
+    """Make images [B,C,H,W]. If [B,T,1,H,W], fold T into C."""
+    if x is None:
+        return x
+    if x.dim() == 5:
+        # [B, T, 1, H, W]  ->  [B, T, H, W] -> treat T as channels
+        return x.flatten(1, 2)  # fold_T_axis does the same; this is inline & fast
+    if x.dim() == 3:
+        return x.unsqueeze(1)
+    return x  # already [B,C,H,W]
+
+def _coerce_float(v):
+    try:
+        x = float(v); 
+        return x if np.isfinite(x) else None
+    except Exception:
+        pass
+    if isinstance(v, (bytes, bytearray)):
+        try: v = v.decode('utf-8', 'ignore')
+        except Exception: return None
+    if isinstance(v, str):
+        m = re.search(r'[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?', v)
+        if m:
+            try: return float(m.group(0))
+            except Exception: return None
+    return None
 
 
 ###############################################

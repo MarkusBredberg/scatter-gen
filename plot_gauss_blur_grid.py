@@ -13,6 +13,7 @@ from matplotlib import colors as mcolors
 from matplotlib.colors import TwoSlopeNorm
 from matplotlib.cm import ScalarMappable
 from matplotlib.patches import Ellipse
+from mpl_toolkits.axes_grid1 import make_axes_locatable
 from astropy.wcs import WCS
 from astropy.cosmology import Planck18 as COSMO
 import astropy.units as u
@@ -20,7 +21,7 @@ from astropy.io import fits
 from astropy.time import Time
 from astropy.convolution import convolve_fft, Gaussian2DKernel
 from mpl_toolkits.axes_grid1 import make_axes_locatable
-import os, glob
+import os, glob, re
 try:
     # best case
     from skimage.registration import phase_cross_correlation as _pcc
@@ -33,7 +34,6 @@ try:
 except Exception:
     HAVE_REPROJECT = False
 print(f"HAVE_REPROJECT={HAVE_REPROJECT}")
-
 
     
 print("Loading scatter_galaxies/plot_gauss_blur_grid_editing.py...")
@@ -48,32 +48,99 @@ ARCSEC = np.deg2rad(1/3600)
 crop_size = (1, 512, 512)  # (T, C, H, W) for 3 channels, 512x512 images
 CLUSTER_METADATA_CSV = "/users/mbredber/scratch/data/PSZ2/cluster_metadata.csv" # Metadata CSV with redshifts
 
+_SLUG_RX = re.compile(
+    r'(PSZ2G)\s*(\d{3}\.\d{2})\s*([+\-])\s*(\d{2})(?:\.(\d{1,2}))?$',
+    re.IGNORECASE
+)
+
+def _norm_slug(s: str) -> str:
+    """Normalize spaces/underscores and collapse 'PSZ2 G' → 'PSZ2G'."""
+    s = str(s).strip()
+    s = s.replace('_', '').replace(' ', '')
+    s = s.replace('PSZ2G', 'PSZ2G').replace('PSZ2G', 'PSZ2G')  # idempotent
+    return s.upper()
+
+def _slug_variants(s: str):
+    """
+    Return normalized slug variants:
+      exact (with decimals if present) and a 'truncated-lat' version.
+    """
+    s = _norm_slug(s)
+    m = _SLUG_RX.match(s)
+    if not m:
+        return {s}
+    pfx, lon, sign, lat2, latdec = m.groups()
+    exact = f"{pfx}{lon}{sign}{lat2}" + (f".{latdec}" if latdec else "")
+    short = f"{pfx}{lon}{sign}{lat2}"
+    return {exact, short}
 
 def _load_cluster_meta(csv_path):
-    import csv, math, os
+    import csv, os, math
     d = {}
     if not os.path.exists(csv_path):
         print(f"[meta] CSV not found: {csv_path}")
         return d
+
+    def _try_float(x):
+        try:
+            v = float(x)
+            return v if math.isfinite(v) else None
+        except Exception:
+            return None
+
+    # Try headered first
     with open(csv_path, newline="") as f:
         R = csv.DictReader(f)
+        if R.fieldnames and {'slug','z'} <= {h.strip().lower() for h in R.fieldnames}:
+            n = 0
+            for row in R:
+                slug = row.get('slug', '')
+                z = _try_float(row.get('z', ''))
+                if not slug or z is None or not (0.0 < z < 5.0):
+                    continue
+                for v in _slug_variants(slug):
+                    d[v] = z
+                n += 1
+            print(f"[meta] loaded {len(d)} redshifts from headered CSV ({n} rows)")
+            return d
+
+    # Fallback: headerless (first col = slug, first numeric 0<z<5 in the rest)
+    with open(csv_path, newline="") as f:
+        R = csv.reader(f)
+        n = 0
         for row in R:
-            slug = (row.get("slug") or "").strip()
-            ztxt = (row.get("z") or "").strip()
-            try:
-                z = float(ztxt)
-            except Exception:
-                z = float("nan")
-            if slug and (z == z) and 0.0 < z < 5.0:   # z==z filters NaN
-                d[slug] = z
-    print(f"[meta] loaded {len(d)} redshifts from CSV")
+            if not row or str(row[0]).lstrip().startswith('#'):
+                continue
+            slug = row[0]
+            z = None
+            for cell in row[1:]:
+                z = _try_float(cell)
+                if z is not None and 0.0 < z < 5.0:
+                    break
+            if not slug or z is None:
+                continue
+            for v in _slug_variants(slug):
+                d[v] = z
+            n += 1
+        print(f"[meta] loaded {len(d)} redshifts from headerless CSV ({n} rows)")
     return d
 
 CLUSTER_META = _load_cluster_meta(CLUSTER_METADATA_CSV)
 
-def _z_from_meta(name):
-    """Lookup z by PSZ2 slug (we already pass base names like PSZ2G192.18+56.12)."""
-    return CLUSTER_META.get(name)
+def _z_from_meta(name: str):
+    """
+    Robust CSV lookup: normalize the query name and try all slug variants.
+    Also tries a prefix match as a last resort (for even-shorter names).
+    """
+    name = _norm_slug(_name_base_from_fn(name))
+    for v in _slug_variants(name):
+        if v in CLUSTER_META:
+            return CLUSTER_META[v]
+    # last resort: prefix match (e.g., 'PSZ2G192.18+56' vs 'PSZ2G192.18+56.23')
+    for k, z in CLUSTER_META.items():
+        if k.startswith(name):
+            return z
+    return None
 
 def radial_tukey(ny, nx, alpha=0.35):
     y = np.linspace(-1, 1, ny); x = np.linspace(-1, 1, nx)
@@ -136,8 +203,10 @@ def reproject_like(arr, src_hdr, dst_hdr):
 
 
 def kpc_to_arcsec(z, L_kpc):
-    """Physical size → angle (arcsec) using angular-diameter distance."""
-    return ((L_kpc * u.kpc) / COSMO.angular_diameter_distance(float(z))).to(u.arcsec).value
+    """Physical size → angle (arcsec) using θ ≈ L / D_A."""
+    D_A = COSMO.angular_diameter_distance(float(z)).to(u.kpc)
+    theta = (L_kpc * u.kpc / D_A) * u.rad  # mark the dimensionless ratio as radians
+    return theta.to(u.arcsec).value
 
 def synth_taper_header_from_kpc(raw_hdr, z, L_kpc,
                                 mode="keep_ratio"):  # or "circular"
@@ -191,9 +260,19 @@ def _make_uv_gaussian_weight(nx, ny, dx, dy, theta_fwhm_arcsec):
     where u,v are in cycles/radian (= wavelengths).
     """
     sigma_th = _sigma_from_fwhm_arcsec(theta_fwhm_arcsec)
-    u = np.fft.fftshift(np.fft.fftfreq(nx, d=dx))
-    v = np.fft.fftshift(np.fft.fftfreq(ny, d=dy))
+    
+    # ---------- uv-space weight W (same shape as F(I)) ----------
+    u = np.fft.fftshift(np.fft.fftfreq(W, d=dx))
+    v = np.fft.fftshift(np.fft.fftfreq(H, d=dy))
     U, V = np.meshgrid(u, v)
+
+    # world-space covariance of the RAW→TARGET kernel
+    C_world = _kernel_world_covariance_from_headers(raw_hdr, H_targ,
+                                                    fudge_scale=fudge_scale_demo)
+
+    # analytic W(u,v); DC = 1 at (u,v)=(0,0)
+    Wuv = _make_W_from_sigma_theta(U, V, sigma_theta_rad=None, anisotropic=C_world)
+
     return np.exp(-2.0 * (np.pi**2) * (sigma_th**2) * (U*U + V*V))
 
 def apply_uv_gaussian_taper(img, hdr_img, theta_fwhm_arcsec, pad_factor=1):
@@ -653,6 +732,262 @@ def _load_fits_arrays_scaled(name, crop_ch=1, out_hw=(128,128)):
     return (raw_cut, t25_cut, t50_cut, t100_cut,
             rt25_cut, rt50_cut, rt100_cut,
             raw_hdr, t25_hdr, t50_hdr, t100_hdr, pix_eff_arcsec, hdr_fft)
+    
+# ----------------------------- NEW: one-source figure -----------------------------
+
+def _gaussian2d_isotropic(shape, sigma_px):
+    """Return a unit-integral isotropic Gaussian kernel on a given pixel grid."""
+    ny, nx = shape
+    y = np.arange(ny) - (ny-1)/2.0
+    x = np.arange(nx) - (nx-1)/2.0
+    X, Y = np.meshgrid(x, y)
+    G = np.exp(-(X*X + Y*Y) / (2.0*sigma_px**2))
+    s = np.nansum(G)
+    if s <= 0 or not np.isfinite(s):  # guard
+        return np.zeros_like(G)
+    return G / s
+
+def _fft_forward(A, dx, dy):
+    """Continuous-norm forward FFT used elsewhere in this file: F = FFT(A) * (dx*dy)."""
+    return np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(A))) * (dx * dy)
+
+def _ifft_inverse(F, dx, dy):
+    """Inverse for the above convention: a = IFFT(F) / (dx*dy)."""
+    return np.fft.fftshift(np.fft.ifft2(np.fft.ifftshift(F))).real / (dx * dy)
+
+def _make_W_from_sigma_theta(U, V, sigma_theta_rad, anisotropic=None):
+    """
+    Analytic W(u,v). If 'anisotropic' is a 2x2 covariance matrix (rad^2),
+    use exp[-2π^2 k^T C k]. Otherwise assume isotropic sigma_theta_rad.
+    """
+    if anisotropic is not None:
+        # U,V are in cycles/radian. Build quadratic form per pixel.
+        # k = [U, V]; exponent = -2π^2 * (k^T C k)
+        a, b, c = float(anisotropic[0,0]), float(anisotropic[0,1]), float(anisotropic[1,1])
+        # k^T C k = a U^2 + 2b U V + c V^2
+        Q = a*(U*U) + 2.0*b*(U*V) + c*(V*V)
+        return np.exp(-2.0 * (np.pi**2) * Q)
+    else:
+        R2 = (U*U + V*V)
+        return np.exp(-2.0 * (np.pi**2) * (sigma_theta_rad**2) * R2)
+
+def _kernel_world_covariance_from_headers(raw_like_hdr, targ_hdr, fudge_scale=1.0):
+    """
+    Return the kernel's world-space covariance C_ker (rad^2) that turns RAW beam → target beam.
+    This mirrors the inner math of kernel_from_beams(...), but returns the *world* C_ker.
+    """
+    def _beam_cov_radians(bmaj_as, bmin_as, pa_deg):
+        sx = _sigma_from_fwhm_arcsec(bmaj_as)
+        sy = _sigma_from_fwhm_arcsec(bmin_as)
+        th = np.deg2rad(pa_deg)
+        R  = np.array([[np.cos(th), -np.sin(th)],
+                       [np.sin(th),  np.cos(th)]], dtype=float)
+        S  = np.diag([sx**2, sy**2])
+        return R @ S @ R.T  # world (rad^2)
+
+    # RAW-like and TARGET beam (arcsec)
+    bmaj_r = float(raw_like_hdr['BMAJ'])  * 3600.0
+    bmin_r = float(raw_like_hdr['BMIN'])  * 3600.0
+    pa_r   = float(raw_like_hdr.get('BPA', 0.0))
+    bmaj_t = float(targ_hdr['BMAJ']) * 3600.0
+    bmin_t = float(targ_hdr['BMIN']) * 3600.0
+    pa_t   = float(targ_hdr.get('BPA', pa_r))
+
+    C_raw = _beam_cov_radians(bmaj_r, bmin_r, pa_r)
+    C_tgt = _beam_cov_radians(bmaj_t, bmin_t, pa_t) * (fudge_scale**2)
+    C_ker = C_tgt - C_raw
+
+    # clip tiny negatives
+    w, V = np.linalg.eigh(C_ker)
+    w = np.clip(w, 0.0, None)
+    return (V * w) @ V.T  # world (rad^2)
+
+
+def plot_one_source_full(
+    name,
+    target_kpc=50,                   # 25, 50, or 100
+    out_hw=(128, 128),
+    fudge_scale_demo=1.0,
+    save_dir="uvmaps",
+    blur_fwhm_px=None,               # legacy, ignored (kernel comes from beams)
+    use_anisotropic_beam_demo=False, # legacy, ignored (anisotropy handled via beams)
+    **kwargs                          # absorb any other legacy kwargs safely
+):
+    """
+    Make a single 2x4 figure for `name` showing both routes:
+
+      TOP (image plane; shared colorbar for first 3):
+        [ I ,  I ⊗ G  (image-space RT) ,  𝔉⁻¹{ 𝔉(I) · W } (uv-space RT) ,  G ]
+
+      BOTTOM (uv plane; shared colorbar for first 3, log10 amplitude):
+        [ |𝔉(I)| ,  |𝔉(I ⊗ G)| ,  |𝔉(I) · W| ,  W(u,v) ]
+
+    Notes
+    -----
+    • G is the Gaussian kernel that turns the RAW restoring beam into the TARGET beam
+      (from `kernel_from_beams_cached` on the RAW grid), normalized to unit integral.
+    • W(u,v) is the continuous-norm FFT of G, rescaled so DC=1. This ensures that
+      𝔉(I ⊗ G) = 𝔉(I) · W holds numerically on the same grid.
+    • The uv-route image 𝔉⁻¹{𝔉(I)·W} is multiplied by Ω_tgt/Ω_raw to match the
+      Jy/beam_target units returned by `convolve_to_target`.
+    """
+
+
+    os.makedirs(save_dir, exist_ok=True)
+
+    # ---------- helpers (continuous-normalized FFT/IFFT) ----------
+    def _fft_forward(A, dx, dy):
+        return _np.fft.fftshift(_np.fft.fft2(_np.fft.ifftshift(_np.asarray(A, float)))) * (dx * dy)
+
+    def _ifft_inverse(F, dx, dy):
+        return _np.fft.fftshift(_np.fft.ifft2(_np.fft.ifftshift(_np.asarray(F, complex)))).real / (dx * dy)
+
+    # ---------- load arrays on a common, FFT-friendly grid ----------
+    (raw_cut, t25_cut, t50_cut, t100_cut,
+     rt25_cut, rt50_cut, rt100_cut,
+     raw_hdr, t25_hdr, t50_hdr, t100_hdr,
+     pix_eff_arcsec, hdr_fft) = _load_fits_arrays_scaled(name, crop_ch=1, out_hw=out_hw)
+
+    # choose target
+    if int(target_kpc) == 25:
+        T, RT, H_targ = t25_cut, rt25_cut, t25_hdr
+        t_tag, rt_tag = "T25", "RT25"
+    elif int(target_kpc) == 50:
+        T, RT, H_targ = t50_cut, rt50_cut, t50_hdr
+        t_tag, rt_tag = "T50", "RT50"
+    else:
+        T, RT, H_targ = t100_cut, rt100_cut, t100_hdr
+        t_tag, rt_tag = "T100", "RT100"
+
+
+    I = raw_cut
+    if I is None or RT is None or H_targ is None:
+        raise RuntimeError(f"Missing planes for {name}: I={I is not None}, RT={RT is not None}, H_targ={H_targ is not None}")
+
+    H, W = I.shape
+    dx = abs(_cdelt_deg(hdr_fft, 1)) * _np.pi/180.0
+    dy = abs(_cdelt_deg(hdr_fft, 2)) * _np.pi/180.0
+
+    # ---------- image-space kernel G (RAW → TARGET) ----------
+    ker = kernel_from_beams_cached(raw_hdr, H_targ, fudge_scale=fudge_scale_demo)
+
+    # small, native kernel for DISPLAY
+    G_small = np.asarray(ker.array, float)
+    G_small /= (np.nansum(G_small) + 1e-12)  # unit-integral
+
+    RT_img = convolve_to_target(I, raw_hdr, H_targ, fudge_scale=fudge_scale_demo)
+    
+    # ---------- uv-space weight W from analytic Gaussian (DC=1) ----------
+    # uv grid in cycles/radian
+    u = _np.fft.fftshift(_np.fft.fftfreq(W, d=dx))
+    v = _np.fft.fftshift(_np.fft.fftfreq(H, d=dy))
+    U, V = _np.meshgrid(u, v)
+
+    # world-space covariance of RAW→TARGET kernel (rad^2)
+    Cw = _kernel_world_covariance_from_headers(raw_hdr, H_targ,
+                                            fudge_scale=fudge_scale_demo)
+    a, b, c = float(Cw[0,0]), float(Cw[0,1]), float(Cw[1,1])
+
+    # W(u,v) = exp(-2π² · [a U² + 2b UV + c V²]); DC=1 by construction
+    Wuv = _np.exp(-2.0 * (_np.pi**2) * (a*(U**2) + 2.0*b*(U*V) + c*(V**2)))
+
+
+    # uv-route: multiply 𝔉(I) by W, inverse FFT, then convert units to Jy/beam_target
+    F_I_raw = _fft_forward(I, dx, dy)
+    F_uv    = F_I_raw * Wuv
+    I_uv    = _ifft_inverse(F_uv, dx, dy)
+    # match convolve_to_target() output units:
+    unit_scale = (_beam_solid_angle_sr(H_targ) / _beam_solid_angle_sr(raw_hdr))
+    RT_uv = I_uv * unit_scale
+
+    # For the uv-row we also need |𝔉(I ⊗ G)|
+    F_img = _fft_forward(RT_img, dx, dy)            # this already includes unit_scale
+    F_uv_scaled = F_uv * unit_scale                 # matches units of F_img
+    
+    T_true = T  # the real uv-tapered map loaded from disk and resampled
+    F_true = _fft_forward(T_true, dx, dy) if T_true is not None else None
+
+
+    # ---------- shared scales ----------
+    # top-row shared (images)
+    top_stack = _np.concatenate([
+        I[_np.isfinite(I)].ravel(),
+        RT_img[_np.isfinite(RT_img)].ravel(),
+        RT_uv[_np.isfinite(RT_uv)].ravel(),
+        (T_true[_np.isfinite(T_true)].ravel() if T_true is not None else _np.array([]))
+    ])
+
+    vmin_top = float(_np.nanpercentile(top_stack, 1.0))
+    vmax_top = float(_np.nanpercentile(top_stack, 99.5))
+    norm_top = mcolors.Normalize(vmin=vmin_top, vmax=vmax_top)
+
+    # bottom-row shared (log |F| )
+    A_raw  = _np.log10(_np.abs(F_I_raw)         + 1e-12)
+    A_img  = _np.log10(_np.abs(F_img)           + 1e-12)
+    A_uv   = _np.log10(_np.abs(F_uv_scaled)     + 1e-12)
+    A_true = _np.log10(_np.abs(F_true) + 1e-12) if F_true is not None else None
+
+    bot_vals = _np.concatenate([
+        A_raw[_np.isfinite(A_raw)].ravel(),
+        A_img[_np.isfinite(A_img)].ravel(),
+        A_uv [_np.isfinite(A_uv )].ravel(),
+        (A_true[_np.isfinite(A_true)].ravel() if A_true is not None else _np.array([]))
+    ])
+
+    vmin_bot = float(_np.nanpercentile(bot_vals, 1.0))
+    vmax_bot = float(_np.nanpercentile(bot_vals, 99.5))
+    norm_bot = mcolors.Normalize(vmin=vmin_bot, vmax=vmax_bot)
+
+    # W(u,v) display (log)
+    W_show = _np.log10(_np.abs(Wuv) + 1e-12)
+    vmin_W = float(_np.nanpercentile(W_show, 2.0))
+    vmax_W = float(_np.nanpercentile(W_show, 98.0))
+    norm_W = mcolors.Normalize(vmin=vmin_W, vmax=vmax_W)
+
+    # ---------- figure ----------
+    fig = plt.figure(figsize=(16.0, 7.8))
+    gs  = fig.add_gridspec(2, 5, wspace=0.10, hspace=0.16)
+
+    # ---- TOP ROW (image plane) ----
+    axI   = fig.add_subplot(gs[0,0]); im0 = axI.imshow(I,       origin='lower', cmap='viridis', norm=norm_top); axI.set_axis_off(); axI.set_title('RAW  $I(\\ell,m)$')
+    axRTi = fig.add_subplot(gs[0,1]); im1 = axRTi.imshow(RT_img,origin='lower', cmap='viridis', norm=norm_top); axRTi.set_axis_off(); axRTi.set_title(f'{rt_tag}: $I\\,*\\,G$  (image space)')
+    axRTu = fig.add_subplot(gs[0,2]); im2 = axRTu.imshow(RT_uv, origin='lower', cmap='viridis', norm=norm_top); axRTu.set_axis_off(); axRTu.set_title(f'{rt_tag}: $\\mathcal{{F}}^{{-1}}[\\mathcal{{F}}(I)\\,W]$  (uv space)')
+    axT   = fig.add_subplot(gs[0,3]); im3 = axT.imshow(T_true,  origin='lower', cmap='viridis', norm=norm_top); axT.set_axis_off();  axT.set_title(f'{t_tag}  (from FITS)')
+    axG   = fig.add_subplot(gs[0,4]); axG.imshow(G_small,       origin='lower', cmap='magma');                  axG.set_axis_off();  axG.set_title('Gaussian kernel  $G$')
+
+    # one shared colorbar for the four image maps (exclude G)
+    fig.colorbar(ScalarMappable(norm=norm_top, cmap='viridis'),
+                ax=[axI, axRTi, axRTu, axT], fraction=0.046, pad=0.02,
+                label='Jy/beam')
+
+    fig.text(0.015, 0.92, 'Image plane: RAW, two RT constructions, and the true tapered map',
+            fontsize=11, weight='bold')
+
+    # ---- BOTTOM ROW (uv plane) ----
+    axF0 = fig.add_subplot(gs[1,0]); imF0 = axF0.imshow(A_raw,  origin='lower', cmap='viridis', norm=norm_bot); axF0.set_axis_off(); axF0.set_title(r'RAW  $|\mathcal{F}(I)|$  (log)')
+    axF1 = fig.add_subplot(gs[1,1]); imF1 = axF1.imshow(A_img,  origin='lower', cmap='viridis', norm=norm_bot); axF1.set_axis_off(); axF1.set_title(rf'{rt_tag}: $|\mathcal{{F}}(I*G)|$  (log)')
+    axF2 = fig.add_subplot(gs[1,2]); imF2 = axF2.imshow(A_uv,   origin='lower', cmap='viridis', norm=norm_bot); axF2.set_axis_off(); axF2.set_title(rf'{rt_tag}: $|\mathcal{{F}}(I)\,W|$  (log)')
+    axF3 = fig.add_subplot(gs[1,3]); imF3 = axF3.imshow(A_true, origin='lower', cmap='viridis', norm=norm_bot); axF3.set_axis_off(); axF3.set_title(rf'{t_tag}: $|\mathcal{{F}}(T)|$  (log)')
+    axWv = fig.add_subplot(gs[1,4]); axWv.imshow(_np.log10(_np.abs(Wuv)+1e-12), origin='lower', cmap='viridis', norm=norm_W); axWv.set_axis_off(); axWv.set_title('$W(u,v)$  (log)')
+
+    # one shared colorbar for the four |F| maps (exclude W)
+    fig.colorbar(ScalarMappable(norm=norm_bot, cmap='viridis'),
+                ax=[axF0, axF1, axF2, axF3], fraction=0.046, pad=0.02,
+                label=r'$\log_{10}$ amplitude (Jy)')
+
+    fig.text(0.015, 0.50, 'UV plane: amplitudes for RAW, both RT routes, and the true tapered map',
+            fontsize=11, weight='bold')
+
+    # overall title (use RTxx)
+    fig.suptitle(f"{name}  —  {rt_tag}  —  RAW, RT, visibilities, and convolution theorem (two paths)",
+                y=0.995, fontsize=12)
+
+
+    out = os.path.join(save_dir, f"one_source_{name}_{targ_tag}_two_paths.pdf")
+    fig.savefig(out, dpi=250, bbox_inches='tight')
+    plt.close(fig)
+    print(f"[one-source] wrote {out}")
+
 
 def kernel_from_beams(raw_hdr, targ_hdr, fudge_scale=1.0):
     """
@@ -857,7 +1192,43 @@ def _pixscale_arcsec(hdr):
 
 
 def auto_fudge_scale(raw_img, raw_hdr, targ_hdr, T_img,
-                     s_grid=np.linspace(1.00, 1.20, 11), nbins=36):
+                     s_grid=np.linspace(1.00, 1.40, 41), nbins=36):
+    """
+    Automatically determine a fudge_scale to improve the match between
+    the tapered image T_img and the convolved raw_img → targ_hdr.
+    A fudge_scale is a multiplicative factor on the target beam size
+    used in the convolution kernel (kernel_from_beams). 
+    This is to compensate for imperfect weighting of long baselines
+    in the original imaging, which leads to a mismatch in the
+    radial brightness profiles at high spatial frequencies.
+    The fudge_scale should be ≥1.0 (1.0 = no change).
+    
+    The best fudge_scale is the one that minimizes the median absolute
+    deviation of the radial brightness ratio from 1.0, over the range
+    where the coherence is good (>0.6).
+    
+    Parameters
+    ----------
+    raw_img : 2D array
+        The raw image on its native grid (Jy/beam_native).
+    raw_hdr : FITS header
+        The FITS header for raw_img.
+    targ_hdr : FITS header
+        The FITS header for the tapered image T_img.
+    T_img : 2D array
+        The tapered image on its own grid (Jy/beam_target).
+    s_grid : 1D array
+        The grid of fudge_scale values to try.
+    nbins : int
+        Number of radial bins for the comparison.
+        
+    Returns
+    -------
+    best_s : float
+        The best fudge_scale found (within s_grid).
+    """
+
+
     # Work entirely on the tapered grid
     best_s, best_cost = 1.0, np.inf
     U,V,FT,AT = image_to_vis(T_img, targ_hdr, beam_hdr=targ_hdr)
@@ -883,14 +1254,19 @@ def auto_fudge_scale(raw_img, raw_hdr, targ_hdr, T_img,
             den2 = np.nanmean(np.abs(FR[m])**2)
             coh.append(np.abs(num)/np.sqrt(den1*den2))
         coh = np.asarray(coh)
+        
+        good = np.isfinite(aT) & np.isfinite(aR) & (coh > 0.6)
 
-        # fit only where the data are trustworthy
-        m = (coh > 0.6) & np.isfinite(aT) & np.isfinite(aR) & (r > r[1]) & (r < 0.8*np.nanmax(r))
-        if not np.any(m): 
-            continue
-        # Cost: how flat and close to 1 the ratio is (log space = equal weight)
-        ratio = aT[m] / (aR[m] + 1e-12)
-        cost = np.nanmedian(np.abs(np.log(ratio)))
+        # focus on the central 20–80% baselines where taper matters
+        qlo, qhi = np.nanpercentile(r[good], [20, 80])
+        band = good & (r >= qlo) & (r <= qhi)
+        cost = np.inf
+        if np.any(band):
+            # joint gain+fudge in log-space (gain closed-form)
+            d = np.log(aT[band]) - np.log(aR[band])
+            w = (coh[band]**2)
+            g = np.exp(np.nansum(w * d) / np.nansum(w))   # best gain
+            cost = np.nanmedian(np.abs(np.log(aT[band]) - np.log(g*aR[band])))
         if cost < best_cost:
             best_cost, best_s = cost, float(s)
     return best_s
@@ -912,14 +1288,16 @@ def _cdelt_deg(hdr, axis):
     return float(np.hypot(M[0, axis-1], M[1, axis-1]))
 
 def image_to_vis(img, img_hdr, beam_hdr=None, divide_by_beam=True,
-                 window='tukey', alpha=0.35, pad_factor=2, roi=0.92,
-                 subtract_mean=True):
+                 window=None, alpha=0.35, pad_factor=2, roi=0.9,
+                 subtract_mean=False):
     """
     Convert a 2D sky image to its discrete Fourier transform (visibilities).
 
     • Optional conversion to Jy/sr (divide by Ω_beam) before the FFT.
-    • Robust DC removal: subtract median inside a central elliptical ROI.
-    • Strong Tukey apodization to tame edge/aliasing.
+    • Robust DC removal: subtract median offset within a central ellipse
+      (fraction 'roi' of image size; set roi=0 to disable).
+    • Apodization window: 'tukey' (default) or 'hann'
+    • Strong Tukey apodization to tame edge/aliasing with alpha=0.35 (default);
     • Optional zero-padding (×2 by default) to reduce wrap-around.
     """
     B = np.array(img, dtype=float)                  # keep NaNs for stats
@@ -950,6 +1328,7 @@ def image_to_vis(img, img_hdr, beam_hdr=None, divide_by_beam=True,
         A *= radial_tukey(ny, nx, alpha=alpha)
     elif window == 'hann':
         A *= radial_hann(ny, nx)
+        
     # Zero-padding
     if pad_factor and pad_factor > 1:
         ny2, nx2 = int(ny * pad_factor), int(nx * pad_factor)
@@ -963,7 +1342,7 @@ def image_to_vis(img, img_hdr, beam_hdr=None, divide_by_beam=True,
     dy = abs(_cdelt_deg(img_hdr, 2)) * np.pi / 180.0
 
     # Continuous-norm FFT ⇒ |F| in Jy
-    F = np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(A))) * (dx * dy)
+    F = np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(A))) * (dx * dy) # centralise 0-freq of a 2D FT of inverse shifted A
 
     # Frequency axes (cycles/radian = wavelengths)
     u = np.fft.fftshift(np.fft.fftfreq(nx, d=dx))
@@ -997,121 +1376,129 @@ def _radial_bin(u, v, values, nbins=36, rmin=None, rmax=None, logspace=True, sta
     rc = 0.5*(edges[:-1] + edges[1:])
     return rc, np.asarray(out)
 
-def vis_compare_quicklook(name, T, RT, hdr_img, hdr_beam, tag, outdir='.', nbins=36):
+def vis_compare_quicklook(name, T, RT, RAW, hdr_img, hdr_beam_T, hdr_beam_RAW,
+                          tag, outdir='.', nbins=36):
     """
-    Compact figure comparing visibilities of TARGET image (T) and RAW→TARGET (RT).
-    Adds:
-      • annulus-wise amplitude mask for Δϕ map,
-      • optional coherence mask on the ratio curve to suppress noisy spikes.
+    Compact figure comparing visibilities of RAW, RT (= RAW→T beam), and T.
+
+    Left block (2×4 small panels):
+      top:   |F_RAW|, |F_RT|, |F_T|, ||F_T|-|F_RT||   (all log10 with shared norm)
+      bottom:arg(F_RAW), arg(F_RT), arg(F_T), Δϕ(T−RT) (deg, shared norm)
+
+    Right block: radial medians for |F_T| and |F_RT| + ratio/coherence (as before).
     """
-    # FFTs
-    U,V,FT,AT = image_to_vis(T,  hdr_img, beam_hdr=hdr_beam)
-    _,_,FR,AR = image_to_vis(RT, hdr_img, beam_hdr=hdr_beam)
+
+    # --- FFTs (all on the same img grid, dividing by the appropriate beam) ---
+    U,V,Fraw,Araw = image_to_vis(RAW, hdr_img, beam_hdr=hdr_beam_RAW)
+    _,_,FR,AR     = image_to_vis(RT,  hdr_img, beam_hdr=hdr_beam_T)
+    _,_,FT,AT     = image_to_vis(T,   hdr_img, beam_hdr=hdr_beam_T)
 
     # Differences
-    dphi = np.angle(FT * np.conj(FR))
+    dphi = np.angle(FT * np.conj(FR))            # phase(T) − phase(RT)
+    dA   = np.abs(AT - AR)                        # ||F_T|-|F_RT||
 
-    # Radial profiles
+    # Radial stats for the right-hand plot (unchanged)
     r, aT = _radial_bin(U,V,AT, nbins=nbins, stat='median')
     _, aR = _radial_bin(U,V,AR, nbins=nbins, stat='median')
     ratio = aT / (aR + 1e-12)
 
-    # Coherence and cross-phase per annulus
     Rgrid = np.sqrt(U*U + V*V)
     edges = np.geomspace(np.nanpercentile(Rgrid,1.0), np.nanmax(Rgrid), nbins+1)
-
-    num_r, den1_r, den2_r, ph_r = [], [], [], []
+    num_r, den1_r, den2_r = [], [], []
     for i in range(nbins):
         m = (Rgrid>=edges[i]) & (Rgrid<edges[i+1])
         if not np.any(m):
-            num_r.append(np.nan); den1_r.append(np.nan); den2_r.append(np.nan); ph_r.append(np.nan); continue
+            num_r.append(np.nan); den1_r.append(np.nan); den2_r.append(np.nan); continue
         num  = np.nanmean(FT[m] * np.conj(FR[m]))
         den1 = np.nanmean(np.abs(FT[m])**2)
         den2 = np.nanmean(np.abs(FR[m])**2)
-        num_r.append(np.abs(num)); den1_r.append(den1); den2_r.append(den2); ph_r.append(np.angle(num))
-    num_r = np.asarray(num_r); den1_r = np.asarray(den1_r); den2_r = np.asarray(den2_r)
-    coh   = num_r / np.sqrt(den1_r * den2_r)
-
-    # Δϕ map: keep only uv pixels above a local amplitude threshold
-    amp   = 0.5*(AT + AR)
-    keep  = np.zeros_like(amp, dtype=bool)
-    for i in range(nbins):
-        m = (Rgrid>=edges[i]) & (Rgrid<edges[i+1])
-        if not np.any(m): 
-            continue
-        thr = np.nanpercentile(amp[m], 35.0)
-        keep |= (m & (amp > thr))
-    dphi_deg_map = np.where(keep, np.rad2deg(dphi), np.nan)
+        num_r.append(np.abs(num)); den1_r.append(den1); den2_r.append(den2)
+    coh = np.asarray(num_r) / np.sqrt(np.asarray(den1_r) * np.asarray(den2_r))
 
     # ---- figure ----
-    fig = plt.figure(figsize=(12.2, 6.6))
-    gs  = fig.add_gridspec(2, 3, width_ratios=[1.0, 1.0, 1.55],
-                           height_ratios=[1.0, 0.42], wspace=0.26, hspace=0.28)
-    gs_maps = gs[0, 0:2].subgridspec(2, 2, wspace=0.08, hspace=0.12)
+    fig = plt.figure(figsize=(13.4, 6.6))
+    gs = fig.add_gridspec(
+        2, 3,
+        width_ratios=[1.55, 1.55, 1.35],  # a bit wider to fit 4 small columns
+        height_ratios=[1.0, 0.44],
+        wspace=0.22, hspace=0.22
+    )
 
-    # |F_T| (log10)
-    ax00 = fig.add_subplot(gs_maps[0,0])
-    ax00.imshow(np.log10(AT + 1e-12), origin='lower', aspect='equal')
-    ax00.set_title('|F_T| (log10)'); ax00.set_axis_off()
+    # 2×4 grid for small UV panels
+    gs_maps = gs[0, 0:2].subgridspec(2, 4, wspace=0.08, hspace=0.10)
 
-    # |F_RT| (log10)
-    ax01 = fig.add_subplot(gs_maps[0,1])
-    ax01.imshow(np.log10(AR + 1e-12), origin='lower', aspect='equal')
-    ax01.set_title('|F_RT| (log10)'); ax01.set_axis_off()
+    # ---------- Amplitudes (log10) with one shared normalisation ----------
+    amp_log_raw = np.log10(Araw + 1e-12)
+    amp_log_rt  = np.log10(AR   + 1e-12)
+    amp_log_t   = np.log10(AT   + 1e-12)
+    both = np.concatenate([
+        amp_log_raw[np.isfinite(amp_log_raw)].ravel(),
+        amp_log_rt [np.isfinite(amp_log_rt )].ravel(),
+        amp_log_t  [np.isfinite(amp_log_t  )].ravel()
+    ])
+    vmin = np.nanpercentile(both, 1.0)
+    vmax = np.nanpercentile(both, 99.5)
+    shared_norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
 
-    # Δ|F|  <-- MISSING AXIS WAS HERE
-    ax10 = fig.add_subplot(gs_maps[1,0])   # <— add this line
-    dA_abs = np.abs(FT) - np.abs(FR)
-    dA_rel = dA_abs / (0.5*(np.abs(FT)+np.abs(FR)) + 1e-12)
-    dA_plot = np.where(keep, dA_rel, np.nan)
-    finite = np.isfinite(dA_plot)
-    R = (np.nanpercentile(np.abs(dA_plot[finite]), 99.5) if np.any(finite) else 1.0)
-    norm_dA = TwoSlopeNorm(vmin=-R, vcenter=0.0, vmax=+R)
-    im10 = ax10.imshow(dA_plot, origin='lower', cmap='RdBu_r', norm=norm_dA, aspect='equal')
-    ax10.set_title('Δ|F| (relative)'); ax10.set_axis_off()
-    div10 = make_axes_locatable(ax10); cax10 = div10.append_axes("right", size="4.5%", pad=0.04)
-    fig.colorbar(im10, cax=cax10, label='Δ|F| / ⟨|F|⟩')
+    axA0 = fig.add_subplot(gs_maps[0, 0]); imA0 = axA0.imshow(amp_log_raw, origin='lower', aspect='equal', norm=shared_norm, cmap='viridis'); axA0.set_title('|F_RAW|'); axA0.set_axis_off()
+    axA1 = fig.add_subplot(gs_maps[0, 1]); imA1 = axA1.imshow(amp_log_rt,  origin='lower', aspect='equal', norm=shared_norm, cmap='viridis'); axA1.set_title('|F_RT|');  axA1.set_axis_off()
+    axA2 = fig.add_subplot(gs_maps[0, 2]); imA2 = axA2.imshow(amp_log_t,   origin='lower', aspect='equal', norm=shared_norm, cmap='viridis'); axA2.set_title('|F_T|');   axA2.set_axis_off()
 
-    # Δϕ (deg)
-    ax11 = fig.add_subplot(gs_maps[1,1])
-    im11 = ax11.imshow(dphi_deg_map, origin='lower', cmap='twilight', vmin=-180, vmax=180, aspect='equal')
-    ax11.set_title('Δϕ (deg)'); ax11.set_axis_off()
-    div11 = make_axes_locatable(ax11); cax11 = div11.append_axes("right", size="4.5%", pad=0.04)
-    fig.colorbar(im11, cax=cax11, label='Δϕ (deg)')
+    # ||F_T|-|F_RT|| uses the SAME scale as amplitudes
+    axA3 = fig.add_subplot(gs_maps[0, 3])
+    dA_log = np.log10(dA + 1e-12)
+    dA_log = np.clip(dA_log, vmin, vmax)
+    imA3 = axA3.imshow(dA_log, origin='lower', aspect='equal', cmap='viridis', norm=shared_norm)
+    axA3.set_title('||F_T|-|F_RT||'); axA3.set_axis_off()
 
-    # Right column: radial |F| + ratio/coherence
-    axA = fig.add_subplot(gs[:, 2])
+    # One shared colour bar for the 4 amplitude panels
+    fig.colorbar(imA2, ax=[axA0, axA1, axA2, axA3], location='right',
+                 fraction=0.046, pad=0.04, label='log10 amplitude (Jy)')
+
+    # ---------- Phases with one shared colour bar ----------
+    phase_norm = mcolors.Normalize(-180, 180)
+    cmap_phase = 'twilight'
+
+    axP0 = fig.add_subplot(gs_maps[1, 0]); imP0 = axP0.imshow(np.rad2deg(np.angle(Fraw)), origin='lower', aspect='equal', cmap=cmap_phase, norm=phase_norm); axP0.set_axis_off()
+    axP1 = fig.add_subplot(gs_maps[1, 1]); imP1 = axP1.imshow(np.rad2deg(np.angle(FR)),   origin='lower', aspect='equal', cmap=cmap_phase, norm=phase_norm); axP1.set_axis_off()
+    axP2 = fig.add_subplot(gs_maps[1, 2]); imP2 = axP2.imshow(np.rad2deg(np.angle(FT)),   origin='lower', aspect='equal', cmap=cmap_phase, norm=phase_norm); axP2.set_axis_off()
+    axP3 = fig.add_subplot(gs_maps[1, 3]); imP3 = axP3.imshow(np.rad2deg(dphi),           origin='lower', aspect='equal', cmap=cmap_phase, norm=phase_norm); axP3.set_axis_off()
+
+    sm_phase = ScalarMappable(norm=phase_norm, cmap=cmap_phase); sm_phase.set_array([])
+    fig.colorbar(sm_phase, ax=[axP0, axP1, axP2, axP3], location='right',
+                 fraction=0.046, pad=0.04, label='phase (deg)', ticks=[-180,-90,0,90,180])
+
+    # ---------- Right column: |F| medians, ratio & coherence (unchanged) ----------
+    axR = fig.add_subplot(gs[:, 2])
     kλ = r/1e3
-    axA.plot(kλ, aT, lw=1.5, label='|F_T| (median)')
-    axA.plot(kλ, aR, lw=1.5, ls='--', label='|F_RT| (median)')
-    axA.set_xscale('log'); axA.set_yscale('log')
-    axA.set_xlabel('baseline (kλ)'); axA.set_ylabel('median |F| (Jy)')
-    axA.grid(True, which='both', ls=':', alpha=0.4)
+    axR.plot(kλ, aT, lw=1.5, color='C0', label='|F_T| (median)')
+    axR.plot(kλ, aR, lw=1.5, color='r',  label='|F_RT| (median)')
+    axR.set_xscale('log'); axR.set_yscale('log')
+    axR.set_xlabel(r'baseline $r=\sqrt{u^2+v^2}$ (kλ)'); axR.set_ylabel('median |F| (Jy)')
+    axR.grid(True, which='both', ls=':', alpha=0.4)
 
-    # Suppress meaningless ratio spikes at very low coherence
     good = (coh > 0.6)
-    # Add a tiny floor on both medians
     thrT = np.nanpercentile(aT, 5.0)
     thrR = np.nanpercentile(aR, 5.0)
     good &= (aT > thrT) & (aR > thrR)
     ratio_plot = np.where(good, ratio, np.nan)
 
-    axA2 = axA.twinx()
-    axA2.plot(kλ, ratio_plot, lw=1.0, label='|F_T| / |F_RT|')
-    axA2.plot(kλ, coh,        lw=1.0, label='coherence')
-    axA2.set_ylabel('ratio / coherence')
+    axR2 = axR.twinx()
+    axR2.plot(kλ, ratio_plot, lw=1.4, color='k', label='|F_T| / |F_RT|')
+    axR2.plot(kλ, coh,        lw=1.2, color='k', ls=':', label='coherence')
+    axR2.set_ylabel('ratio / coherence')
     ymax = np.nanmax([np.nanmax(coh), np.nanmax(ratio_plot), 1.0])
-    axA2.set_ylim(0, max(1.05, ymax))
+    axR2.set_ylim(0, max(1.05, ymax))
 
-    lines, labels = axA.get_legend_handles_labels()
-    lines2, labels2 = axA2.get_legend_handles_labels()
-    axA.legend(lines + lines2, labels + labels2, loc='lower left', fontsize=9)
+    lines, labels = axR.get_legend_handles_labels()
+    lines2, labels2 = axR2.get_legend_handles_labels()
+    axR.legend(lines + lines2, labels + labels2, loc='lower left', fontsize=9)
 
-    # Bottom: phase stats vs baseline (amplitude-weighted circular stats)
-    axP = fig.add_subplot(gs[1, 0:2])
+    # ---------- Bottom: phase stats vs baseline (as before) ----------
+    axPstat = fig.add_subplot(gs[1, 0:2])
     phi_bar_deg, sigma_circ_deg, rphi = [], [], []
     for i in range(nbins):
-        m = (Rgrid >= edges[i]) & (Rgrid < edges[i+1]) & keep & np.isfinite(dphi)
+        m = (Rgrid >= edges[i]) & (Rgrid < edges[i+1]) & np.isfinite(dphi)
         if not np.any(m):
             phi_bar_deg.append(np.nan); sigma_circ_deg.append(np.nan); rphi.append(np.nan); continue
         w = AT[m] * AR[m]
@@ -1124,15 +1511,15 @@ def vis_compare_quicklook(name, T, RT, hdr_img, hdr_beam, tag, outdir='.', nbins
         sigma_circ_deg.append(np.rad2deg(np.sqrt(np.maximum(0.0, -2.0*np.log(Rlen)))))
         rphi.append(0.5*(edges[i] + edges[i+1]))
     rphi = np.asarray(rphi); phi_bar_deg = np.asarray(phi_bar_deg); sigma_circ_deg = np.asarray(sigma_circ_deg)
-    axP.plot(rphi/1e3, np.abs(phi_bar_deg), lw=1.2, label='|mean Δϕ|')
-    axP.plot(rphi/1e3, sigma_circ_deg, lw=1.2, ls='--', label='circular σ(Δϕ)')
-    axP.set_xscale('log'); axP.set_xlabel('baseline (kλ)'); axP.set_ylabel('phase (deg)')
-    axP.grid(True, which='both', ls=':', alpha=0.4); axP.legend(loc='upper left', fontsize=9)
+    axPstat.plot(rphi/1e3, np.abs(phi_bar_deg), lw=1.2, label='|mean Δϕ|')
+    axPstat.plot(rphi/1e3, sigma_circ_deg, lw=1.2, ls='--', label=r'$\sigma(\Delta\phi)=\sqrt{-2\ln R}$')
+    axPstat.set_xscale('log'); axPstat.set_xlabel('baseline (kλ)'); axPstat.set_ylabel('phase (deg)')
+    axPstat.grid(True, which='both', ls=':', alpha=0.4); axPstat.legend(loc='upper left', fontsize=9)
 
     fig.suptitle(f'{name}  –  {tag}', y=0.98, fontsize=12)
     save_dir = os.path.join(outdir, 'uvmaps'); os.makedirs(save_dir, exist_ok=True)
     out = os.path.join(save_dir, f'uvcmp_{name}_{tag}.pdf')
-    fig.savefig(out, dpi=200, bbox_inches='tight'); plt.close(fig)
+    fig.savefig(out, dpi=250, bbox_inches='tight'); plt.close(fig)
     print(f'Wrote {out}')
     
 hdr = fits.getheader("/users/mbredber/scratch/data/PSZ2/fits/PSZ2G192.18+56.12/PSZ2G192.18+56.12CHANDRA.fits")
@@ -1253,17 +1640,23 @@ def plot_galaxy_grid(images, filenames, labels,
         ax.set_title(t, fontsize=12, pad=6)
 
     # row positions for the chosen sources (skip the spacer index if present)
-    row_map = list(range(top)) + list(range(top + spacer, top + spacer + bot))
+    row_map = list(range(top)) + list(range(top + spacer, top + spacer + bot)) 
+    print("Row map:", row_map)
     outH, outW = images.shape[-2], images.shape[-1]
 
     # ---------- PASS 1: load, convolve, and paired debug ----------
     rows = []
     for i_src, grid_row in enumerate(row_map):
         name = _name_base_from_fn(filenames[i_src])
+        print("Name:", name)
         (raw_cut, t25_cut, t50_cut, t100_cut,
         rt25_cut, rt50_cut, rt100_cut,
         raw_hdr, t25_hdr, t50_hdr, t100_hdr,
         pix_eff, hdr_fft) = _load_fits_arrays_scaled(name, crop_ch=1, out_hw=(outH, outW))
+        print("Name:", name, "raw_cut shape:", None if raw_cut is None else raw_cut.shape,
+              "t25_cut shape:", None if t25_cut is None else t25_cut.shape,
+              "t50_cut shape:", None if t50_cut is None else t50_cut.shape,
+              "t100_cut shape:", None if t100_cut is None else t100_cut.shape)
         
         rows.append(dict(
             name=name, grid_row=grid_row,
@@ -1276,11 +1669,23 @@ def plot_galaxy_grid(images, filenames, labels,
         # -------- Controls and checks --------
         if DO_VIS:
             if (t25_cut is not None) and (rt25_cut is not None):
-                vis_compare_quicklook(name, t25_cut,  rt25_cut,  hdr_fft, t25_hdr,  tag='T25')
+                vis_compare_quicklook(name,
+                                    T=t25_cut, RT=rt25_cut, RAW=raw_cut,
+                                    hdr_img=hdr_fft,
+                                    hdr_beam_T=t25_hdr, hdr_beam_RAW=raw_hdr,
+                                    tag='T25')
             if (t50_cut is not None) and (rt50_cut is not None):
-                vis_compare_quicklook(name, t50_cut,  rt50_cut,  hdr_fft, t50_hdr,  tag='T50')
+                vis_compare_quicklook(name,
+                                    T=t50_cut, RT=rt50_cut, RAW=raw_cut,
+                                    hdr_img=hdr_fft,
+                                    hdr_beam_T=t50_hdr, hdr_beam_RAW=raw_hdr,
+                                    tag='T50')
             if (t100_cut is not None) and (rt100_cut is not None):
-                vis_compare_quicklook(name, t100_cut, rt100_cut, hdr_fft, t100_hdr, tag='T100')
+                vis_compare_quicklook(name,
+                                    T=t100_cut, RT=rt100_cut, RAW=raw_cut,
+                                    hdr_img=hdr_fft,
+                                    hdr_beam_T=t100_hdr, hdr_beam_RAW=raw_hdr,
+                                    tag='T100')
 
         # --- Registration sanity + optional correction on the display grid ---
         for tgt, T, RT in [(25, t25_cut, rt25_cut),
@@ -1312,25 +1717,6 @@ def plot_galaxy_grid(images, filenames, labels,
             print("RAW:", describe(raw_hdr), "  T50:", describe(t50_hdr))
     except NameError:
         pass
-
-
-    # ---------- Optional: show global clip stats (for reference only) ----------
-    if not SKIP_CLIP_NORM:
-        all_vals = []
-        for r in rows:
-            for k in ("t25","t50","t100","rt25","rt50","rt100"):
-                a = r[k]
-                if a is not None:
-                    a = np.asarray(a, float)
-                    a = a[np.isfinite(a)]
-                    if a.size:
-                        all_vals.append(a.ravel())
-        if all_vals:
-            v = np.concatenate(all_vals)
-            g_lo, g_hi = np.nanpercentile(v, [lo, hi])
-            if not np.isfinite(g_hi - g_lo) or g_hi <= g_lo:
-                g_lo, g_hi = np.nanmin(v), np.nanmax(v)
-            print(f"Global clip percentiles: {lo}→{hi} gives {g_lo:.3e} to {g_hi:.3e}")
             
     # ---------- FAST PATH: no clipping/normalisation ----------
     if SKIP_CLIP_NORM:
@@ -1417,7 +1803,25 @@ def plot_galaxy_grid(images, filenames, labels,
         plt.savefig(outname, dpi=300, bbox_inches="tight", pad_inches=0.02)
         plt.close(fig)
         print(f"Wrote {outname}")
+        print("Used the short-circuit path with SKIP_CLIP_NORM=True.")
         return
+    
+    # ---------- Optional: show global clip stats (for reference only) ----------
+    all_vals = []
+    for r in rows:
+        for k in ("t25","t50","t100","rt25","rt50","rt100"):
+            a = r[k]
+            if a is not None:
+                a = np.asarray(a, float)
+                a = a[np.isfinite(a)]
+                if a.size:
+                    all_vals.append(a.ravel())
+    if all_vals:
+        v = np.concatenate(all_vals)
+        g_lo, g_hi = np.nanpercentile(v, [lo, hi])
+        if not np.isfinite(g_hi - g_lo) or g_hi <= g_lo:
+            g_lo, g_hi = np.nanmin(v), np.nanmax(v)
+        print(f"Global clip percentiles: {lo}→{hi} gives {g_lo:.3e} to {g_hi:.3e}")
 
     # ---------- Build planes per row (SIGNED residuals, real clipping) ----------
     rows_planes = []
@@ -1559,4 +1963,20 @@ if __name__ == "__main__":
     eval_imgs   = result[2]
     eval_labels = result[3]  # eval_labels lives at index 3
     eval_fns    = result[5]
+    
+    for probe in ["PSZ2G120.08-44", "PSZ2G150.56+58", "PSZ2G031.93+78"]:
+        z = _z_from_meta(probe)
+        print(f"[meta-test] {probe} → z={z}")
+        
+    # --- Example: make the one-source figure for the first eval example ---
+    example_name = _name_base_from_fn(eval_fns[0])
+    print("[one-source] building figure for:", example_name)
+    plot_one_source_full(
+        name=example_name,
+        target_kpc=50,             # choose 25 / 50 / 100
+        out_hw=(128, 128),         # should match the loader’s downsample size
+        blur_fwhm_px=5.0,          # size of the demo Gaussian in image pixels
+        use_anisotropic_beam_demo=False  # set True to base W(u,v) on the beam difference
+    )
+    
     plot_galaxy_grid(eval_imgs, eval_fns, eval_labels, lo=60, hi=100, SKIP_CLIP_NORM=False, SCALE_SEPARATE=True, DO_VIS=True)

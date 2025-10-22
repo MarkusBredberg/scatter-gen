@@ -634,7 +634,46 @@ def count_emission_regions(image, threshold=0.1, region_size=(128, 128)):
     
     return num_features
 
+def plot_class_images(images, labels, filenames=None, set_name='train'):
+        # ensure labels are a plain list of ints
+        if isinstance(labels, torch.Tensor):
+            labels = labels.tolist()
 
+        # if images have more than one channel (C, H, W), only use the first channel
+        if isinstance(images, torch.Tensor) and images.ndim == 4:
+            images = [img[0] for img in images]
+        
+        desc_map = {c['tag']: c['description'] for c in get_classes()}
+        
+        for cls in sorted(set(labels)):
+            # collect up to 10 examples of this class
+            idxs = [i for i,l in enumerate(labels) if l == cls][:10]
+            if not idxs:
+                continue
+            
+            fig, axes = plt.subplots(2, 5, figsize=(10, 4))
+            fig.suptitle(f"{set_name} images for class {cls} – {desc_map.get(cls, '')}", fontsize=12)
+            
+            for ax, idx in zip(axes.flat, idxs):
+                img = images[idx]
+                arr = img.squeeze().cpu().numpy() if isinstance(img, torch.Tensor) else np.squeeze(img)
+                
+                # If multiple channels take the first channel
+                if arr.ndim == 3 and arr.shape[0] > 1:
+                    arr = arr[0]
+                
+                ax.imshow(arr, cmap='viridis', origin='lower')
+                ax.axis('off')
+                if filenames and idx < len(filenames):
+                    ax.set_title(filenames[idx], fontsize=8)
+            
+            # blank out any unused subplots
+            for ax in axes.flat[len(idxs):]:
+                ax.axis('off')
+            
+            plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+            plt.savefig(f"./classifier/{cls}_{set_name}_images.png", dpi=300)
+            plt.close(fig)
 
 def plot_cut_flow_for_all_filters(images, labels, num_thresholds=11, region_size=(64, 64), save_path_prefix="cut_flow"):
     """
@@ -1988,6 +2027,77 @@ def load_RGZ10k(path=root_path + "RGZ_10k", fold=5, target_classes=None, crop_si
     return train_images, train_labels, eval_images, eval_labels
 
 
+def load_MGCLS(path='/users/mbredber/data/MGCLS/classified_crops_1600/',  # Path to MGCLS data
+               fold=None,
+               target_classes=[40],
+               crop_size=(1600, 1600),
+               downsample_size=(128, 128),
+               sample_size=300,
+               BALANCE=False, AUGMENT=False,
+               train=False):
+
+
+    print("Loading MGCLS diffuse data…")
+
+    # build a map tag→folder
+    classes_map = {c['tag']: c['description'] for c in get_classes()}
+
+    images, labels, filenames = [], [], []
+    for cls in target_classes:
+        folder = classes_map.get(cls)
+        if folder is None:
+            continue
+        class_dir = os.path.join(path, folder)
+        for fn in os.listdir(class_dir):
+            if fn.lower().endswith((".jpg", ".jpeg", ".png")):
+                with Image.open(os.path.join(class_dir, fn)) as img:
+                    pil_gray = img.convert("L")
+                    tensor = transforms.ToTensor()(pil_gray)
+                    tensor = apply_formatting(tensor, crop_size, downsample_size)
+                images.append(tensor)
+                labels.append(cls)
+                filenames.append(fn)
+
+    if not images:
+        raise ValueError("No images loaded. Check the path and file extensions.")
+    
+    # throttle total loaded images
+    if sample_size is not None and len(images) > sample_size:
+        images, labels, filenames = (
+            list(images)[:sample_size],
+            list(labels)[:sample_size],
+            list(filenames)[:sample_size],
+        )
+
+    # === GROUP-AWARE SPLIT ===
+    # 1) extract group key (everything before the final underscore)
+    groups = [fn.rsplit('_', 1)[0] for fn in filenames]
+
+    # 2) unique groups and one label per group
+    unique_groups, inverse_idxs = np.unique(groups, return_inverse=True)
+    # pick the first occurrence of each group to get its label
+    group_labels = [labels[groups.index(g)] for g in unique_groups]
+
+    # 3) split groups, stratified by their class
+    train_groups, test_groups = train_test_split(
+        unique_groups,
+        test_size=0.2,
+        stratify=group_labels,
+        random_state=SEED
+    )
+
+    # 4) assign each file to train/test based on its group
+    train_idx = [i for i, g in enumerate(groups) if g in train_groups]
+    test_idx  = [i for i, g in enumerate(groups) if g in test_groups]
+
+    train_images = [images[i] for i in train_idx]
+    train_labels = [labels[i] for i in train_idx]
+    eval_images  = [images[i] for i in test_idx]
+    eval_labels  = [labels[i] for i in test_idx]
+
+    return train_images, train_labels, eval_images, eval_labels
+
+
 def load_PSZ2(path=root_path + "PSZ2/classified/",
               fold=5,
               sample_size=300,
@@ -2258,80 +2368,7 @@ def load_PSZ2(path=root_path + "PSZ2/classified/",
     train_filenames = [filenames[i] for i in train_idx]
     eval_filenames  = [filenames[i] for i in test_idx]
 
-    # --------- return types exactly as before ----------
     return train_images, train_labels, eval_images, eval_labels, train_filenames, eval_filenames
-
-
-def load_MGCLS(path='/users/mbredber/data/MGCLS/classified_crops_1600/',  # Path to MGCLS data
-               fold=None,
-               target_classes=[40],
-               crop_size=(1600, 1600),
-               downsample_size=(128, 128),
-               sample_size=300,
-               BALANCE=False, AUGMENT=False,
-               train=False):
-
-
-    print("Loading MGCLS diffuse data…")
-
-    # build a map tag→folder
-    classes_map = {c['tag']: c['description'] for c in get_classes()}
-
-    images, labels, filenames = [], [], []
-    for cls in target_classes:
-        folder = classes_map.get(cls)
-        if folder is None:
-            continue
-        class_dir = os.path.join(path, folder)
-        for fn in os.listdir(class_dir):
-            if fn.lower().endswith((".jpg", ".jpeg", ".png")):
-                with Image.open(os.path.join(class_dir, fn)) as img:
-                    pil_gray = img.convert("L")
-                    tensor = transforms.ToTensor()(pil_gray)
-                    tensor = apply_formatting(tensor, crop_size, downsample_size)
-                images.append(tensor)
-                labels.append(cls)
-                filenames.append(fn)
-
-    if not images:
-        raise ValueError("No images loaded. Check the path and file extensions.")
-    
-    # throttle total loaded images
-    if sample_size is not None and len(images) > sample_size:
-        images, labels, filenames = (
-            list(images)[:sample_size],
-            list(labels)[:sample_size],
-            list(filenames)[:sample_size],
-        )
-
-    # === GROUP-AWARE SPLIT ===
-    # 1) extract group key (everything before the final underscore)
-    groups = [fn.rsplit('_', 1)[0] for fn in filenames]
-
-    # 2) unique groups and one label per group
-    unique_groups, inverse_idxs = np.unique(groups, return_inverse=True)
-    # pick the first occurrence of each group to get its label
-    group_labels = [labels[groups.index(g)] for g in unique_groups]
-
-    # 3) split groups, stratified by their class
-    train_groups, test_groups = train_test_split(
-        unique_groups,
-        test_size=0.2,
-        stratify=group_labels,
-        random_state=SEED
-    )
-
-    # 4) assign each file to train/test based on its group
-    train_idx = [i for i, g in enumerate(groups) if g in train_groups]
-    test_idx  = [i for i, g in enumerate(groups) if g in test_groups]
-
-    train_images = [images[i] for i in train_idx]
-    train_labels = [labels[i] for i in train_idx]
-    eval_images  = [images[i] for i in test_idx]
-    eval_labels  = [labels[i] for i in test_idx]
-
-    return train_images, train_labels, eval_images, eval_labels
-
 
 def load_galaxies(galaxy_classes, path=None, versions=None, fold=None, island=None, crop_size=None, downsample_size=None, sample_size=None, 
                   REMOVEOUTLIERS=True, BALANCE=False, AUGMENT=False, FLUX_CLIPPING=False, STRETCH=False, percentile_lo=80, percentile_hi=99,
@@ -2479,8 +2516,7 @@ def load_galaxies(galaxy_classes, path=None, versions=None, fold=None, island=No
     if BALANCE:
         train_images, train_labels = balance_classes(train_images, train_labels) # Remove excess images from the largest class
         
-        
-    if STRETCH and not FLUX_CLIPPING:
+    if STRETCH and not FLUX_CLIPPING and False:
         train_class_ids = sorted(set(train_labels))
         for class_id in train_class_ids:
             train_idx   = next(i for i, lbl in enumerate(train_labels) if lbl == class_id)
@@ -2667,50 +2703,9 @@ def load_galaxies(galaxy_classes, path=None, versions=None, fold=None, island=No
                 fig.suptitle(f"eval {class_id} — {source_name} ({suffix})")
                 plt.savefig(f"./classifier/{class_id}_eval_{source_name}_{suffix}_stretching.png", dpi=300)
                 plt.close(fig)
-
-    def plot_class_images(images, labels, filenames=None, set_name='train'):
-        # ensure labels are a plain list of ints
-        if isinstance(labels, torch.Tensor):
-            labels = labels.tolist()
-
-        # if images have more than one channel (C, H, W), only use the first channel
-        if isinstance(images, torch.Tensor) and images.ndim == 4:
-            images = [img[0] for img in images]
-        
-        desc_map = {c['tag']: c['description'] for c in get_classes()}
-        
-        for cls in sorted(set(labels)):
-            # collect up to 10 examples of this class
-            idxs = [i for i,l in enumerate(labels) if l == cls][:10]
-            if not idxs:
-                continue
             
-            fig, axes = plt.subplots(2, 5, figsize=(10, 4))
-            fig.suptitle(f"{set_name} images for class {cls} – {desc_map.get(cls, '')}", fontsize=12)
-            
-            for ax, idx in zip(axes.flat, idxs):
-                img = images[idx]
-                arr = img.squeeze().cpu().numpy() if isinstance(img, torch.Tensor) else np.squeeze(img)
-                
-                # If multiple channels take the first channel
-                if arr.ndim == 3 and arr.shape[0] > 1:
-                    arr = arr[0]
-                
-                ax.imshow(arr, cmap='viridis', origin='lower')
-                ax.axis('off')
-                if filenames and idx < len(filenames):
-                    ax.set_title(filenames[idx], fontsize=8)
-            
-            # blank out any unused subplots
-            for ax in axes.flat[len(idxs):]:
-                ax.axis('off')
-            
-            plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-            plt.savefig(f"./classifier/{cls}_{set_name}_images.png", dpi=300)
-            plt.close(fig)
-            
-    sample_indices = {}
     # Convert labels to a list if they are tensors
+    sample_indices = {}
     if isinstance(train_labels, torch.Tensor):
         train_labels = train_labels.tolist()
     for cls in sorted(set(train_labels)):
@@ -2754,18 +2749,6 @@ def load_galaxies(galaxy_classes, path=None, versions=None, fold=None, island=No
             else:                      # [B, C, H, W]
                 all_images = per_image_percentile_stretch(all_images, percentile_lo, percentile_hi)
 
-            
-            #if len(all_images.shape) == 5:  # (B, T, C, H, W)
-            #    #print("Applying stretch separately to each T in shape:", all_images.shape)
-            #    stretched = []
-            #    for t in range(all_images.shape[1]):
-            #        all_images_t = all_images[:, t]  # shape: (B, C, H, W)
-            #        stretched_t = percentile_stretch(all_images_t, lo=percentile_lo, hi=percentile_hi)  # Percentile stretch over each T
-            #        stretched.append(stretched_t.unsqueeze(1))  # keep T dim
-            #    all_images = torch.cat(stretched, dim=1)   
-            #else:
-            #    all_images = percentile_stretch(all_images, lo=percentile_lo, hi=percentile_hi) # Percentile stretch over all images
-        #all_images = torch.stack([percentile_stretch(img, lo=60, hi=99) for img in all_images]) # Individual percentile stretch
         train_images = all_images[:len(train_images)]
         eval_images  = all_images[len(train_images):]
        
@@ -2804,8 +2787,6 @@ def load_galaxies(galaxy_classes, path=None, versions=None, fold=None, island=No
                 cls_imgs = [img for img, lbl in zip(imgs, lbls) if lbl == (cls-min(target_classes))]
                 print(f"Length of {kind} images for class {cls}: {len(cls_imgs)}")
                 np.save(f"{path}_{kind}_{cls}_{len(cls_imgs)}.npy", cls_imgs)
-
-
         
     if EXTRADATA and not PRINTFILENAMES:
         meta_df = pd.read_csv(os.path.join(root_path, "PSZ2/cluster_source_data.csv"))
