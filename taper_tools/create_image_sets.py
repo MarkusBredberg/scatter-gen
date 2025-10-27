@@ -191,12 +191,6 @@ def _canon_size(sz):
         if len(sz) == 3:  return (sz[0], sz[1], sz[2])
     raise ValueError("size must be H,W or C,H,W")
 
-def center_crop_at(arr, ny_target, nx_target, cy, cx):
-    ny, nx = arr.shape
-    y0 = int(round(cy - ny_target/2)); x0 = int(round(cx - nx_target/2))
-    y0 = max(0, min(y0, ny - ny_target)); x0 = max(0, min(x0, nx - nx_target))
-    return arr[y0:y0+ny_target, x0:x0+nx_target]
-
 def crop_to_fov_on_raw(I, Hraw, fov_arcmin, *arrs, center=None):
     """Square crop on RAW grid with side=fov_arcmin (arcmin). If `center` is given,
     it must be (cy,cx) in INPUT pixels on RAW; otherwise use the image centre."""
@@ -241,55 +235,6 @@ def crop_to_side_arcsec_on_raw(I, Hraw, side_arcsec, *arrs, center=None):
 
     out = [a[y0:y0+ny, x0:x0+nx] for a in (I,) + arrs]
     return out, (ny, nx), (cy_eff, cx_eff)
-
-
-def apply_formatting(image: torch.Tensor,
-                     crop_size: Tuple[int, int, int] = (1, 128, 128),
-                     downsample_size: Tuple[int, int, int] = (1, 128, 128),
-                     center_px: Optional[Tuple[float, float]] = None) -> torch.Tensor:
-    """
-    Center-crop and resize a single-channel tensor (no PIL).
-    Args:
-      image: [C,H0,W0] or [H0,W0]
-      crop_size:      (C,Hc,Wc) or (Hc,Wc)
-      downsample_size:(C,Ho,Wo) or (Ho,Wo)
-      center_px: (y,x) in pixels in the *input* image to center the crop on.
-    Returns:
-      [C,Ho,Wo]
-    """
-    crop_size = _canon_size(crop_size)
-    downsample_size = _canon_size(downsample_size)
-
-    if image.dim() == 4 and image.size(0) == 1:
-        image = image.squeeze(0)
-    if image.dim() == 3:
-        H0, W0 = image.shape[-2], image.shape[-1]
-        img = image
-    elif image.dim() == 2:
-        H0, W0 = image.shape
-        img = image.unsqueeze(0)
-    else:
-        raise ValueError(f"Unexpected image dims: {image.shape}")
-
-    if crop_size[0] == 1 or downsample_size[0] == 1:
-        img = img.mean(dim=0, keepdim=True)
-
-    _, Hc, Wc = crop_size
-    _, Ho, Wo = downsample_size
-
-    if center_px is None:
-        y0, x0 = H0 // 2, W0 // 2
-    else:
-        y0, x0 = int(round(center_px[0])), int(round(center_px[1]))
-
-    y1, y2 = y0 - Hc // 2, y0 + Hc // 2
-    x1, x2 = x0 - Wc // 2, x0 + Wc // 2
-    y1, y2 = max(0, y1), min(H0, y2)
-    x1, x2 = max(0, x1), min(W0, x2)
-
-    crop = img[:, y1:y2, x1:x2].unsqueeze(0)   # [1,C,*,*]
-    resized = F.interpolate(crop, size=(Ho, Wo), mode='bilinear', align_corners=False)
-    return resized.squeeze(0)                   # [C,Ho,Wo]
 
 # ------------------------------ IO helpers -----------------------------------
 def t_product_path(src_dir: Path, name: str, scale_kpc: str) -> Path:
@@ -466,21 +411,11 @@ def make_montage(source_name: str,
         yc_t += dy_px; xc_t += dx_px
         center_note += f" | manual offset (dy,dx)=({dy_px:.1f},{dx_px:.1f}) px"
 
-    # --- equal-beams crop: side = global_min_beams * FWHM_T50 ---
-    fwhm_t50_as = fwhm_major_as(H_tgt)
-    side_as = make_montage._global_nbeams * fwhm_t50_as
-    if getattr(make_montage, "GLOBAL_NBEAMS", None):
-        # equal-beams crop using global min beam count
-        fwhm_t50_as = fwhm_major_as(H_tgt)
-        side_as = make_montage.GLOBAL_NBEAMS * fwhm_t50_as
-        (I_crop, RT_crop, T_crop), (nyc, nxc), (cy_raw, cx_raw) = crop_to_side_arcsec_on_raw(
-            I_raw, H_raw, side_as, RT_rawgrid, T_on_raw, center=(yc_i, xc_i)
-        )
-    else:
-        # fallback: just use your default FOV crop
-        (I_crop, RT_crop, T_crop), (nyc, nxc), (cy_raw, cx_raw) = crop_to_fov_on_raw(
-            I_raw, H_raw, fov_arcmin, RT_rawgrid, T_on_raw, center=(yc_i, xc_i)
-        )
+    # --- fixed physical FOV crop (identical angular size for all scales) ---
+    (I_crop, RT_crop, T_crop), (nyc, nxc), (cy_raw, cx_raw) = crop_to_fov_on_raw(
+        I_raw, H_raw, fov_arcmin, RT_rawgrid, T_on_raw, center=(yc_i, xc_i)
+    )
+
     # Optional downsample to a fixed display size (keeps the FOV content)
     Ho, Wo = _canon_size(downsample_size)[-2:]
     def _maybe_downsample(arr, Ho, Wo):
@@ -560,7 +495,7 @@ def parse_tuple3(txt: str) -> Tuple[int,int,int]:
 def main():
     ap = argparse.ArgumentParser(description="3×2 montages per source: RAW, RT=RAW⊗G, and T_X (X in kpc).")
     DEFAULT_ROOT = Path("/users/mbredber/scratch/data/PSZ2/fits")
-    DEFAULT_OUT  = Path("/users/mbredber/scratch/outputs/montages")
+    DEFAULT_OUT  = Path("/users/mbredber/scratch/create_image_sets_outputs/montages")
 
     ap.add_argument("--root", type=Path, default=DEFAULT_ROOT,
                     help=f"Root directory with per-source subfolders (/<name>/<name>.fits and T_X).")
@@ -580,7 +515,7 @@ def main():
                     help="Comma-separated source names to include exclusively.")
     ap.add_argument("--save-fits", action="store_true", default=True,
                     help="Also write formatted RAW/RT/T_X FITS for each montage.")
-    ap.add_argument("--fits-out", type=Path, default=Path("/users/mbredber/scratch/outputs/processed_psz2_fits"),
+    ap.add_argument("--fits-out", type=Path, default=Path("/users/mbredber/scratch/create_image_sets_outputs/processed_psz2_fits"),
                     help="Directory for formatted FITS (defaults to the montage folder).")
 
     args = ap.parse_args()

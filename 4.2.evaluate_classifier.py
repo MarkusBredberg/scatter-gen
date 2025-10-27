@@ -1,20 +1,17 @@
-import numpy as np
-import pickle
-import torch
+import numpy as np, pickle, torch, os, itertools
+from torch.utils.data import TensorDataset, DataLoader
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, roc_curve, auc
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import label_binarize
-from utils.data_loader import get_classes, load_galaxies, get_synthetic
-import itertools
-from collections import defaultdict
 from sklearn.manifold import TSNE
-from torch.utils.data import TensorDataset, DataLoader
+from utils.data_loader import get_classes, load_galaxies, get_synthetic
+from collections import defaultdict
+from glob import glob
 import matplotlib.pyplot as plt
 import matplotlib.lines as mlines  # <-- For creating custom line legend entries
 from matplotlib.colors import LinearSegmentedColormap
 from matplotlib import colormaps  # For newer Matplotlib versions
 import seaborn as sns
-import os
 os.makedirs('./classifier/trained_models', exist_ok=True)
 os.makedirs('./classifier/trained_models_filtered', exist_ok=True)
 
@@ -38,12 +35,12 @@ learning_rates = [1e-3]
 regularization_params = [1e-3]
 lambda_values = [0]
 num_experiments = 100
-percentile_lo, percentile_hi = 30, 90
+percentile_lo, percentile_hi = 60, 99
 folds = [5] # Number of folds for cross-validation
 generators = ['DDPM']
 classifier = ["TinyCNN", "Rustige", "SCNN", "CNNSqueezeNet", "DualCNNSqueezeNet", "CloudNet", "DANN", "ScatterNet", "ScatterDual", "ScatterSqueezeNet", "Binary", "ScatterResNet"][-3]
 print("Classifier:", classifier)
-crop_size = (1, 512, 512)  # Crop size for the images
+crop_size = (512, 512)  # Crop size for the images
 
 # -------------------------- NEW GAN CONFIGURATION --------------------------
 gan_epoch = 500           # e.g., epoch number to load from
@@ -250,6 +247,103 @@ lambda_values = valid_lambda_values
 ###############################################
 ########### PLOTTING FUNCTIONS ################
 ###############################################
+
+def robust_metric_histograms(
+    metrics,
+    galaxy_classes=galaxy_classes,
+    classifier=classifier,
+    dataset_sizes=dataset_sizes,
+    folds=folds,
+    save_dir="./classifier"
+):
+    """
+    For each metric series (accuracy/precision/recall/f1_score), make a histogram
+    with 16/50/84 percentile markers and write a compact percentile summary CSV.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    rows = []
+    wanted = {"accuracy", "precision", "recall", "f1_score"}
+
+    grouped = defaultdict(list)
+
+    for key, values in metrics.items():
+        # "{generator}_{metric}_{subset}_{fold}_{experiment}_{lr}_{reg}_{lambda}"
+        parts = key.split("_")
+        if len(parts) < 8:
+            continue
+        metric_name = parts[1]
+        if metric_name not in wanted:
+            continue
+        if not isinstance(values, (list, tuple)) or len(values) == 0:
+            continue
+        try:
+            vals = np.asarray(values, dtype=float).ravel()
+        except Exception:
+            continue
+        if vals.size == 0 or not np.isfinite(vals).any():
+            continue
+
+        # drop the 'experiment' token so we aggregate across experiments
+        # group key keeps generator, metric, subset, fold, lr, reg, lambda
+        group_key = "_".join([parts[0], parts[1], parts[2], parts[3], parts[5], parts[6], parts[7]])
+        grouped[group_key].extend(vals.tolist())
+
+    for group_key, all_vals in grouped.items():
+        vals = np.asarray(all_vals, dtype=float)
+        if vals.size == 0 or not np.isfinite(vals).any():
+            continue
+
+        p16, p50, p84 = np.percentile(vals, [16, 50, 84])
+        sigma68 = 0.5 * (p84 - p16)
+
+        # parse for filenames/titles
+        gparts = group_key.split("_")  # [generator, metric, subset, fold, lr, reg, lambda]
+        gen_name, metric_name = gparts[0], gparts[1]
+
+        vmin, vmax = float(np.min(vals)), float(np.max(vals))
+        if vmin == vmax:
+            eps = max(1e-6, abs(vmin) * 1e-3)
+            vmin, vmax = vmin - eps, vmax + eps
+        edges = np.linspace(vmin, vmax, 21)
+
+        plt.figure(figsize=(5, 3.2))
+        plt.hist(vals, bins=edges, edgecolor="none", alpha=0.8)
+        for x, style in [(p16, ":"), (p50, "-"), (p84, ":")]:
+            plt.axvline(x, linestyle=style)
+        plt.xlim(vmin, vmax)
+        plt.title(group_key)
+        plt.xlabel(metric_name)
+        plt.ylabel("Count")
+        plt.tight_layout()
+
+        largest_sz = dataset_sizes[folds[-1]][-1]
+        save_path_hist = f"{save_dir}/{galaxy_classes}_{classifier}_{gen_name}_{largest_sz}_{metric_name}_histogram.pdf"
+        plt.savefig(save_path_hist, dpi=150)
+        plt.close()
+
+        rows.append({
+            "setting": group_key,
+            "metric": metric_name,
+            "n": int(vals.size),
+            "p16": float(p16),
+            "p50": float(p50),
+            "p84": float(p84),
+            "sigma68": float(sigma68)
+        })
+
+    # write a compact CSV summary
+    if rows:
+        import csv
+        csv_path = f"{save_dir}/{galaxy_classes}_{classifier}_robust_summary.csv"
+        fieldnames = list({k for row in rows for k in row.keys()})
+        with open(csv_path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            w.writeheader()
+            for row in rows:
+                w.writerow({k: row.get(k, "") for k in fieldnames})
+        print(f"Wrote robust summary to {csv_path}")
+
+
 
 def extract_feats(loader):
         feats = []
@@ -666,6 +760,8 @@ def plot_avg_roc_curves(metrics, generators, dataset_sizes=dataset_sizes, merge_
                             os.makedirs(save_dir, exist_ok=True)
                             plt.savefig(f'{save_dir}/{galaxy_classes}_{classifier}_{generator}_{merged_subset_key}_{lr}_{reg}_{lambda_generate}_avg_roc_curve.pdf')
                             plt.close(fig)
+                print(f"Saved average ROC curve at {save_dir}/{galaxy_classes}_{classifier}_{generator}_{merged_subset_key}_{lr}_{reg}_{lambda_generate}_avg_roc_curve.pdf")
+
 
 def plot_roc_curves(metrics, generators, dataset_sizes=dataset_sizes,  folds= folds, num_experiments=num_experiments, learning_rates=learning_rates, regularization_params=regularization_params, 
                     galaxy_classes=galaxy_classes, class_descriptions={cls['tag']: cls['description'] for cls in classes}, save_dir='./classifier'):
@@ -1035,127 +1131,6 @@ def plot_loss(
         plt.savefig(f"./classifier/{galaxy_classes}_{classifier}_{generator}_{dataset_sizes[-1][-1]}_{lr}_{reg}_loss.pdf")
         plt.close(fig)
 
-def old_plot_loss(
-    generators,
-    history=history,
-    dataset_sizes=dataset_sizes,
-    folds=folds,
-    num_experiments=num_experiments,
-    galaxy_classes=galaxy_classes,
-    learning_rates=learning_rates,
-    regularization_params=regularization_params,
-    classifier=None,
-    lambda_values=lambda_values
-):
-    # Sort lambdas so we can assign colors in a nice gradient order
-    sorted_lambdas = sorted(lambda_values)
-    n_lambdas = len(sorted_lambdas)
-
-    # 1) Get a continuous colormap
-    base_cmap = colormaps["viridis"]
-
-    # 2) Create a discrete list of colors by sampling the colormap.
-    #    Handle the edge case of n_lambdas=1 to avoid divide-by-zero.
-    if n_lambdas > 1:
-        colors = [base_cmap(i / (n_lambdas - 1)) for i in range(n_lambdas)]
-    else:
-        # If there's only one λ, just pick a single color (e.g. mid-range)
-        colors = [base_cmap(0.5)]
-
-    # 3) Map each λ to one color
-    lambda_to_color = {
-        lam: colors[i] for i, lam in enumerate(sorted_lambdas)
-    }
-
-    for generator in generators:
-        fig, ax = plt.subplots(figsize=(10, 8))
-
-        for lr, reg in itertools.product(learning_rates, regularization_params):
-            for lambda_generate in sorted_lambdas:
-                all_train_losses = []
-                all_val_losses   = []
-
-                for experiment in range(num_experiments):
-                    for fold in folds:
-                        largest_subset_size = max(dataset_sizes[fold])
-                        if largest_subset_size <= 0:
-                            continue
-
-                        loss_key = (
-                            f"{generator}_loss_{largest_subset_size}_{fold}_"
-                            f"{experiment}_{lr}_{reg}_{lambda_generate}"
-                        )
-                        val_loss_key = (
-                            f"{generator}_val_loss_{largest_subset_size}_{fold}_"
-                            f"{experiment}_{lr}_{reg}_{lambda_generate}"
-                        )
-
-                        if loss_key not in history.get(generator, {}):
-                            continue
-                        if val_loss_key not in history[generator]:
-                            continue
-
-                        train_loss = history[generator][loss_key]
-                        val_loss   = history[generator][val_loss_key]
-
-                        all_train_losses.append(train_loss)
-                        all_val_losses.append(val_loss)
-
-                if not all_train_losses or not all_val_losses:
-                    continue
-
-                # Truncate to min length if epochs differ
-                min_len_train = min(len(t) for t in all_train_losses)
-                min_len_val   = min(len(t) for t in all_val_losses)
-                min_len       = min(min_len_train, min_len_val)
-
-                all_train_losses = [arr[:min_len] for arr in all_train_losses]
-                all_val_losses   = [arr[:min_len] for arr in all_val_losses]
-
-                # Convert to arrays
-                all_train_losses = np.array(all_train_losses)
-                all_val_losses   = np.array(all_val_losses)
-                mean_train = np.mean(all_train_losses, axis=0)
-                std_train  = np.std(all_train_losses, axis=0)
-                mean_val   = np.mean(all_val_losses, axis=0)
-                std_val    = np.std(all_val_losses, axis=0)
-
-                epochs = range(len(mean_train))
-                color = lambda_to_color[lambda_generate]
-
-                # Plot training (solid) - label only once per λ
-                ax.plot(epochs, mean_train, color=color, label=f"λ={lambda_generate}")
-                ax.fill_between(
-                    epochs,
-                    mean_train - std_train,
-                    mean_train + std_train,
-                    color=color, alpha=0.2
-                )
-
-                # Plot validation (dashed) - no label
-                ax.plot(epochs, mean_val, color=color, linestyle='--', label="")
-                ax.fill_between(
-                    epochs,
-                    mean_val - std_val,
-                    mean_val + std_val,
-                    color=color, alpha=0.2
-                )
-
-        ax.set_title(f"Training and Validation Loss for Generator={generator}", fontsize=18)
-        ax.set_xlabel("Epochs", fontsize=16)
-        ax.set_ylabel("Loss", fontsize=16)
-
-        # Deduplicate legend labels
-        handles, labels = ax.get_legend_handles_labels()
-        by_label = dict(zip(labels, handles))
-        ax.legend(by_label.values(), by_label.keys(), fontsize=14, loc="best")
-
-        ax.grid(True)
-        plt.tight_layout()
-        plt.savefig(f"./classifier/{galaxy_classes}_{classifier}_{generator}_loss.pdf")
-        plt.close(fig)
-
-
 ###############################################
 ############ PLOTS AFTER ALL FOLDS ############
 ###############################################
@@ -1371,9 +1346,10 @@ if any(lam > 0 for lam in lambda_values):
 
 # ——— Make plots ———
 plot_loss(generators, history=history)
+robust_metric_histograms(metrics)
 #plot_roc_curves(metrics, generators)
-#plot_avg_roc_curves(metrics, generators, merge_map=merge_map)
-#plot_all_metrics_vs_dataset_size(metrics, generators, merge_map=merge_map)
+plot_avg_roc_curves(metrics, generators, merge_map=merge_map)
+plot_all_metrics_vs_dataset_size(metrics, generators, merge_map=merge_map)
 #plot_accuracy_vs_lambda(lambda_values, metrics, generators)
 #plot_confusion_matrix(metrics, generators)
 plot_avg_std_confusion_matrix(metrics, generators, metric_stats=metrics_last, merge_map=merge_map)

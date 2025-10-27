@@ -2153,8 +2153,8 @@ def load_PSZ2(
     downsample_size = (1, 128, 128),  # (C,Ho,Wo) — output per frame
     fold = 5,                         # 0..4 = CV folds, 5 = last split
     train = False,                    # Not implemented
-    processed_dir = "/users/mbredber/scratch/outputs/processed_psz2_fits", # directory for preformatted images
-    prefer_processed = False,   # whether to prefer processed images when available
+    processed_dir = "/users/mbredber/scratch/create_image_sets_outputs/processed_psz2_fits", # directory for preformatted images
+    prefer_processed = True,   # whether to prefer processed images when available
     gate_with = None  # None | "auto" | "T50kpc" | 50 (number). If set, gate RAW/T/RT against this T directory.
 ):
     # Data available at: https://lofar-surveys.org/planck_dr2.html
@@ -2163,7 +2163,15 @@ def load_PSZ2(
     # Format and taper data with taper_tools.create_image_sets.py
     # This is the data loader for any version of the processed data
 
-    print("Preferred processedimages:", prefer_processed)
+    print("Parameters:")
+    print("  path:", path)
+    print("  versions:", versions)
+    print("  crop_size:", crop_size)
+    print("  downsample_size:", downsample_size)
+    print("  target_classes:", target_classes)
+    print("  processed_dir:", processed_dir)
+    print("  prefer_processed:", prefer_processed)
+    print("  gate_with:", gate_with)
 
     def _kpc_tag(v):
         # Find the canonical kpc tag for a version string
@@ -2466,7 +2474,7 @@ def load_PSZ2(
                             _seen_sources.add(src)
                             continue
                     else:
-                        print(f"[MISS] processed not found for class={sub}: {proc_path}")
+                        #print(f"[MISS] processed not found for class={sub}: {proc_path}")
                         continue
 
                 # === FALLBACK when processed file is missing or not preferred ===
@@ -2502,9 +2510,8 @@ def load_PSZ2(
                     frm = apply_formatting(ten, crop_size=(1, Hc_eff, Wc_eff), downsample_size=(1, Ho, Wo))
 
                 elif vU.startswith("RT"):
-                    # Generate RT from RAW using gate header (existing logic)
-                    print("Generating RT from RAW for source:", src)
-                    print("Not yet implemented well")
+                    # RT fallback: convolve RAW to a circularized T-beam at the requested scale, then format
+                    # 1) Load RAW frame
                     arr = np.squeeze(fits.getdata(fpath)).astype(np.float32)
                     if arr.ndim == 3:
                         arr = arr.mean(axis=0)
@@ -2515,15 +2522,84 @@ def load_PSZ2(
                     raw_hdr = fits.getheader(fpath)
                     Hc_eff, Wc_eff = Hc_ref, Wc_ref
 
-                    num = ''.join([c for c in vU if c.isdigit()])
-                    gate_T = f"T{num}kpc"
-                    txx_path = os.path.join(path, gate_T, sub, f"{base}.fits")
+                    # 2) Resolve the gate T directory and FITS filename: .../TXXkpc/<sub>/<base>TXXkpc.fits
+                    num = ''.join([c for c in vU if c.isdigit()]) or "50"
+                    preferred_gate = f"T{int(float(num)) if float(num).is_integer() else num}kpc"
+                    if os.path.isdir(os.path.join(path, preferred_gate, sub)):
+                        gate_dirname = preferred_gate
+                    else:
+                        gate_dirname = _nearest_T_dir(path, sub, float(num))
+                    if gate_dirname is None:
+                        print(f"[GATE] No TXXkpc dir available for RT{num}kpc in sub='{sub}'. Skipping {src}.")
+                        continue
+
+                    txx_path = os.path.join(path, gate_dirname, sub, f"{base}{gate_dirname}.fits")
                     if not os.path.isfile(txx_path):
                         print(f"  [SKIP] missing gate T image for RT convolution: {txx_path}")
                         continue
                     txx_hdr = fits.getheader(txx_path)
 
-                    ker = _kernel_from_beams(raw_hdr, txx_hdr)
+                    # 3) Build a circular (area-preserving) target covariance in world coords, then kernel on RAW pixels
+                    def _cd_matrix_rad(h):
+                        if 'CD1_1' in h:
+                            M = np.array([[h['CD1_1'], h.get('CD1_2', 0.0)],
+                                        [h.get('CD2_1', 0.0), h['CD2_2']]], float)
+                        else:
+                            pc11=h.get('PC1_1',1.0); pc12=h.get('PC1_2',0.0)
+                            pc21=h.get('PC2_1',0.0); pc22=h.get('PC2_2',1.0)
+                            cd1 =h.get('CDELT1', 1.0); cd2 =h.get('CDELT2', 1.0)
+                            M = np.array([[pc11, pc12],[pc21, pc22]], float) @ np.diag([cd1, cd2])
+                        return M * (np.pi/180.0)
+
+                    def _beam_cov_world(h):
+                        bmaj_as = abs(float(h['BMAJ']))*3600.0
+                        bmin_as = abs(float(h['BMIN']))*3600.0
+                        pa_deg  = float(h.get('BPA', 0.0))
+                        to_sig  = 1.0/(2.0*np.sqrt(2.0*np.log(2.0)))
+                        sx = (bmaj_as * to_sig) * (np.pi/(180.0*3600.0))
+                        sy = (bmin_as * to_sig) * (np.pi/(180.0*3600.0))
+                        th = np.deg2rad(pa_deg)
+                        R = np.array([[np.cos(th), -np.sin(th)],[np.sin(th), np.cos(th)]], float)
+                        S = np.diag([sx*sx, sy*sy])
+                        return R @ S @ R.T
+
+                    C_raw_w = _beam_cov_world(raw_hdr)
+                    C_tgt_w = _beam_cov_world(txx_hdr)
+
+                    # Circularize target: isotropic with same area as target (sigma^2 = sqrt(det(C_tgt)))
+                    sigma2 = float(np.sqrt(max(0.0, np.linalg.det(C_tgt_w))))
+                    C_tgt_circ_w = np.array([[sigma2, 0.0],[0.0, sigma2]], float)
+
+                    # Kernel covariance in world coords (PSD-clipped): C_ker = C_tgt_circ - C_raw
+                    C_ker_w = C_tgt_circ_w - C_raw_w
+                    w, V = np.linalg.eigh(C_ker_w)
+                    w = np.clip(w, 0.0, None)
+                    C_ker_w = (V * w) @ V.T
+
+                    # Map to RAW pixel coords
+                    J = _cd_matrix_rad(raw_hdr)
+                    Jinv = np.linalg.inv(J)
+                    Cpix = Jinv @ C_ker_w @ Jinv.T
+
+                    # Build Gaussian kernel on a pixel grid (no Gaussian2DKernel dependency)
+                    evals, evecs = np.linalg.eigh(Cpix)
+                    evals = np.clip(evals, 1e-18, None)
+                    s1, s2 = float(np.sqrt(evals[0])), float(np.sqrt(evals[1]))  # pixel stddevs
+                    nker = int(np.ceil(8.0 * max(s1, s2))) | 1
+                    k = (nker - 1) // 2
+                    yy, xx = np.mgrid[-k:k+1, -k:k+1].astype(np.float32)
+                    X = np.stack([xx, yy], axis=-1)  # [...,2]
+                    Cinv = evecs @ np.diag(1.0/np.array([s1*s1, s2*s2], dtype=np.float32)) @ evecs.T
+                    # exp(-0.5 * x^T Cinv x)
+                    quad = (X @ Cinv * X).sum(axis=-1)
+                    ker = np.exp(-0.5 * quad)
+                    s = float(ker.sum())
+                    if not np.isfinite(s) or s <= 0:
+                        print("  [SKIP] degenerate kernel for", src)
+                        continue
+                    ker /= s
+
+                    # 4) Convolve RAW and rescale to Jy/beam_tgt
                     arr = convolve_fft(
                         arr, ker, boundary="fill", fill_value=np.nan,
                         nan_treatment="interpolate", normalize_kernel=True,
@@ -2531,6 +2607,7 @@ def load_PSZ2(
                     )
                     arr *= (_beam_solid_angle_sr(txx_hdr) / _beam_solid_angle_sr(raw_hdr))
 
+                    # 5) Equal-beams cropping on RAW grid using target FWHM, if requested
                     if n_beams_min is not None:
                         fwhm_as = max(float(txx_hdr["BMAJ"]), float(txx_hdr["BMIN"])) * 3600.0
                         side_as = n_beams_min * fwhm_as
@@ -2538,6 +2615,7 @@ def load_PSZ2(
                         Hc_eff = max(1, int(round(side_as / py)))
                         Wc_eff = max(1, int(round(side_as / px)))
 
+                    # 6) Format to network size
                     ten = torch.from_numpy(arr).unsqueeze(0).float()
                     frm = apply_formatting(ten, crop_size=(1, Hc_eff, Wc_eff), downsample_size=(1, Ho, Wo))
 
@@ -2588,6 +2666,7 @@ def load_PSZ2(
             f"with fmt_{Ho}x{Wo}. "
             f"Tip: ensure crop_size matches available *_fmt_HxW.fits, "
             f"or use the fallback glob below."
+            f"First location tried:\n {os.path.join(processed_dir, f'*_{v_tag}_fmt_{Ho}x{Wo}.fits')} "
         )
 
     try:

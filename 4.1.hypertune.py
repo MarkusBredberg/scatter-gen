@@ -1,5 +1,5 @@
 import sys, os, glob, re, csv, torch, os, math, hashlib, time, random
-from utils.data_loader import load_galaxies, get_classes,  get_synthetic, augment_images, apply_formatting, load_halos_and_relics
+from utils.data_loader import load_galaxies, get_classes,  get_synthetic, augment_images, apply_formatting
 from utils.classifiers import (
     RustigeClassifier, TinyCNN, MLPClassifier, SCNN, CNNSqueezeNet, ScatterResNet,
     DANNClassifier, BinaryClassifier, ScatterSqueezeNet, ScatterSqueezeNet2,
@@ -60,14 +60,14 @@ print("Running ht1 with seed", SEED)
 
 PSZ2_ROOT = "/users/mbredber/scratch/data/PSZ2"  # FITS root used below
 
-galaxy_classes    = [50, 51]
+galaxy_classes    = [52, 53]
+max_num_galaxies  = 1000000  # Upper limit for the all-classes combined training data before classical augmentation
 dataset_portions  = [1]
 J, L, order       = 2, 12, 2
 gen_model_names   = ['DDPM'] #['ST', 'DDPM', 'wGAN', 'GAN', 'Dual', 'CNN', 'STMLP', 'lavgSTMLP', 'ldiffSTMLP'] # Specify the generative model_name
 num_epochs_cuda = 200
 num_epochs_cpu = 100
 folds = [5]  # e.g., [1, 2, 3, 4, 5] for five-fold cross-validation
-max_num_galaxies = 1000000  # Upper limit for the all-classes combined training data before classical augmentation
 lambda_values = [0]  # Ratio between generated images and original images per class. 8 is reserfved for TRAINONGENERATED
 num_experiments = 3
 
@@ -90,7 +90,7 @@ classifier        = ["TinyCNN",       # Very Simple CNN
 param_grid = {
     'lr':            [1e-3],
     'reg':           [1e-3],
-    'label_smoothing':[0.1],
+    'label_smoothing':[0.2],
     'J':             [2],          # Only used for scattering classifiers
     'L':             [12],         # Only used for scattering classifiers
     'order':         [2],          # Only used for scattering classifiers
@@ -98,24 +98,22 @@ param_grid = {
     'percentile_hi': [80, 90, 99], # Only used for data normalisation
     'crop_size':     [(512,512)],  # Not used for preformatted data
     'downsample_size':[(128,128)], # Not used for preformatted data
-    'versions':       ['T25kpc']  # 'raw', 'T50kpc', ad hoc tapering: e.g. 'rt50'  strings in list → product() iterates them individually
+    'versions':       ['RAW']  # 'raw', 'T50kpc', ad hoc tapering: e.g. 'rt50'  strings in list → product() iterates them individually
 } #'versions': [('raw', 'rt50')]  # tuple signals “stack these”
 
 STRETCH = True  # Arcsinh stretch
 USE_GLOBAL_NORMALISATION = False           # single on/off switch . False - image-by-image normalisation 
-GLOBAL_NORM_MODE = "percentile"           # "percentile" or "flux"
+GLOBAL_NORM_MODE = "percentile"           # "percentile" or "flux". Becomes "none" if USE_GLOBAL_NORMALISATION is 
+NORMALISEIMGS = True  # Normalise images to [0, 1]
+NORMALISEIMGSTOPM = False  # Normalise images to [-1, 1] 
+NORMALISESCS = False  # Normalise scattering coefficients to [0, 1]
+NORMALISESCSTOPM = False  # Normalise scattering coefficients to [-1, 1]
 FILTERED = True  # Remove in training, validation and test data for the classifier
 FILTERGEN = False  # Remove generated images that are too similar to other generated images
-AUGMENT = True  # Apply classical data augmentation (flips, rotations)
+AUGMENT = True  # Use classical data augmentation (flips, rotations)
+PRINTFILENAMES = True
 USE_CLASS_WEIGHTS = True  # Set to False to disable class weights
 TRAINONGENERATED = False  # Use generated data as testdata
-NORMALISEIMGS = True  # Globally normalise images to [0, 1]
-NORMALISEIMGSTOPM = False  # Globally normalise images to [-1, 1] 
-NORMALISESCS = False  # Normalise scattering coefficients to [0, 1]
-NORMALISESCSTOPM = False  # Normalise scattering coefficients to [-1, 1
-USE_MEMMAP = False  # Use memmap for scattering coefficients
-PRINTFILENAMES = True
-EXTRAVARS = False
 ES, patience = True, 10  # Use early stopping
 SCHEDULER = False  # Use a learning rate scheduler
 SHOWIMGS = True  # Show some generated images for each class (Tool for control)
@@ -144,12 +142,6 @@ forbidden_classes = 12  # Generated bent sources look awful
 ##################### AUTOMATIC CONFIGURATION ##########################
 ########################################################################
 
-BALANCE = True if galaxy_classes == [52, 53] else False  # Balance the dataset by undersampling the majority class
-
-# get the full list of available classes
-classes = get_classes()
-base_cls = min(galaxy_classes)
-
 if torch.cuda.is_available():
     DEVICE = "cuda"
     num_epochs = num_epochs_cuda
@@ -161,29 +153,26 @@ else:
     num_epochs = num_epochs_cpu
 print(f"{DEVICE.upper()} is available. Setting epochs to {num_epochs}.")
 
-ARCSEC = np.deg2rad(1/3600.0)
-
-_loader = load_halos_and_relics if galaxy_classes == [52, 53] else load_galaxies
-
-# CSV with redshifts (slug,z)
-CLUSTER_METADATA_CSV = f"{PSZ2_ROOT}/cluster_metadata.csv"
-
 # --- optional RT knobs via env (keep default off to remain reproducible) ---
 APPLY_UV_TAPER = os.getenv("RT_USE_UV_TAPER", "0") == "1"   # default off
 UV_TAPER_FRAC  = float(os.getenv("RT_UV_TAPER_FRAC", "0.0"))  # e.g. 0.2 (20% of target FWHM)
-
-# Align rt* to a fixed anchor when possible (keeps exact file parity)
-ALIGN_RT_WITH_FIXED = True
 
 if TRAINONGENERATED:
     lambda_values = [8]  # To identify and distinguish TRAINONGENERATED from other runs
     print("Using generated data for testing.")
     
+# —— MULTI-LABEL SWITCH for RH/RR ——
 if galaxy_classes == [52, 53]:
-    # —— MULTI-LABEL SWITCH ——
-    MULTILABEL = True     # predict presence of RH and/or RR (independent)
-    LABEL_INDEX = {"RH": 0, "RR": 1}   # RH=52, RR=53 below
-    THRESHOLD = 0.5       # sigmoid threshold at inference
+    from utils.data_loader import load_halos_and_relics
+    import seaborn as sns
+    MULTILABEL = True            # predict RH and RR independently
+    LABEL_INDEX = {"RH": 0, "RR": 1}
+    THRESHOLD = 0.5
+else:
+    MULTILABEL = False
+
+_loader = load_halos_and_relics if galaxy_classes == [52, 53] else load_galaxies
+BALANCE = True if galaxy_classes == [52, 53] else False  # Balance the dataset by undersampling the majority class
 
 
 ########################################################################
@@ -287,6 +276,7 @@ def permute_like(x, perm):
         return tuple(x[i] for i in idx)
     return x
 
+base_cls = min(galaxy_classes) # Remove?
 def relabel(y):
     """
     Convert raw single-class ids to 2-bit multi-label targets [RH, RR].
@@ -294,14 +284,19 @@ def relabel(y):
     RR (53) -> [0,1]
     If you ever have 'both', set both bits to 1 *upstream*.
     """
-    y = y.long()
-    out = torch.zeros((y.shape[0], 2), dtype=torch.float32, device=y.device)
-    out[:, 0] = (y == 52).float()  # RH
-    out[:, 1] = (y == 53).float()  # RR
-    return out    
+    if MULTILABEL:
+        y = y.long()
+        out = torch.zeros((y.shape[0], 2), dtype=torch.float32, device=y.device)
+        out[:, 0] = (y == 52).float()   # RH
+        out[:, 1] = (y == 53).float()   # RR
+        return out
+    return (y - base_cls).long()
 
 def as_index_labels(y: torch.Tensor) -> torch.Tensor:
     return y.argmax(dim=1) if y.ndim > 1 else y
+
+def _as_5d(x):
+    return x if x.dim() == 5 else x.unsqueeze(1)  # [B,1,H,W] -> [B,1,1,H,W]
 
 def collapse_logits(logits, num_classes, multilabel):
     if logits.ndim == 4:
@@ -431,8 +426,6 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
     FIXED_ANCHOR = False          # <— key: do not require fixed T*kpc headers
     _anchor_versions = []         # no anchor gating
 
-    print(f"PRINTFILENAMES={PRINTFILENAMES}, EXTRAVARS={EXTRAVARS}")
-
     # —— MULTI-LABEL mode for RH/RR ——
     if galaxy_classes == [52, 53]:
         MULTILABEL = True
@@ -446,7 +439,6 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
             return out
     else:
         MULTILABEL = False
-        base_cls = min(galaxy_classes)
         def relabel(y):
             return (y - base_cls).long()
 
@@ -551,9 +543,23 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
         else:
             raise ValueError(f"loader(train=False) returned {len(_out)} values, expected 4 or 6")
 
-        # Relabel to local indices/one-hot as needed
-        test_labels = relabel(test_labels)
-        
+        train_labels = relabel(train_labels)  # Will be used for the sanity check below
+        test_labels  = relabel(test_labels)   # [0,1,...] aligning with galaxy_classes
+        if not MULTILABEL:
+            unique_labels, counts = torch.unique(as_index_labels(test_labels), return_counts=True)
+
+        # ——— Data sanity checks ———
+        for i, cls in enumerate(galaxy_classes):
+            if MULTILABEL:
+                train_mask = train_labels[:, i] > 0.5
+                test_mask  = test_labels[:,  i] > 0.5
+            else:
+                train_mask = as_index_labels(train_labels) == i
+                test_mask  = as_index_labels(test_labels)  == i
+
+            check_tensor(f"Train images for class {cls} (idx={i})", train_images[train_mask])
+            check_tensor(f"Test images for class {cls} (idx={i})",  test_images[test_mask])
+
         # Shuffle TEST set to avoid any ordering systematics
         perm_test = torch.randperm(test_images.size(0))
         test_images, test_labels = test_images[perm_test], test_labels[perm_test]
@@ -704,11 +710,6 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                     valid_images, valid_labels = valid_images[perm_valid], valid_labels[perm_valid]
                     if PRINTFILENAMES and valid_fns is not None:
                         valid_fns = permute_like(valid_fns, perm_valid)
-                          
-                    if EXTRAVARS:
-                        print("Warning, this is not fully tested.")
-                        train_data = train_fns
-                        valid_data = valid_fns
                 else:
                     raise ValueError(f"loader(train=True) returned {len(_out)} values, expected 4 or 6")
 
@@ -803,11 +804,11 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                         pristine_train_labels = train_labels
                         
                 # Check the tensor for generated images
-                for cls in galaxy_classes:
-                    cls_mask = (as_index_labels(train_labels) == (cls - min(galaxy_classes))) if train_labels.ndim > 1 else (train_labels == cls)
+                for i, cls in enumerate(galaxy_classes):
+                    cls_mask = (as_index_labels(train_labels) == i)
                     cls_images = train_images[cls_mask]
                     check_tensor(f"Generated images for class {cls} with model {gen_model_name}", cls_images)
-                train_labels = relabel(train_labels)
+                train_labels = relabel(train_labels)  # [0,1,2,...] for classes [50,51,...]
                         
             if TRAINONGENERATED:
                 # For each class, select the correct slice of (images, labels), then concatenate all.
@@ -838,11 +839,11 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                 perm = torch.randperm(train_images.size(0))
                 train_images = train_images[perm]
                 train_labels = train_labels[perm]
-                if EXTRAVARS:
-                    print("Cannot use extra features with TRAINONGENERATED, setting EXTRAVARS to False")
-                    EXTRAVARS = False
-                
-            unique_labels, counts = torch.unique(train_labels, return_counts=True)
+
+            if not MULTILABEL:
+                unique_labels, counts = torch.unique(as_index_labels(train_labels), return_counts=True)
+                #labels_1d = train_labels.argmax(dim=1) if train_labels.ndim > 1 else train_labels
+                #unique_labels, counts = torch.unique(labels_1d, return_counts=True)
 
             if dataset_sizes == {}:
                 dataset_sizes[fold] = [int(len(train_images) * p) for p in dataset_portions]
@@ -855,11 +856,11 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
             if classifier in ['Rustige', 'CNNSqueezeNet', 'SCNN', 'ScatterSqueezeNet', 'ScatterSqueezeNet2', 'Binary']:
                 if lambda_generate not in [0, 8]:
                     # 1. concatenate images
-                    img_splits = [
-                        pristine_train_images.to(DEVICE),
-                        generated_images.to(DEVICE),
-                        valid_images.to(DEVICE)
-                    ]
+                    p = _as_5d(pristine_train_images).to(DEVICE)
+                    g = _as_5d(generated_images).to(DEVICE)
+                    v = _as_5d(valid_images).to(DEVICE)
+
+                    img_splits = [p, g, v]
                     img_lengths = [len(t) for t in img_splits]
                     all_images = torch.cat(img_splits, dim=0)
 
@@ -895,10 +896,10 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
 
                 else:
                     # same idea if lambda_generate == 0 (i.e. only real train+valid)
-                    img_splits = [
-                        train_images.to(DEVICE),
-                        valid_images.to(DEVICE)
-                    ]
+                    a = _as_5d(train_images).to(DEVICE)
+                    b = _as_5d(valid_images).to(DEVICE)
+
+                    img_splits = [a, b]
                     img_lengths = [len(t) for t in img_splits]
                     all_images = torch.cat(img_splits, dim=0)
 
@@ -922,95 +923,75 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                     train_labels, valid_labels = chunked_lbls            
             
             if MULTILABEL:
+                # labels are 2-hot; compute per-label pos_weight for BCE
                 pos_counts = train_labels.sum(dim=0)                       # [2]
                 neg_counts = train_labels.shape[0] - pos_counts            # [2]
                 pos_counts = torch.clamp(pos_counts, min=1.0)
                 pos_weight = (neg_counts / pos_counts).to(DEVICE)          # [2]
-                weights = None
+                print(f"[pos_weight] RH={pos_weight[0].item():.2f}, RR={pos_weight[1].item():.2f}")
+                weights = None  # not used in BCE branch
             else:
                 if USE_CLASS_WEIGHTS:
                     unique, counts = np.unique(train_labels.cpu().numpy(), return_counts=True)
                     total_count = sum(counts)
                     class_weights = {i: total_count / count for i, count in zip(unique, counts)}
-                    weights = torch.tensor([class_weights.get(i, 1.0) for i in range(len(galaxy_classes))],
+                    weights = torch.tensor([class_weights.get(i, 1.0) for i in range(num_classes)],
                                         dtype=torch.float, device=DEVICE)
                 else:
                     weights = None
 
+            if fold in [0, 5] and SHOWIMGS:
+                imgs = train_images.detach().cpu().numpy()
+                # Make labels 1-D: 0 for first class, 1 for second; then shift to 52/53
+                lbls = (as_index_labels(train_labels) + min(galaxy_classes)).detach().cpu().numpy()
+                plot_images_by_class(
+                    imgs,
+                    labels=lbls,
+                    num_images=5,
+                    save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_example_train_data.pdf"
+                )
             # Prepare input data
             mock_tensor = torch.zeros_like(train_images)
             valid_mock_tensor = torch.zeros_like(valid_images)
-            if classifier in ['ScatterNet', 'ScatterResNet', 'ScatterSqueezeNet', 'ScatterSqueezeNet2', 'DISSN']:
-                train_images = fold_T_axis(train_images)
+            if classifier in ['ScatterNet', 'ScatterResNet', 'ScatterSqueezeNet', 'ScatterSqueezeNet2']:
+                # Define cache paths (you can adjust these names as needed)
+                train_cache_path = f"./.cache/train_scat_{galaxy_classes}_{fold}_{lambda_generate}_{dataset_portions[0]}_{FILTERED}_{TRAINONGENERATED}.npy"
+                valid_cache_path = f"./.cache/valid_scat_{galaxy_classes}_{fold}_{lambda_generate}_{dataset_portions[0]}_{FILTERED}_{TRAINONGENERATED}.npy"
+            
+                # fold T into C on both real & scattering inputs
+                train_images = fold_T_axis(train_images) # Merges the image version into the channel dimension
                 valid_images = fold_T_axis(valid_images)
+                mock_train = torch.zeros_like(train_images)
+                mock_valid = torch.zeros_like(valid_images)
 
-                if classifier == 'DISSN':
-                    vnames = [str(v).lower() for v in (versions or ['raw'])]
-                    assert 'raw' in vnames and 't50kpc' in vnames, \
-                        f"DISSN requires versions to include 'raw' and 'T50kpc', got: {vnames}"
+                train_cache = f"./.cache/train_scat_{galaxy_classes}_{fold}_{lambda_generate}_{dataset_portions[0]}_{FILTERED}.pt"
+                valid_cache = f"./.cache/valid_scat_{galaxy_classes}_{fold}_{lambda_generate}_{dataset_portions[0]}_{FILTERED}.pt"
+                train_scat_coeffs = compute_scattering_coeffs(train_images, scattering, batch_size=128, device="cpu")
+                valid_scat_coeffs = compute_scattering_coeffs(valid_images, scattering, batch_size=128, device="cpu")
 
-                    idx_raw = vnames.index('raw')
-                    idx_t50 = vnames.index('t50kpc')
+                if train_scat_coeffs.dim() == 5:
+                    # [B, C_in, C_scat, H, W] → [B, C_in*C_scat, H, W]
+                    print("Shape of train_scat_coeffs before flattening: ", train_scat_coeffs.shape)
+                    train_scat_coeffs = train_scat_coeffs.flatten(start_dim=1, end_dim=2)
+                    valid_scat_coeffs = valid_scat_coeffs.flatten(start_dim=1, end_dim=2)
+                    print("Shape of train_scat_coeffs after flattening: ", train_scat_coeffs.shape)
 
-                    # images are RAW
-                    raw_train = train_images[:, idx_raw:idx_raw+1]
-                    raw_valid = valid_images[:, idx_raw:idx_raw+1]
-
-                    # scattering on T50kpc only
-                    t50_train = train_images[:, idx_t50:idx_t50+1].contiguous()
-                    t50_valid = valid_images[:, idx_t50:idx_t50+1].contiguous()
-
-                    train_scat_coeffs = compute_scattering_coeffs(t50_train, scattering, batch_size=128, device="cpu")
-                    valid_scat_coeffs = compute_scattering_coeffs(t50_valid, scattering, batch_size=128, device="cpu")
-
-                    if train_scat_coeffs.dim() == 5:
-                        train_scat_coeffs = train_scat_coeffs.flatten(start_dim=1, end_dim=2)
-                        valid_scat_coeffs = valid_scat_coeffs.flatten(start_dim=1, end_dim=2)
-
-                    # (optional) joint normalization for stability
-                    all_scat = torch.cat([train_scat_coeffs, valid_scat_coeffs], dim=0)
-                    if NORMALISESCS or NORMALISESCSTOPM:
-                        if NORMALISESCSTOPM:
-                            all_scat = normalise_images(all_scat, -1, 1)
-                        else:
-                            all_scat = normalise_images(all_scat, 0, 1)
-                    train_scat_coeffs = all_scat[:len(train_scat_coeffs)]
-                    valid_scat_coeffs = all_scat[len(train_scat_coeffs):]
-
-                    scatdim = train_scat_coeffs.shape[1:]
-
-                    # Build datasets (img=RAW, scat=scattering(T50kpc))
-                    train_dataset = TensorDataset(raw_train, train_scat_coeffs, train_labels)
-                    valid_dataset = TensorDataset(raw_valid, valid_scat_coeffs, valid_labels)
-
-                    # also keep these around for model shape inference below
-                    train_images = raw_train
-                    valid_images = raw_valid
-
-                else:
-                    # original behavior for the other scatter-based classifiers
-                    mock_train = torch.zeros_like(train_images)
-                    mock_valid = torch.zeros_like(valid_images)
-                    train_scat_coeffs = compute_scattering_coeffs(train_images, scattering, batch_size=128, device="cpu")
-                    valid_scat_coeffs = compute_scattering_coeffs(valid_images, scattering, batch_size=128, device="cpu")
-                    if train_scat_coeffs.dim() == 5:
-                        train_scat_coeffs = train_scat_coeffs.flatten(start_dim=1, end_dim=2)
-                        valid_scat_coeffs = valid_scat_coeffs.flatten(start_dim=1, end_dim=2)
-                    all_scat = torch.cat([train_scat_coeffs, valid_scat_coeffs], dim=0)
-                    if NORMALISESCS or NORMALISESCSTOPM:
-                        if NORMALISESCSTOPM:
-                            all_scat = normalise_images(all_scat, -1, 1)
-                        else:
-                            all_scat = normalise_images(all_scat, 0, 1)
-                    train_scat_coeffs, valid_scat_coeffs = all_scat[:len(train_scat_coeffs)], all_scat[len(train_scat_coeffs):]
-                    scatdim = train_scat_coeffs.shape[1:]
-                    if classifier in ['ScatterNet', 'ScatterResNet']:
-                        train_dataset = TensorDataset(mock_train, train_scat_coeffs, train_labels)
-                        valid_dataset = TensorDataset(mock_valid, valid_scat_coeffs, valid_labels)
+                all_scat = torch.cat([train_scat_coeffs, valid_scat_coeffs], dim=0)
+                if NORMALISESCS or NORMALISESCSTOPM:
+                    if NORMALISESCSTOPM:
+                        all_scat = normalise_images(all_scat, -1, 1)
                     else:
-                        train_dataset = TensorDataset(train_images, train_scat_coeffs, train_labels)
-                        valid_dataset  = TensorDataset(valid_images, valid_scat_coeffs, valid_labels)
+                        all_scat = normalise_images(all_scat, 0, 1)
+                train_scat_coeffs, valid_scat_coeffs = all_scat[:len(train_scat_coeffs)], all_scat[len(train_scat_coeffs):]
 
+                scatdim = train_scat_coeffs.shape[1:]   # tuple(C, H, W)
+
+                if classifier in ['ScatterNet', 'ScatterResNet']:
+                    train_dataset = TensorDataset(mock_train, train_scat_coeffs, train_labels)
+                    valid_dataset = TensorDataset(mock_valid, valid_scat_coeffs, valid_labels)
+                else: # if classifier in ['ScatterSqueezeNet', 'ScatterSqueezeNet2']:
+                    train_dataset = TensorDataset(train_images, train_scat_coeffs, train_labels)
+                    valid_dataset = TensorDataset(valid_images, valid_scat_coeffs, valid_labels)
             else:
                 if train_images.dim() == 5:
                     train_images = fold_T_axis(train_images)   # [B,T,1,H,W] -> [B,T,H,W]
@@ -1020,18 +1001,8 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                     assert x.dim() == 4, f"{name}_images should be [B,C,H,W], got {tuple(x.shape)}"
                 mock_train = torch.zeros_like(train_images)
                 mock_valid = torch.zeros_like(valid_images)
-                if classifier == "DICSN":
-                    idx_v1 = 0
-                    idx_v2 = 1
-                    v1_train = train_images[:, idx_v1:idx_v1+1]
-                    v2_train = train_images[:, idx_v2:idx_v2+1]
-                    v1_valid = valid_images[:, idx_v1:idx_v1+1]
-                    v2_valid = valid_images[:, idx_v2:idx_v2+1]
-                    train_dataset = TensorDataset(v1_train, v2_train, train_labels)
-                    valid_dataset = TensorDataset(v1_valid, v2_valid, valid_labels)
-                else:
-                    train_dataset = TensorDataset(train_images, mock_train, train_labels)
-                    valid_dataset = TensorDataset(valid_images, mock_valid, valid_labels)
+                train_dataset = TensorDataset(train_images, mock_train, train_labels)
+                valid_dataset = TensorDataset(valid_images, mock_valid, valid_labels)
 
             train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=custom_collate, drop_last=False)
             valid_loader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=custom_collate, drop_last=False)
@@ -1048,9 +1019,13 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
             if fold == folds[0] and SHOWIMGS and downsample_size[-1] == 128:               
                 if len(galaxy_classes) == 2:
                     # Plot histograms for the two classes
-                    train_images_cls1 = train_images[train_labels == galaxy_classes[0] - min(galaxy_classes)]
-                    train_images_cls2 = train_images[train_labels == galaxy_classes[1] - min(galaxy_classes)]
-                    
+                    if MULTILABEL:
+                        train_images_cls1 = train_images[train_labels[:, 0] > 0.5]
+                        train_images_cls2 = train_images[train_labels[:, 1] > 0.5]
+                    else:
+                        train_images_cls1 = train_images[train_labels == galaxy_classes[0] - min(galaxy_classes)]
+                        train_images_cls2 = train_images[train_labels == galaxy_classes[1] - min(galaxy_classes)]
+
                     #Make sure the images are not tupples
                     if isinstance(train_images_cls1, tuple):
                         train_images_cls1 = train_images_cls1[0]
@@ -1146,10 +1121,7 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
             elif classifier == "ScatterResNet":
                 models = {"ScatterResNet": {"model": ScatterResNet(scat_shape=scatdim, num_classes=num_classes).to(DEVICE)}}
             elif classifier == "ScatterSqueezeNet":
-                if EXTRAVARS:
-                    models = {"ScatterSqueezeNet": {"model": MetaWrapper(ScatterSqueezeNet(img_shape=tuple(valid_images.shape[1:]), scat_shape=scatdim, num_classes=num_classes), meta_dim=test_meta.shape[1]).to(DEVICE)}}
-                else:
-                    models = {"ScatterSqueezeNet": {"model": ScatterSqueezeNet(img_shape=tuple(valid_images.shape[1:]), scat_shape=scatdim, num_classes=num_classes).to(DEVICE)}}
+                models = {"ScatterSqueezeNet": {"model": ScatterSqueezeNet(img_shape=tuple(valid_images.shape[1:]), scat_shape=scatdim, num_classes=num_classes).to(DEVICE)}}
             elif classifier == "ScatterSqueezeNet2":
                 models = {"ScatterSqueezeNet2": {"model": ScatterSqueezeNet2(img_shape=tuple(valid_images.shape[1:]), scat_shape=scatdim, num_classes=num_classes).to(DEVICE)}}
             elif classifier == 'Binary':
@@ -1214,11 +1186,7 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                             total_images = 0
 
                             for images, scat, _rest in subset_train_loader:
-                                if EXTRAVARS:
-                                    meta, labels = _rest
-                                    meta = meta.to(DEVICE)  # Send metadata to device
-                                else:
-                                    labels = _rest
+                                labels = _rest
                                 images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE) # Send to device
                                 optimizer.zero_grad()
                                 if classifier == "DANN":
@@ -1254,8 +1222,7 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                                         logits = model(images)
 
                                     logits = collapse_logits(logits, num_classes, MULTILABEL)
-
-                                    #labels = labels.long()
+                                    labels = labels.float() if MULTILABEL else labels.long()
                                     loss = criterion(logits, labels)
 
                                     loss.backward()
@@ -1276,11 +1243,7 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                                     if images is None or len(images) == 0:
                                         print(f"Empty batch at index {i}. Skipping...")
                                         continue
-                                    if EXTRAVARS:
-                                        meta, labels = _rest
-                                        meta = meta.to(DEVICE)  # Send metadata to device
-                                    else:
-                                        labels = _rest
+                                    labels = _rest
                                     images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE)
                                     if classifier == "DANN":
                                         logits, _ = model(images, alpha=1.0)
@@ -1291,38 +1254,12 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                                             logits = model(images, scat)
                                         else:
                                             logits = model(images)
-                                            
-                                    if galaxy_classes == [52, 53]:
-                                        # If a model ever returns [B, C, H, W], keep your collapse:
-                                        if logits.ndim == 4:
-                                            logits = torch.nn.functional.adaptive_avg_pool2d(logits, (1, 1)).squeeze(-1).squeeze(-1)
-                                        elif logits.ndim == 3:
-                                            logits = logits.mean(dim=-1)
 
-                                        # For BCE: labels must be float and same shape as logits
-                                        labels = labels.float()
-
-                                        
-                                    else:
-
-                                        # Collapse spatial maps to [B, C] if the model returns [B, C, H, W]
-                                        if logits.ndim == 4:
-                                            logits = torch.nn.functional.adaptive_avg_pool2d(logits, (1, 1)).squeeze(-1).squeeze(-1)
-                                        elif logits.ndim == 3:  # rare: [B, C, H]
-                                            logits = logits.mean(dim=-1)
-
-                                        # Keep binary 2-logit shape for CE
-                                        if logits.ndim == 1:
-                                            logits = logits.unsqueeze(1)
-                                        if logits.shape[1] == 1 and num_classes == 2 and galaxy_classes != [52, 53]:
-                                            logits = torch.cat([-logits, logits], dim=1)
-
-                                    #labels = labels.long()
-                                    loss = criterion(logits, labels)
-                                        
-                                    # inside the training loop, just before loss = criterion(outputs, labels)
-                                    if galaxy_classes != [52, 53]:
+                                    logits = collapse_logits(logits, num_classes, MULTILABEL)
+                                    labels = labels.float() if MULTILABEL else labels.long()
+                                    if not MULTILABEL:
                                         assert labels.dtype == torch.long, f"labels dtype {labels.dtype} must be long"
+                                    loss = criterion(logits, labels)
                                     mn, mx = int(labels.min()), int(labels.max())
                                     assert 0 <= mn and mx < num_classes, f"label range [{mn},{mx}] not in [0,{num_classes-1}]"
 
@@ -1349,11 +1286,7 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                             mis_preds  = []
                             
                             for images, scat, _rest in test_loader:
-                                if EXTRAVARS:
-                                    meta, labels = _rest
-                                    meta = meta.to(DEVICE)  # Send metadata to device
-                                else:
-                                    labels = _rest
+                                labels = _rest
                                 images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE)
                                 if classifier == "DANN":
                                     logits, _ = model(images, alpha=1.0)
@@ -1365,6 +1298,7 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                                     else:
                                         logits = model(images)
                                         
+                                logits = collapse_logits(logits, num_classes, MULTILABEL)
                                 if MULTILABEL:
                                     probs = torch.sigmoid(logits).cpu().numpy()           # [B,2]
                                     preds = (probs >= THRESHOLD).astype(int)              # [B,2]
@@ -1380,7 +1314,6 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                                     all_pred_labels[key].extend(pred_labels)
                                     all_true_labels[key].extend(true_labels)
                                     
-                                # WITH these lines
                                 if SHOWIMGS and experiment == num_experiments - 1:
                                     if MULTILABEL:
                                         batch_pred = preds          # shape [B, 2]
@@ -1456,16 +1389,11 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                 generated_features = []
                 with torch.inference_mode():
                     for images, scat, _rest in test_loader:
-                        if EXTRAVARS:
-                            meta, labels = _rest
-                            meta = meta.to(DEVICE)
-                        else:
-                            labels = _rest
+                        labels = _rest
                         images = images.to(DEVICE, non_blocking=True)
                         scat   = scat.to(DEVICE, non_blocking=True)
                         labels = labels.to(DEVICE, non_blocking=True)
 
-                        
                         if classifier == "DANN":
                             class_logits, _ = model(images, alpha=1.0)
                             outputs = class_logits.cpu().detach().numpy()

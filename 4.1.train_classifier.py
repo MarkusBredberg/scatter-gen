@@ -37,11 +37,10 @@ print("Running script 4.1 Latest version with seed", SEED)
 ###############################################
 ################ CONFIGURATION ################
 ###############################################
-
-galaxy_classes = [52, 53]  # Classes to classify
-max_num_galaxies = 1000000  # Upper limit for the all-classes combined training data before classical augmentation
-dataset_portions = [1]  # Portions of complete dataset for the accuracy vs dataset size
-J, L, order = 2, 12, 2  # Scatter transform parameters
+galaxy_classes    = [50, 51]
+max_num_galaxies  = 1000000  # Upper limit for the all-classes combined training data before classical augmentation
+dataset_portions  = [1]
+J, L, order       = 2, 12, 2
 classifier = ["TinyCNN", # Very Simple CNN
               "Rustige", # Simple CNN from Rustige et al. 2023, https://github.com/floriangriese/wGAN-supported-augmentation/blob/main/src/Classifiers/SimpleClassifiers/Classifiers.py
               "SCNN", # Simple CNN similar to Rustige's
@@ -59,15 +58,15 @@ label_smoothing = 0.2  # Label smoothing for the classifier
 num_experiments = 100
 folds = [5] # 0-4 for 5-fold cross validation, 5 for only one training
 lambda_values = [0]  # Ratio between generated images and original images per class. 8 is reserfved for TRAINONGENERATED
-percentile_lo = 30 # Percentile stretch lower bound
+percentile_lo = 60 # Percentile stretch lower bound
 percentile_hi = 99  # Percentile stretch upper bound
-versions = ['RAW']  # any mix of loadable and runtime-tapered planes. 'rt50' or 'rt100' for tapering. Square brackets for stacking
+versions = 'RT50kpc' # any mix of loadable and runtime-tapered planes. 'rt50' or 'rt100' for tapering. Square brackets for stacking
 
 STRETCH = True  # Arcsinh stretch
 USE_GLOBAL_NORMALISATION = False           # single on/off switch . False - image-by-image normalisation 
 GLOBAL_NORM_MODE = "percentile"           # "percentile" or "flux". Becomes "none" if USE_GLOBAL_NORMALISATION is 
-NORMALISEIMGS = True  # Globally normalise images to [0, 1]
-NORMALISEIMGSTOPM = False  # Globally normalise images to [-1, 1] 
+NORMALISEIMGS = True  # Normalise images to [0, 1]
+NORMALISEIMGSTOPM = False  # Normalise images to [-1, 1] 
 NORMALISESCS = False  # Normalise scattering coefficients to [0, 1]
 NORMALISESCSTOPM = False  # Normalise scattering coefficients to [-1, 1]
 FILTERED = True  # Remove in training, validation and test data for the classifier
@@ -114,8 +113,8 @@ elif galaxy_classes[0] in list(range(40, 49)):
     downsample_size = (128, 128)  # Downsample size for the images
     batch_size = 16
 elif galaxy_classes[0] in list(range(50, 60)):
-    crop_size = (1, 512, 512)  # Crop size for the images
-    downsample_size = (1, 128, 128)  # Downsample size for the images
+    crop_size = (512, 512)  # Crop size for the images
+    downsample_size = (128, 128)  # Downsample size for the images
     batch_size = 16 
 
 img_shape = downsample_size
@@ -191,6 +190,12 @@ def permute_like(x, perm):
 
 base_cls = min(galaxy_classes)
 def relabel(y):
+    """
+    Convert raw single-class ids to 2-bit multi-label targets [RH, RR].
+    RH (52) -> [1,0]
+    RR (53) -> [0,1]
+    If you ever have 'both', set both bits to 1 *upstream*.
+    """
     if MULTILABEL:
         y = y.long()
         out = torch.zeros((y.shape[0], 2), dtype=torch.float32, device=y.device)
@@ -326,7 +331,7 @@ dataset_sizes = {}
 scattering = Scattering2D(J=J, L=L, shape=img_shape[-2:], max_order=order)      
 for gen_model_name in gen_model_names:
 
-    with torch.no_grad():
+    with torch.inference_mode():
         dummy = torch.zeros((1, *img_shape)).cpu()
         scat_dummy = scattering(dummy)
         if scat_dummy.dim()==5:
@@ -1057,12 +1062,10 @@ for gen_model_name in gen_model_names:
                                 meta = meta.to(DEVICE)  # Send metadata to device
                             else:
                                 labels = _rest
-                            #images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE) # Send to device
                             images  = images.to(DEVICE, non_blocking=True)
                             scat    = scat.to(DEVICE, non_blocking=True)
                             labels  = labels.to(DEVICE, non_blocking=True)
 
-                            
                             optimizer.zero_grad()
                             if classifier == "DANN":
                                 class_logits, domain_logits = model(images, alpha=1.0)
@@ -1093,7 +1096,7 @@ for gen_model_name in gen_model_names:
                         val_total_loss = 0
                         val_total_images = 0
 
-                        with torch.no_grad(): # Validate on validation data
+                        with torch.inference_mode(): # Validate on validation data
                             for i, (images, scat, _rest) in enumerate(valid_loader):
                                 if images is None or len(images) == 0:
                                     print(f"Empty batch at index {i}. Skipping...")
@@ -1140,7 +1143,7 @@ for gen_model_name in gen_model_names:
                                 break
 
                     model.eval()
-                    with torch.no_grad(): # Evaluate on test data
+                    with torch.inference_mode(): # Evaluate on test data
                         key = f"{gen_model_name}_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}"
                         all_pred_probs[key] = []
                         all_pred_labels[key] = []
@@ -1274,7 +1277,7 @@ for gen_model_name in gen_model_names:
                         file.write(f"Time taken to train the model on fold {fold}: {elapsed_time:.2f} seconds \n")
             
             generated_features = []
-            with torch.no_grad():
+            with torch.inference_mode():
                 for images, scat, _rest in test_loader:
                     if EXTRAVARS:
                         meta, labels = _rest
