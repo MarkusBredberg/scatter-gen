@@ -52,16 +52,18 @@ classifier = ["TinyCNN", # Very Simple CNN
 gen_model_names = ['DDPM'] #['ST', 'DDPM', 'wGAN', 'GAN', 'Dual', 'CNN', 'STMLP', 'lavgSTMLP', 'ldiffSTMLP'] # Specify the generative model_name
 num_epochs_cuda = 200
 num_epochs_cpu = 100
-learning_rates = [1e-3]  # Learning rates done 
-regularization_params = [1e-3]  # Regularisation parameters
-label_smoothing = 0.2  # Label smoothing for the classifier
-num_experiments = 100
+learning_rates = [1e-3]
+regularization_params = [1e-3]  
+label_smoothing = 0.2  
+num_experiments = 100 
 folds = [5] # 0-4 for 5-fold cross validation, 5 for only one training
 lambda_values = [0]  # Ratio between generated images and original images per class. 8 is reserfved for TRAINONGENERATED
-percentile_lo = 60 # Percentile stretch lower bound
-percentile_hi = 99  # Percentile stretch upper bound
+percentile_lo = 30 # Percentile stretch lower bound
+percentile_hi = 90  # Percentile stretch upper bound
 versions = 'RT50kpc' # any mix of loadable and runtime-tapered planes. 'rt50' or 'rt100' for tapering. Square brackets for stacking
 
+#PREFER_PROCESSED = True if versions != 'RAW' else False  # Prefer processed images if available (constant n_beams)
+PREFER_PROCESSED = False  
 STRETCH = True  # Arcsinh stretch
 USE_GLOBAL_NORMALISATION = False           # single on/off switch . False - image-by-image normalisation 
 GLOBAL_NORM_MODE = "percentile"           # "percentile" or "flux". Becomes "none" if USE_GLOBAL_NORMALISATION is 
@@ -343,7 +345,7 @@ for gen_model_name in gen_model_names:
     hidden_dim2 = 128
     vae_latent_dim = 64
     
-    _out  = load_galaxies(galaxy_classes=galaxy_classes,
+    _out  = _loader(galaxy_classes=galaxy_classes,
                 versions=versions, 
                 fold=max(folds), #Any fold other than 5 gives me the test data for the five fold cross validation
                 crop_size=crop_size,
@@ -360,6 +362,7 @@ for gen_model_name in gen_model_names:
                 USE_GLOBAL_NORMALISATION=USE_GLOBAL_NORMALISATION,
                 GLOBAL_NORM_MODE=GLOBAL_NORM_MODE,
                 PRINTFILENAMES=PRINTFILENAMES,
+                PREFER_PROCESSED=PREFER_PROCESSED,
                 train=False)
 
     if len(_out) == 4:
@@ -449,6 +452,12 @@ for gen_model_name in gen_model_names:
         torch.cuda.empty_cache()
         runname = f"{galaxy_classes}_{gen_model_name}_lr{lr}_reg{reg}_lo{percentile_lo}_hi{percentile_hi}_cs{crop_size[0]}x{crop_size[1]}"
 
+        print(f"\n▶ Experiment: g_classes={galaxy_classes}, lr={lr}, reg={reg}, ls={label_smoothing}, "
+        f"J={J}, L={L}, crop={crop_size}, down={downsample_size}, ver={versions}, "
+        f"lo={percentile_lo}, hi={percentile_hi}, classifier={classifier}, "
+        f"global_norm={USE_GLOBAL_NORMALISATION}, norm_mode={GLOBAL_NORM_MODE}, "
+        f"PREFER_PROCESSED={PREFER_PROCESSED} ◀\n")
+
         log_path = f"./classifier/log_{runname}.txt"
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
         #file = open(log_path, 'w')
@@ -458,7 +467,7 @@ for gen_model_name in gen_model_names:
             # only synthetic for training; reserve real for validation
             train_images = torch.empty((0, *img_shape), device=DEVICE)
             train_labels = torch.empty((0,), dtype=torch.long, device=DEVICE)
-            _out = load_galaxies(
+            _out = _loader(
                 galaxy_classes=galaxy_classes,
                 versions=versions,
                 fold=fold,
@@ -474,6 +483,7 @@ for gen_model_name in gen_model_names:
                 GLOBAL_NORM_MODE=GLOBAL_NORM_MODE,
                 train=True,
                 PRINTFILENAMES=PRINTFILENAMES,
+                PREFER_PROCESSED=PREFER_PROCESSED
             )
 
             if len(_out) == 4:
@@ -493,7 +503,7 @@ for gen_model_name in gen_model_names:
 
         else:
             # real train + valid
-            _out = load_galaxies(
+            _out = _loader(
                 galaxy_classes=galaxy_classes,
                 versions=versions,
                 fold=max(folds),
@@ -511,6 +521,7 @@ for gen_model_name in gen_model_names:
                 USE_GLOBAL_NORMALISATION=USE_GLOBAL_NORMALISATION,
                 GLOBAL_NORM_MODE=GLOBAL_NORM_MODE,
                 PRINTFILENAMES=PRINTFILENAMES,
+                PREFER_PROCESSED=PREFER_PROCESSED,
                 train=True)
 
             if len(_out) == 4:
@@ -1348,17 +1359,38 @@ for gen_model_name in gen_model_names:
                         vmin, vmax = vmin - eps, vmax + eps
                     edges = np.linspace(vmin, vmax, 21)  # 20 bins across [min, max]
 
+                    import matplotlib.patches as mpatches
+
+                    # compute stats
+                    mean = float(np.mean(vals))
+                    std = float(np.std(vals, ddof=0))
+                    p16, p50, p84 = float(p16), float(p50), float(p84)
+
                     plt.figure(figsize=(5,3.2))
-                    plt.hist(vals, bins=edges, edgecolor='none', alpha=0.8)
-                    for x, style in [(p16, ':'), (p50, '-'), (p84, ':')]:
-                        plt.axvline(x, linestyle=style)
-                    plt.xlim(vmin, vmax)  # force axis to the observed range
-                    plt.title(key)
-                    plt.xlabel(metric_name)
-                    plt.ylabel("count")
+                    counts, bins, patches = plt.hist(vals, bins=edges, edgecolor='black', color='green', alpha=0.45)
+
+                    # vertical lines: mean (solid), median (dashed), p16/p84 (dotted)
+                    mean_line, = plt.plot([mean, mean], [0, counts.max()], linestyle='-', color='blue', linewidth=2, label=f"Mean = {mean:.3f}, σ = {std:.3f}")
+                    median_line, = plt.plot([p50, p50], [0, counts.max()], linestyle='--', color='orange', linewidth=2, label=f"Median = {p50:.3f}")
+                    p16_line = plt.plot([p16, p16], [0, counts.max()], color='green', linestyle=':', linewidth=1)
+                    p84_line = plt.plot([p84, p84], [0, counts.max()], color='green', linestyle=':', linewidth=1)
+                    mean_plus_std_line = plt.plot([mean + std, mean + std], [0, counts.max()], color='blue', linestyle='--', linewidth=1)
+                    mean_minus_std_line = plt.plot([mean - std, mean - std], [0, counts.max()], color='blue', linestyle='--', linewidth=1)
+
+                    # shaded central 68% credibility region (p16--p84)
+                    ymax = counts.max()
+                    region_patch = plt.fill_betweenx([0, ymax], p16, p84, alpha=0.12, facecolor='green')
+
+                    plt.xlim(vmin, vmax)
+                    plt.xlabel(metric_name.capitalize())
+                    plt.ylabel("Count")
+
+                    # assemble legend: use created artists and the shaded patch
+                    legend_handles = [median_line, mean_line, mpatches.Patch(facecolor='green', alpha=0.12, label=f"68% interval [{p16:.3f}, {p84:.3f}]")]
+                    plt.legend(handles=legend_handles, loc='best', frameon=False, fontsize='small')
+
                     plt.tight_layout()
 
-                    # save one file per metric so nothing gets overwritten
                     save_path_hist = (
                         f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_"
                         f"{dataset_sizes[folds[-1]][-1]}_{metric_name}_histogram.pdf"

@@ -26,6 +26,8 @@ np.random.seed(seed)
 ################ CONFIGURATION ################
 ###############################################
 
+# Make the file names longer and more descriptive
+
 FILTERED = True       # Evaluation with filtered data (REMOVEOUTLIERS = True)
 TRAINONGENERATED = False # Use generated data as testdata
 
@@ -35,7 +37,7 @@ learning_rates = [1e-3]
 regularization_params = [1e-3]
 lambda_values = [0]
 num_experiments = 100
-percentile_lo, percentile_hi = 60, 99
+percentile_lo, percentile_hi = 30, 90
 folds = [5] # Number of folds for cross-validation
 generators = ['DDPM']
 classifier = ["TinyCNN", "Rustige", "SCNN", "CNNSqueezeNet", "DualCNNSqueezeNet", "CloudNet", "DANN", "ScatterNet", "ScatterDual", "ScatterSqueezeNet", "Binary", "ScatterResNet"][-3]

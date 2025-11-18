@@ -2463,7 +2463,7 @@ def load_PSZ2(
                     Hwant, Wwant = Ho, Wo
                     proc_path = os.path.join(
                         processed_dir,
-                        f"{src_name}_{tag}_fmt_{Hwant}x{Wwant}.fits"
+                        f"{src_name}_{tag}_fmt_{Hwant}x{Wwant}.fits" # This is the used file name
                     )
                     if os.path.isfile(proc_path):
                         arr = np.squeeze(fits.getdata(proc_path)).astype(np.float32)
@@ -2482,12 +2482,12 @@ def load_PSZ2(
                 if vU.startswith("T"):
                     # Load tapered image directly from TXXkpc/<sub>/<base>TXXkpc.fits and format
                     t_dir = os.path.join(path, tag, sub)  # tag is e.g. "T50kpc"
-                    t_path = os.path.join(t_dir, f"{base}{tag}.fits")
+                    t_path = os.path.join(t_dir, f"{base}.fits")
                     if not os.path.isfile(t_path):
                         print(f"[MISS] tapered FITS not found for class={sub}: {t_path}")
                         continue
 
-                    print(f"[T-FALLBACK] Using tapered image: {t_path}")
+                    #print(f"[T-FALLBACK] Using tapered image: {t_path}")
                     arr = np.squeeze(fits.getdata(t_path)).astype(np.float32)
                     if arr.ndim == 3:
                         arr = arr.mean(axis=0)
@@ -2535,7 +2535,7 @@ def load_PSZ2(
 
                     txx_path = os.path.join(path, gate_dirname, sub, f"{base}{gate_dirname}.fits")
                     if not os.path.isfile(txx_path):
-                        print(f"  [SKIP] missing gate T image for RT convolution: {txx_path}")
+                        #print(f"  [SKIP] missing gate T image for RT convolution: {txx_path}")
                         continue
                     txx_hdr = fits.getheader(txx_path)
 
@@ -2692,7 +2692,7 @@ def load_PSZ2(
 
 def load_galaxies(galaxy_classes, path=None, versions=None, fold=None, island=None, crop_size=None, downsample_size=None, sample_size=None, DEBUG=False,
                   REMOVEOUTLIERS=True, BALANCE=False, AUGMENT=False, USE_GLOBAL_NORMALISATION=False, GLOBAL_NORM_MODE="percentile", STRETCH=False, percentile_lo=30, percentile_hi=99,
-                 NORMALISE=True, NORMALISETOPM=False, EXTRADATA=False, PRINTFILENAMES=False, SAVE_IMAGES=False, train=None):
+                 NORMALISE=True, NORMALISETOPM=False, PREFER_PROCESSED=True, EXTRADATA=False, PRINTFILENAMES=False, SAVE_IMAGES=False, train=None):
     """
     Master loader that delegates to specific dataset loaders and returns zero-based labels.
     """
@@ -2703,7 +2703,7 @@ def load_galaxies(galaxy_classes, path=None, versions=None, fold=None, island=No
     
     # Clean up kwargs to remove None values
     kwargs = {'path': path, 'versions': versions, 'sample_size': sample_size, 'fold':fold, 'train': train,
-              'island': island, 'crop_size': crop_size, 'downsample_size': downsample_size}
+              'island': island, 'crop_size': crop_size, 'downsample_size': downsample_size, 'prefer_processed': PREFER_PROCESSED}
     clean_kwargs = {k: v for k, v in kwargs.items() if v is not None}
 
     max_class = get_max_class(galaxy_classes)

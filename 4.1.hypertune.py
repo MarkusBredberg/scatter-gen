@@ -34,7 +34,6 @@ FUDGE_GLOBAL = float(os.getenv("RT_FUDGE_SCALE", "1.00"))  # e.g. 1.05
 #os.environ.setdefault("RT_AUTO_FUDGE", "1")  # default is already "1"; this makes it explicit
 os.environ["RT_AUTO_FUDGE"] = "0"  # disable per-source broadening; match target beam exactly
 
-
 SEED = 1  # Set a seed for reproducibility
 def set_seed(seed):
     random.seed(seed)
@@ -49,6 +48,7 @@ set_seed(SEED)
 
 os.makedirs('./classifier/trained_models', exist_ok=True)
 os.makedirs('./classifier/trained_models_filtered', exist_ok=True)
+os.makedirs('./hypertuning_outputs', exist_ok=True)
 matplotlib.use('Agg')
 tqdm.pandas(disable=True)
 
@@ -60,7 +60,7 @@ print("Running ht1 with seed", SEED)
 
 PSZ2_ROOT = "/users/mbredber/scratch/data/PSZ2"  # FITS root used below
 
-galaxy_classes    = [52, 53]
+galaxy_classes    = [50, 51]
 max_num_galaxies  = 1000000  # Upper limit for the all-classes combined training data before classical augmentation
 dataset_portions  = [1]
 J, L, order       = 2, 12, 2
@@ -98,9 +98,11 @@ param_grid = {
     'percentile_hi': [80, 90, 99], # Only used for data normalisation
     'crop_size':     [(512,512)],  # Not used for preformatted data
     'downsample_size':[(128,128)], # Not used for preformatted data
-    'versions':       ['RAW']  # 'raw', 'T50kpc', ad hoc tapering: e.g. 'rt50'  strings in list → product() iterates them individually
+    'versions':       ['RT50kpc']  # 'raw', 'T50kpc', ad hoc tapering: e.g. 'rt50'  strings in list → product() iterates them individually
 } #'versions': [('raw', 'rt50')]  # tuple signals “stack these”
 
+#PREFER_PROCESSED = True if versions != 'RAW' else False  # Prefer processed images if available (constant n_beams)
+PREFER_PROCESSED = True
 STRETCH = True  # Arcsinh stretch
 USE_GLOBAL_NORMALISATION = False           # single on/off switch . False - image-by-image normalisation 
 GLOBAL_NORM_MODE = "percentile"           # "percentile" or "flux". Becomes "none" if USE_GLOBAL_NORMALISATION is 
@@ -179,6 +181,11 @@ BALANCE = True if galaxy_classes == [52, 53] else False  # Balance the dataset b
 ##################### HELPER FUNCTIONS #################################
 ########################################################################
 
+
+#-------------------------------------------------------------
+# Diagnostics and debugging 
+#-------------------------------------------------------------
+
 def plot_first_rows_by_source(images, filenames, versions, out_path, n_show=10):
     """
     Plot the first N rows titled by source name. If images are [B,T,1,H,W] or [B,T,H,W],
@@ -235,6 +242,53 @@ def plot_first_rows_by_source(images, filenames, versions, out_path, n_show=10):
     plt.close()
     print(f"[quicklook] wrote {out_path}")
 
+def check_overfitting_indicators(metrics, gen_model_name, subset_size, fold, lr, reg, lambda_generate, 
+                                  crop_size, downsample_size, ver_key, history):
+    """Print comprehensive overfitting diagnostics."""
+    base = f"{gen_model_name}_ss{subset_size}_f{fold}_lr{lr}_reg{reg}_lam{lambda_generate}_cs{crop_size[0]}x{crop_size[1]}_ds{downsample_size[0]}x{downsample_size[1]}_ver{ver_key}"
+    
+    test_accs = metrics[f"{base}_accuracy"]
+    
+    print("\n" + "="*60)
+    print("OVERFITTING DIAGNOSTICS")
+    print("="*60)
+    
+    # 1. Train vs Test accuracy gap
+    # (You need to add train accuracy tracking first)
+    
+    # 2. Validation vs Test accuracy gap
+    print(f"\n📊 Test Accuracy: {np.mean(test_accs):.4f} ± {np.std(test_accs):.4f}")
+    
+    # 3. Check if early stopping triggered
+    loss_key = f"{gen_model_name}_loss_{subset_size}_{fold}_0_{lr}_{reg}_{lambda_generate}"
+    if loss_key in history[gen_model_name]:
+        epochs_trained = len(history[gen_model_name][loss_key])
+        print(f"📈 Epochs trained: {epochs_trained}/{num_epochs}")
+        if epochs_trained < num_epochs:
+            print(f"⚠️  Early stopping triggered after {epochs_trained} epochs")
+        
+    # 4. Loss trajectory
+    val_loss_key = f"{gen_model_name}_val_loss_{subset_size}_{fold}_0_{lr}_{reg}_{lambda_generate}"
+    if val_loss_key in history[gen_model_name]:
+        val_losses = history[gen_model_name][val_loss_key]
+        if len(val_losses) > 10:
+            early_avg = np.mean(val_losses[:5])
+            late_avg = np.mean(val_losses[-5:])
+            if late_avg > early_avg * 1.1:
+                print(f"⚠️  Validation loss increased from {early_avg:.4f} to {late_avg:.4f}")
+    
+    # 5. Variance across experiments
+    if len(test_accs) > 1:
+        if np.std(test_accs) > 0.05:
+            print(f"⚠️  High variance across experiments: {np.std(test_accs):.4f}")
+            print(f"    This suggests model is sensitive to initialization")
+    
+    print("="*60 + "\n")
+
+#-------------------------------------------------------------
+# Evaluation
+#-------------------------------------------------------------
+
 def compute_classification_metrics(y_true, y_pred, multilabel, num_classes):
     acc = accuracy_score(y_true, y_pred)
     if multilabel:
@@ -250,6 +304,10 @@ def compute_classification_metrics(y_true, y_pred, multilabel, num_classes):
     return acc, precision_score(y_true, y_pred, average=avg, zero_division=0), \
                  recall_score(y_true, y_pred, average=avg, zero_division=0), \
                  f1_score(y_true, y_pred, average=avg, zero_division=0)
+
+# -------------------------------------------------------------
+# Data processing helpers
+# -------------------------------------------------------------
 
 def permute_like(x, perm):
     if x is None:
@@ -369,11 +427,11 @@ def initialize_history(history, model_name, subset_size, fold, experiment, lr, r
 
     loss_key = f"{model_name}_loss_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}"
     val_loss_key = f"{model_name}_val_loss_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}"
+    train_acc_key = f"{model_name}_train_acc_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}"
 
-    if loss_key not in history[model_name]:
-        history[model_name][loss_key] = []
-    if val_loss_key not in history[model_name]:
-        history[model_name][val_loss_key] = []
+    for key in [loss_key, val_loss_key, train_acc_key]:
+        if key not in history[model_name]:
+            history[model_name][key] = []
 
 def initialize_labels(all_true_labels, all_pred_labels, model_name, subset_size, fold, experiment, lr, reg, lambda_generate):
     key = f"{model_name}_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}"
@@ -413,7 +471,8 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
     print(f"\n▶ Experiment: g_classes={galaxy_classes}, lr={lr}, reg={reg}, ls={ls}, "
         f"J={J}, L={L}, crop={crop_size}, down={downsample_size}, ver={versions}, "
         f"lo={percentile_lo}, hi={percentile_hi}, classifier={classifier}, "
-        f"global_norm={USE_GLOBAL_NORMALISATION}, norm_mode={GLOBAL_NORM_MODE} ◀\n")
+        f"global_norm={USE_GLOBAL_NORMALISATION}, norm_mode={GLOBAL_NORM_MODE}, "
+        f"PREFER_PROCESSED={PREFER_PROCESSED} ◀\n")
 
     if any(cls in galaxy_classes for cls in [10, 11, 12, 13]):
         batch_size = 128
@@ -516,6 +575,7 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
             USE_GLOBAL_NORMALISATION=USE_GLOBAL_NORMALISATION,
             GLOBAL_NORM_MODE=GLOBAL_NORM_MODE,
             PRINTFILENAMES=True,                   # ensure filenames for TEST
+            PREFER_PROCESSED=PREFER_PROCESSED,
             train=False
         )
 
@@ -531,7 +591,7 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
             try: # Checking so that the read in images look correct
                 # If you loaded a single version like 'T50kpc', this will plot one column.
                 # If you loaded two versions (e.g. versions=['RT50kpc','T50kpc']), it will plot side-by-side.
-                out_quick = f"/users/mbredber/scratch/psz2_first10_{ver_key}_train.png"
+                out_quick = f"/users/mbredber/scratch/hypertuning_outputs/psz2_first10_{ver_key}_{percentile_lo}_{percentile_hi}_train.png"
                 plot_first_rows_by_source(train_images.cpu(), train_fns, versions, out_quick, n_show=10)
             except Exception as e:
                 print(f"[quicklook] skipped: {e}")
@@ -685,6 +745,7 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                     USE_GLOBAL_NORMALISATION=USE_GLOBAL_NORMALISATION,
                     GLOBAL_NORM_MODE=GLOBAL_NORM_MODE,
                     PRINTFILENAMES=PRINTFILENAMES,
+                    PREFER_PROCESSED=PREFER_PROCESSED,
                     train=True)
 
                 if len(_out) == 4:
@@ -948,7 +1009,7 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                     imgs,
                     labels=lbls,
                     num_images=5,
-                    save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_example_train_data.pdf"
+                    save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{percentile_lo}_{percentile_hi}_example_train_data.pdf"
                 )
             # Prepare input data
             mock_tensor = torch.zeros_like(train_images)
@@ -1009,8 +1070,8 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
 
             if SHOWIMGS and lambda_generate not in [0, 8]: 
                 if classifier in ['TinyCNN', 'SCNN', 'CNNSqueezeNet', 'Rustige', 'ScatterSqueezeNet', 'ScatterSqueezeNet2', 'Binary']:
-                    #save_images_tensorboard(generated_images[:36], save_path=f"./{gen_model_name}_{galaxy_classes}_generated.png", nrow=6)
-                    plot_histograms(pristine_train_images, valid_images, title1="Train images", title2="Valid images", imgs3=generated_images, imgs4=test_images, title3='Generated images', title4='Test images', save_path=f"./{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{ver_key}_histogram.png")
+                    #save_images_tensorboard(generated_images[:36], save_path=f"./hypertuning_outputs/{gen_model_name}_{galaxy_classes}_generated.png", nrow=6)
+                    plot_histograms(pristine_train_images, valid_images, title1="Train images", title2="Valid images", imgs3=generated_images, imgs4=test_images, title3='Generated images', title4='Test images', save_path=f"./hypertuning_outputs/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{percentile_lo}_{percentile_hi}_{ver_key}_histogram.png")
 
             ###############################################
             ############# SANITY CHECKS ###################
@@ -1037,7 +1098,7 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                         train_images_cls2.cpu(),
                         title1=f"Class {galaxy_classes[0]}",
                         title2=f"Class {galaxy_classes[1]}",
-                        save_path=f"./{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_histogram_{ver_key}.png"
+                        save_path=f"./hypertuning_outputs/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{percentile_lo}_{percentile_hi}_histogram_{ver_key}.png"
                     )
                     
                     # Histogram for summed pixel values. One image is one point in the histogram.
@@ -1050,7 +1111,7 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                     plt.ylabel("Number of images")
                     plt.title(f"Histogram of summed pixel values for classes {galaxy_classes[0]} and {galaxy_classes[1]}")
                     plt.legend()
-                    plt.savefig(f"./{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_sum_histogram_{ver_key}.png")
+                    plt.savefig(f"./hypertuning_outputs/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{percentile_lo}_{percentile_hi}_sum_histogram_{ver_key}.png")
                     plt.close()
 
                     for cls in galaxy_classes:
@@ -1064,20 +1125,20 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                         imgs4plot = _ensure_4d(train_images)[sel_train].cpu()
                         plot_image_grid(
                             imgs4plot, num_images=36, titles=titles_train,
-                            save_path=f"./{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_train_grid_{ver_key}.png"
+                            save_path=f"./hypertuning_outputs/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{percentile_lo}_{percentile_hi}_{cls}_train_grid_{ver_key}.png"
                         )
 
                         imgs4plot = _ensure_4d(test_images)[sel_test].cpu()
                         plot_image_grid(
                             imgs4plot, num_images=36, titles=titles_test,
-                            save_path=f"./{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_test_grid_{ver_key}.png"
+                            save_path=f"./hypertuning_outputs/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{percentile_lo}_{percentile_hi}_{cls}_test_grid_{ver_key}.png"
                         )
 
                         if lambda_generate not in [0, 8]:
                             gen_imgs = _ensure_4d(generated_by_class[cls])[:36].cpu()
                             plot_image_grid(
                                 gen_imgs, num_images=36,
-                                save_path=f"./{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_generated_grid_{ver_key}.png"
+                                save_path=f"./hypertuning_outputs/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{percentile_lo}_{percentile_hi}_{cls}_generated_grid_{ver_key}.png"
                             )
 
                             plot_histograms(
@@ -1085,14 +1146,14 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                                 orig_imgs.cpu(),
                                 title1="Generated Images",
                                 title2="Train Images",
-                                save_path=f"./{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_histogram_{ver_key}.png"
+                                save_path=f"./hypertuning_outputs/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{percentile_lo}_{percentile_hi}_{cls}_histogram_{ver_key}.png"
                             )
                             plot_background_histogram(
                                 orig_imgs,
                                 gen_imgs,
                                 img_shape=(1, 128, 128),
                                 title="Background histograms",
-                                save_path=f"./{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_background_hist_{ver_key}.png")
+                                save_path=f"./hypertuning_outputs/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{percentile_lo}_{percentile_hi}_{cls}_background_hist_{ver_key}.png")
 
             
             ###############################################
@@ -1269,6 +1330,37 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                             val_average_loss = val_total_loss / val_total_images if val_total_images > 0 else float('inf')
                             val_loss_key = f"{gen_model_name}_val_loss_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}"
                             history[gen_model_name][val_loss_key].append(val_average_loss)
+
+                            # To check for overfitting, validate on training data as well
+                            model.eval()
+                            train_correct = 0
+                            train_total = 0
+
+                            with torch.inference_mode():
+                                for images, scat, _rest in subset_train_loader:
+                                    labels = _rest
+                                    images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE)
+                                    
+                                    if classifier in ["ScatterNet", "ScatterResNet"]:
+                                        logits = model(scat)
+                                    elif classifier in ["ScatterSqueezeNet", "ScatterSqueezeNet2", "DICSN", "DISSN"]:
+                                        logits = model(images, scat)
+                                    else:
+                                        logits = model(images)
+                                        
+                                    logits = collapse_logits(logits, num_classes, MULTILABEL)
+                                    
+                                    if MULTILABEL:
+                                        preds = (torch.sigmoid(logits) >= THRESHOLD).cpu().numpy()
+                                        trues = labels.cpu().numpy()
+                                        train_correct += (preds == trues).all(axis=1).sum()
+                                    else:
+                                        preds = logits.argmax(dim=1)
+                                        train_correct += (preds == labels).sum().item()
+                                    train_total += labels.size(0)
+
+                            train_accuracy = train_correct / train_total
+                            history[gen_model_name][f"{gen_model_name}_train_acc_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}"] = train_accuracy
                             
                             if ES:
                                 early_stopping(val_average_loss, model, f'./classifier/trained_models/{gen_model_name}_best_model.pth')
@@ -1357,7 +1449,7 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                                 for ax in axes[len(mis_images):]:
                                     ax.axis('off')
 
-                                out_path = f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_misclassified_{ver_key}.png"
+                                out_path = f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{percentile_lo}_{percentile_hi}_misclassified_{ver_key}.png"
                                 fig.savefig(out_path, dpi=150, bbox_inches='tight')
                                 plt.close(fig)
 
@@ -1416,4 +1508,7 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
 
                 model_save_path = f'./classifier/trained_models/{gen_model_name}_model.pth'
                 torch.save(model.state_dict(), model_save_path)
+
+            check_overfitting_indicators(metrics, gen_model_name, subset_size, fold, lr, reg, 
+                                 lambda_generate, crop_size, downsample_size, ver_key, history)
 

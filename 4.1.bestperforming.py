@@ -65,17 +65,16 @@ classifier = ["TinyCNN", # Very Simple CNN
               "SCNN", # Simple CNN similar to Rustige's
               "CNNSqueezeNet", # SCNN with Squeeze-and-Excitation blocks
               "DualCNNSqueezeNet", # Dual CNN with Squeeze-and-Excitation blocks
-              "CloudNet", # From https://github.com/SorourMo/Cloud-Net-A-semantic-segmentation-CNN-for-cloud-detection/tree/master
               "DANN", # Domain-Adversarial Neural Network
               "ScatterNet", "ScatterSqueezeNet", "ScatterSqueezeNet2",
               "Binary", "ScatterResNet"][-4]
 gen_model_names = ['DDPM'] #['ST', 'DDPM', 'wGAN', 'GAN', 'Dual', 'CNN', 'STMLP', 'lavgSTMLP', 'ldiffSTMLP'] # Specify the generative model_name
 num_epochs_cuda = 200
 num_epochs_cpu = 100
-learning_rates = [1e-3]  # Learning rates
-regularization_params = [1e-3]  # Regularisation parameters
-label_smoothing = 0.2  # Label smoothing for the classifier
-num_experiments = 100
+learning_rates = [1e-3]
+regularization_params = [1e-3]  
+label_smoothing = 0.2  
+num_experiments = 100 
 folds = [5] # 0-4 for 5-fold cross validation, 5 for only one training
 lambda_values = [0]  # Ratio between generated images and original images per class. 8 is reserfved for TRAINONGENERATED
 percentile_lo = 30 # Percentile stretch lower bound
@@ -121,7 +120,6 @@ gan_lambda_div = 0
 gan_type = ['Simple', 'Advanced'][0]
 gan_data_version = 'clean' if FILTERED else 'full'  # 'full' or 'clean'
 
-
 # ---------------------------- VAE CONFIGURATION -----------------------------
 VAE_train_size = 1101128
 forbidden_classes = 12  # Generated bent sources look awful
@@ -129,7 +127,10 @@ forbidden_classes = 12  # Generated bent sources look awful
 #####################################################################################
 ########################### AUTOMATIC CONFIGURATION #################################
 #####################################################################################
-    
+
+os.makedirs('./classifier/trained_models', exist_ok=True)
+os.makedirs('./classifier/trained_models_filtered', exist_ok=True)
+
 if any (cls in galaxy_classes for cls in [10, 11, 12, 13]):
     crop_size = (128, 128)  # Crop size for the images
     downsample_size = (128, 128)  # Downsample size for the images
@@ -189,46 +190,6 @@ ver_key = _verkey(versions)
 ##################### HELPER FUNCTIONS #################################
 ########################################################################
 
-def plot_red_histogram(imgs1, imgs2, title1, title2, save_path, bins=50, cmap_name='viridis'):
-    """
-    Plots a histogram of the RED channel. If images are single-channel,
-    they are first mapped to RGBA via the chosen matplotlib colormap, and
-    the RED component is histogrammed.
-    imgs*: torch tensors shaped [B, C, H, W] with C=1 or C=3.
-    """
-    def _to_red_values(batch):
-        x = batch.detach().cpu()
-        if x.dim() != 4:
-            raise ValueError(f"Expected [B,C,H,W], got {tuple(x.shape)}")
-        # If RGB, take channel 0 directly
-        if x.size(1) == 3:
-            r = x[:, 0]                                   # [B,H,W]
-            return r.reshape(-1).numpy()
-        # If single-channel, normalize per-image and map through colormap → take RED
-        if x.size(1) == 1:
-            x = x[:, 0]                                   # [B,H,W]
-            reds = []
-            cmap = cm.get_cmap(cmap_name)
-            for im in x:
-                im = (im - im.min()) / (im.max() - im.min() + 1e-6)
-                rgba = cmap(im.numpy())                   # [H,W,4]
-                reds.append(rgba[..., 0].reshape(-1))     # RED
-            return np.concatenate(reds, axis=0)
-        raise ValueError(f"Unsupported channel count: {x.size(1)}")
-
-    r1 = _to_red_values(imgs1)
-    r2 = _to_red_values(imgs2)
-
-    plt.figure(figsize=(6,3))
-    plt.hist(r1, bins=bins, alpha=0.6, label=title1)
-    plt.hist(r2, bins=bins, alpha=0.6, label=title2)
-    plt.xlabel('Red channel value')
-    plt.ylabel('Count')
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150)
-    plt.close()
-
 def permute_like(x, perm):
     if x is None: return None
     idx = perm.cpu().tolist()
@@ -238,7 +199,7 @@ def permute_like(x, perm):
     return x
 
 base_cls = min(galaxy_classes)
-def relabel(y): 
+def relabel(y):
     return (y - base_cls).long()
 
 def replicate_list(x, n):
@@ -517,10 +478,11 @@ for gen_model_name in gen_model_names:
                 _, _, valid_images, valid_labels, _, valid_data = _out
 
             # Relabel and shuffle validation data
-            valid_labels = relabel(valid_labels)  # [0,1,2,...] for classes [50,51,...]
+            valid_labels = relabel(valid_labels)
             perm_valid = torch.randperm(valid_images.size(0))
             valid_images, valid_labels = valid_images[perm_valid], valid_labels[perm_valid]
-            if PRINTFILENAMES: valid_fns = permute_like(valid_fns, perm_valid)
+            if PRINTFILENAMES and (valid_fns is not None):
+                valid_fns = permute_like(valid_fns, perm_valid)
 
         else:
             # real train + valid
@@ -797,23 +759,15 @@ for gen_model_name in gen_model_names:
                     train_images_cls2.cpu(),
                     title1=f"Class {galaxy_classes[0]}",
                     title2=f"Class {galaxy_classes[1]}",
-                    save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_histogram.png"
+                    save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_histogram.pdf"
                 )
 
                 plot_background_histogram(
-                    train_images_cls1.cpu(),        # shape (936, 1, 128, 128)
-                    train_images_cls2.cpu(),        # shape (720, 1, 128, 128)
-                    img_shape=(1, 128, 128),
-                    title="Background histograms",
-                    save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_background_hist.png"
-                )
-
-                plot_red_histogram(
                     train_images_cls1.cpu(),
                     train_images_cls2.cpu(),
-                    title1=f"Class {galaxy_classes[0]}",
-                    title2=f"Class {galaxy_classes[1]}",
-                    save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_red_hist.png"
+                    img_shape=(1, 128, 128),
+                    title="Background histograms",
+                    save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_background_hist.pdf"
                 )
 
                 for cls in galaxy_classes:
@@ -823,12 +777,12 @@ for gen_model_name in gen_model_names:
                     plot_image_grid(
                         orig_imgs.cpu(),
                         num_images=36,
-                        save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_train_grid.png"
+                        save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_train_grid.pdf"
                     )
                     plot_image_grid(
                         test_imgs.cpu(),
                         num_images=36,
-                        save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_test_grid.png"
+                        save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_test_grid.pdf"
                     )
                     tag_to_desc = { d["tag"]: d["description"] for d in get_classes() }
                     
@@ -852,7 +806,7 @@ for gen_model_name in gen_model_names:
                         train_images_cls2.cpu(),
                         label1=tag_to_desc[classes[galaxy_classes[0]]['tag']],
                         label2=tag_to_desc[classes[galaxy_classes[1]]['tag']],
-                        save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_summed_intensity_histogram.png"
+                        save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_summed_intensity_histogram.pdf"
                     )
                     
         
@@ -862,21 +816,21 @@ for gen_model_name in gen_model_names:
                         plot_image_grid(
                             gen_imgs,
                             num_images=36,
-                            save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_generated_grid.png"
+                            save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_generated_grid.pdf"
                         )
                         plot_histograms(
                             gen_imgs,
                             orig_imgs.cpu(),
                             title1="Generated Images",
                             title2="Train Images",
-                            save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_histogram.png"
+                            save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_histogram.pdf"
                         )
                         plot_background_histogram(
                             orig_imgs,
                             gen_imgs,
                             img_shape=(1, 128, 128),
                             title="Background histograms",
-                            save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_background_hist.png")
+                            save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_background_hist.pdf")
         
         if USE_CLASS_WEIGHTS:
             unique, counts = np.unique(train_labels.cpu().numpy(), return_counts=True)
@@ -965,8 +919,8 @@ for gen_model_name in gen_model_names:
 
         if SHOWIMGS and lambda_generate not in [0, 8]: 
             if classifier in ['TinyCNN', 'SCNN', 'CNNSqueezeNet', 'Rustige', 'ScatterSqueezeNet', 'ScatterSqueezeNet2', 'Binary']:
-                #save_images_tensorboard(generated_images[:36], save_path=f"./classifier/{gen_model_name}_{galaxy_classes}_generated.png", nrow=6)
-                plot_histograms(pristine_train_images, valid_images, title1="Train images", title2="Valid images", imgs3=generated_images, imgs4=test_images, title3='Generated images', title4='Test images', save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_histograms.png")
+                #save_images_tensorboard(generated_images[:36], save_path=f"./classifier/{gen_model_name}_{galaxy_classes}_generated.pdf", nrow=6)
+                plot_histograms(pristine_train_images, valid_images, title1="Train images", title2="Valid images", imgs3=generated_images, imgs4=test_images, title3='Generated images', title4='Test images', save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_histograms.pdf")
 
         
         ###############################################
@@ -983,11 +937,6 @@ for gen_model_name in gen_model_names:
             models = {"DualCNNSqueezeNet": {"model": DualCNNSqueezeNet(input_shape=tuple(valid_images.shape[1:]), num_classes=num_classes).to(DEVICE)}}
         elif classifier == "TinyCNN":
             models = {"TinyCNN": {"model": TinyCNN(input_shape=tuple(valid_images.shape[1:]), num_classes=num_classes).to(DEVICE)}} 
-        elif classifier == 'CloudNet':
-            cloud_model = CloudNet()  
-            cloud_model.load_weights(os.path.join(sys.path[0],
-                'Cloud-Net_trained_on_38-Cloud_training_patches.h5'))
-            cloud_model.trainable = True   # now you can fine-tune it on your radio maps
         elif classifier == "DANN":
             models = {"DANN": {"model": DANNClassifier(input_shape=tuple(valid_images.shape[1:]), num_classes=num_classes).to(DEVICE)}}
         elif classifier == "ScatterNet":
@@ -1250,7 +1199,7 @@ for gen_model_name in gen_model_names:
                                     plt.xlabel('Predicted')
                                     plt.ylabel('True')
                                     plt.title(f'Confusion Matrix — {classifier_name}')
-                                    plt.savefig(f"./{galaxy_classes}_{classifier_name}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_confusion_matrix.png", dpi=150)
+                                    plt.savefig(f"./{galaxy_classes}_{classifier_name}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_confusion_matrix.pdf", dpi=150)
                                     plt.close()
 
                         accuracy = accuracy_score(all_true_labels[key], all_pred_labels[key])
@@ -1286,7 +1235,7 @@ for gen_model_name in gen_model_names:
                             for ax in axes[len(mis_images):]:
                                 ax.axis('off')
 
-                            out_path = f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_misclassified.png"
+                            out_path = f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_misclassified.pdf"
                             fig.savefig(out_path, dpi=150, bbox_inches='tight')
                             plt.close(fig)
 
@@ -1343,13 +1292,13 @@ for gen_model_name in gen_model_names:
 
             model_save_path = f'./classifier/trained_models/{gen_model_name}_model.pth'
             torch.save(model.state_dict(), model_save_path)
-          
+    
     directory = './classifier/trained_models_filtered/' if FILTERED else './classifier/trained_models/'
     for fold, lr, reg, lambda_generate in param_combinations:
         for subset_size in dataset_sizes[fold]:
             for experiment in range(num_experiments):
                                 
-                metrics_save_path = f'{directory}{classifier}_{galaxy_classes}_{gen_model_name}_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}_metrics_data.pkl'
+                metrics_save_path = f'./classifier/4.1.runs/{runname}_sz{subset_size}_f{fold}_e{experiment}_lam{lambda_generate}_metrics_data.pkl'
 
                 # Build robust, per-setting summaries using empirical percentiles
                 robust_summary = {}   # { base_key: {metric: {'n', 'p16','p50','p84','sigma68'} } }
@@ -1381,20 +1330,41 @@ for gen_model_name in gen_model_names:
                         vmin, vmax = vmin - eps, vmax + eps
                     edges = np.linspace(vmin, vmax, 21)  # 20 bins across [min, max]
 
+                    import matplotlib.patches as mpatches
+
+                    # compute stats
+                    mean = float(np.mean(vals))
+                    std = float(np.std(vals, ddof=0))
+                    p16, p50, p84 = float(p16), float(p50), float(p84)
+
                     plt.figure(figsize=(5,3.2))
-                    plt.hist(vals, bins=edges, edgecolor='none', alpha=0.8)
-                    for x, style in [(p16, ':'), (p50, '-'), (p84, ':')]:
-                        plt.axvline(x, linestyle=style)
-                    plt.xlim(vmin, vmax)  # force axis to the observed range
-                    plt.title(key)
-                    plt.xlabel(metric_name)
-                    plt.ylabel("count")
+                    counts, bins, patches = plt.hist(vals, bins=edges, edgecolor='black', color='green', alpha=0.45)
+
+                    # vertical lines: mean (solid), median (dashed), p16/p84 (dotted)
+                    mean_line, = plt.plot([mean, mean], [0, counts.max()], linestyle='-', color='blue', linewidth=2, label=f"Mean = {mean:.3f}, σ = {std:.3f}")
+                    median_line, = plt.plot([p50, p50], [0, counts.max()], linestyle='--', color='orange', linewidth=2, label=f"Median = {p50:.3f}")
+                    p16_line = plt.plot([p16, p16], [0, counts.max()], color='green', linestyle=':', linewidth=1)
+                    p84_line = plt.plot([p84, p84], [0, counts.max()], color='green', linestyle=':', linewidth=1)
+                    mean_plus_std_line = plt.plot([mean + std, mean + std], [0, counts.max()], color='blue', linestyle='--', linewidth=1)
+                    mean_minus_std_line = plt.plot([mean - std, mean - std], [0, counts.max()], color='blue', linestyle='--', linewidth=1)
+
+                    # shaded central 68% credibility region (p16--p84)
+                    ymax = counts.max()
+                    region_patch = plt.fill_betweenx([0, ymax], p16, p84, alpha=0.12, facecolor='green')
+
+                    plt.xlim(vmin, vmax)
+                    plt.xlabel(metric_name.capitalize())
+                    plt.ylabel("Count")
+
+                    # assemble legend: use created artists and the shaded patch
+                    legend_handles = [median_line, mean_line, mpatches.Patch(facecolor='green', alpha=0.12, label=f"68% interval [{p16:.3f}, {p84:.3f}]")]
+                    plt.legend(handles=legend_handles, loc='best', frameon=False, fontsize='small')
+
                     plt.tight_layout()
 
-                    # save one file per metric so nothing gets overwritten
                     save_path_hist = (
                         f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_"
-                        f"{dataset_sizes[folds[-1]][-1]}_{metric_name}_histogram.png"
+                        f"{dataset_sizes[folds[-1]][-1]}_{metric_name}_histogram.pdf"
                     )
                     plt.savefig(save_path_hist, dpi=150)
                     plt.close()
@@ -1412,16 +1382,17 @@ for gen_model_name in gen_model_names:
                 # Also write a tidy CSV so you can scan summaries quickly
                 summary_csv = f'{directory}{classifier}_{galaxy_classes}_{gen_model_name}_percentile_summary.csv'
                 pd.DataFrame(rows).to_csv(summary_csv, index=False)
-
+                
                 with open(metrics_save_path, 'wb') as f:
                     pickle.dump({
                         "models": models,
                         "history": history,
-                        "metrics": metrics,                 # raw per-run values remain
+                        "metrics": metrics,
                         "metric_colors": metric_colors,
                         "all_true_labels": all_true_labels,
                         "all_pred_labels": all_pred_labels,
                         "training_times": training_times,
                         "all_pred_probs": all_pred_probs,
-                        "percentile_summary": robust_summary  # new robust summaries
+                        "percentile_summary": robust_summary
                     }, f)
+                print(f"Saved metrics PKL to {os.path.abspath(metrics_save_path)}")
