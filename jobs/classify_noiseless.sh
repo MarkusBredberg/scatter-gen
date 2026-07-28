@@ -4,7 +4,7 @@
 #SBATCH --account=sk036
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --time=2:10:00
+#SBATCH --time=1:20:00
 #SBATCH --chdir=/users/mbredber/p2_DCRECLASS
 #SBATCH --output=/users/mbredber/p2_DCRECLASS/outputs/logs/sbatchrun-%j.out
 #SBATCH --error=/users/mbredber/p2_DCRECLASS/outputs/logs/sbatchrun-%j.err
@@ -14,7 +14,7 @@
 #SBATCH --cpus-per-task=4
 
 # ── Run configuration ─────────────────────────────────────────────────────────
-ALL_CLASSIFIERS=("DualSSN" "DualCSN" "ImageCNN" "SimpleScatterNet")
+ALL_CLASSIFIERS=("ImageCNN" "DualCSN" "DualSSN")
 CROP_MODE="beam_crop"
 BLUR_METHOD="circular"
 FOLDS="0 1 2 3 4 5 6 7 8 9"

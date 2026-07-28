@@ -4,8 +4,10 @@ _sass/
 .ipynb_checkpoints/
 legacy_scripts/
 outputs/
+.claude/
 /data/
 scratch/
+jobs/
 notebooks/explore_blurring_outputs
 core_*
 

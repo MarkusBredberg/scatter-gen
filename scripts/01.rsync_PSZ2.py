@@ -22,8 +22,22 @@ from bs4           import BeautifulSoup
 from urllib.parse  import urljoin
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ── Import reusable check from the package ────────────────────────────────────
-from dcreclass.data.loaders import check_complete_download
+# ── Inlined completeness check (avoids importing torch via dcreclass) ─────────
+def check_complete_download(dest_dir, slug):
+    """Return (is_complete, n_existing, missing_files)."""
+    dest_dir = Path(dest_dir)
+    if not dest_dir.exists():
+        return False, 0, []
+    existing = {f for f in os.listdir(dest_dir) if f.endswith('.fits')}
+    if len(existing) < 2:
+        return False, len(existing), []
+    required = [
+        f"{slug}.fits",
+        f"{slug}T25kpc.fits", f"{slug}T50kpc.fits", f"{slug}T100kpc.fits",
+        f"{slug}T25kpcSUB.fits", f"{slug}T50kpcSUB.fits", f"{slug}T100kpcSUB.fits",
+    ]
+    missing = [f for f in required if f not in existing]
+    return (len(missing) == 0), len(existing), missing
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 OUT_ROOT  = Path("/users/mbredber/scratch/data/PSZ2")
@@ -60,7 +74,7 @@ def download_and_extract(page_url, slug, force=False):
                   f"missing {len(missing)}) — re-downloading")
 
     # Fetch cluster detail page
-    r = requests.get(page_url)
+    r = requests.get(page_url, timeout=30)
     if r.status_code != 200:
         print(f"✖️  {slug}: could not fetch {page_url}")
         return ('failed', 0)
@@ -80,7 +94,7 @@ def download_and_extract(page_url, slug, force=False):
 
     # Download tarball
     try:
-        tr = requests.get(tar_url)
+        tr = requests.get(tar_url, timeout=600)
         tr.raise_for_status()
     except Exception as e:
         print(f"❌ {slug}: download failed: {e}")
@@ -122,6 +136,10 @@ def main():
         '--check-only', action='store_true',
         help='Report incomplete downloads without downloading anything'
     )
+    parser.add_argument(
+        '--csv-only', action='store_true',
+        help='Fetch cluster metadata from LOFAR surveys and write cluster_source_data.csv without downloading FITS files'
+    )
     args = parser.parse_args()
 
     print("=" * 60)
@@ -135,7 +153,7 @@ def main():
 
     # Fetch and parse the main cluster table
     print("Fetching cluster list from LOFAR surveys...")
-    r = requests.get(INDEX)
+    r = requests.get(INDEX, timeout=30)
     r.raise_for_status()
     soup  = BeautifulSoup(r.text, "html.parser")
     table = soup.find("table")
@@ -170,6 +188,18 @@ def main():
         }
 
     print(f"Found {len(cluster_pages)} cluster pages\n")
+
+    # CSV-only mode: write metadata and exit
+    if args.csv_only:
+        metadata_csv = OUT_ROOT / "cluster_source_data.csv"
+        with open(metadata_csv, "w", newline="") as fd:
+            fieldnames = ["slug", "z", "M500", "M500_err", "r500", "r500_err", "classification"]
+            w = csv.DictWriter(fd, fieldnames=fieldnames)
+            w.writeheader()
+            for slug, info in cluster_info.items():
+                w.writerow({"slug": slug, **info})
+        print(f"Wrote {len(cluster_info)} rows to {metadata_csv}")
+        return
 
     # Check-only mode: report and exit
     if args.check_only:
@@ -219,8 +249,8 @@ def main():
         print(f"  📊 Total:       {len(cluster_pages)}")
         print("=" * 60)
 
-        # Write metadata CSV
-        metadata_csv = OUT_ROOT / "cluster_metadata.csv"
+        # Write metadata CSV (cluster_source_data.csv is the canonical name used by other scripts)
+        metadata_csv = OUT_ROOT / "cluster_source_data.csv"
         with open(metadata_csv, "w", newline="") as fd:
             fieldnames = ["slug", "z", "M500", "M500_err", "r500", "r500_err", "classification"]
             w = csv.DictWriter(fd, fieldnames=fieldnames)

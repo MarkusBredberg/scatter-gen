@@ -77,6 +77,7 @@ def make_multi_scale_montage(source_name: str,
                              root_dir: Path,
                              downsample_size=(1, 128, 128),
                              save_fits: bool = False,
+                             save_montage: bool = True,
                              cheat_rt: bool = False,
                              subtract_beam: bool = True,
                              force: bool = False,
@@ -152,7 +153,7 @@ def make_multi_scale_montage(source_name: str,
     Ho, Wo = _canon_size(downsample_size)[-2:]
 
     if not force:
-        all_outputs_exist = out_png.exists()
+        all_outputs_exist = (out_png.exists() if save_montage else True)
         if save_fits and all_outputs_exist:
             for data in processed_scales:
                 sc = data['scale']; sc_str = int(sc) if sc == int(sc) else sc
@@ -170,106 +171,107 @@ def make_multi_scale_montage(source_name: str,
             print(f"[SKIP] {source_name}: all outputs exist (use --force to regenerate)")
             return
 
-    has_sub   = any(d['has_sub'] for d in processed_scales)
-    nrows     = 4 if has_sub else 3
-    n_scales  = len(processed_scales)
-    ncols     = n_scales * 2
-    row_heights = [2.0] + [1.0] * (nrows - 1)
-    fig = plt.figure(figsize=(4 * ncols, sum(row_heights) * 4.3))
-    from matplotlib.gridspec import GridSpec
-    gs = GridSpec(nrows, ncols, figure=fig, height_ratios=row_heights,
-                  left=0.03, right=0.98, top=0.93, bottom=0.04,
-                  wspace=0.15, hspace=0.12)
+    if save_montage:
+        has_sub   = any(d['has_sub'] for d in processed_scales)
+        nrows     = 4 if has_sub else 3
+        n_scales  = len(processed_scales)
+        ncols     = n_scales * 2
+        row_heights = [2.0] + [1.0] * (nrows - 1)
+        fig = plt.figure(figsize=(4 * ncols, sum(row_heights) * 4.3))
+        from matplotlib.gridspec import GridSpec
+        gs = GridSpec(nrows, ncols, figure=fig, height_ratios=row_heights,
+                      left=0.03, right=0.98, top=0.93, bottom=0.04,
+                      wspace=0.15, hspace=0.12)
 
-    usable_h = 0.93 - 0.04
-    y_below_raw = 0.93 - (row_heights[0] / sum(row_heights)) * usable_h + 0.005
-    usable_w = 0.98 - 0.03
-    for scale_idx, data in enumerate(processed_scales):
-        sc_str = int(data['scale']) if data['scale'] == int(data['scale']) else data['scale']
-        col_centre = (scale_idx * 2 + 1) / ncols
-        x = 0.03 + col_centre * usable_w
-        fig.text(x, y_below_raw, f"{sc_str} kpc",
-                 fontsize=11, fontweight='bold', ha='center', va='bottom',
-                 transform=fig.transFigure)
-
-    row_label_names = ['Blur', 'T', 'SUB'] if has_sub else ['Blur', 'T']
-    total_height = sum(row_heights)
-    for row_idx, label in enumerate(row_label_names, start=1):
-        y_top = 1.0 - sum(row_heights[:row_idx]) / total_height
-        y_bot = 1.0 - sum(row_heights[:row_idx + 1]) / total_height
-        fig.text(0.005, (y_top + y_bot) / 2, label, fontsize=13, fontweight='bold',
-                 ha='left', va='center', transform=fig.transFigure)
-
-    first_data = processed_scales[0]
-    I_raw      = first_data['I_raw']
-    I_fmt_np   = first_data['I_fmt_np']
-    W_i_fmt    = first_data['W_i_fmt']
-    W_common   = (WCS(first_data['H_tgt']).celestial
-                  if hasattr(WCS(first_data['H_tgt']), 'celestial')
-                  else WCS(first_data['H_tgt'], naxis=2))
-    I_on_common_for_display = reproject_like(I_raw, first_data['H_raw'], first_data['H_tgt'])
-
-    ax_raw_orig = fig.add_subplot(gs[0, :n_scales], projection=W_common)
-    ax_raw_crop = fig.add_subplot(gs[0, n_scales:], projection=W_i_fmt)
-    vmin_I, vmax_I = robust_vmin_vmax(I_on_common_for_display)
-    ax_raw_orig.imshow(I_on_common_for_display, origin="lower", vmin=vmin_I, vmax=vmax_I)
-    ax_raw_orig.set_title("RAW (original)", fontsize=12, pad=8)
-    ax_raw_crop.imshow(I_fmt_np, origin="lower", vmin=vmin_I, vmax=vmax_I)
-    nan_frac = check_nan_fraction(I_fmt_np, "")
-    ax_raw_crop.set_title(f"RAW (cropped {Ho}x{Wo})"
-                          + (f" {nan_frac*100:.1f}% NaN" if nan_frac > 0 else ""),
-                          fontsize=12, pad=8)
-
-    row_labels = ['Blur', 'T', 'SUB'] if has_sub else ['Blur', 'T']
-    for row_idx, row_label in enumerate(row_labels, start=1):
+        usable_h = 0.93 - 0.04
+        y_below_raw = 0.93 - (row_heights[0] / sum(row_heights)) * usable_h + 0.005
+        usable_w = 0.98 - 0.03
         for scale_idx, data in enumerate(processed_scales):
-            sc_str   = int(data['scale']) if data['scale'] == int(data['scale']) else data['scale']
-            col_orig = scale_idx * 2
-            col_crop = scale_idx * 2 + 1
-            if row_label == 'Blur':
-                arr_orig, arr_crop = data['RT_rawgrid'], data['RT_fmt_np']
-            elif row_label == 'T':
-                arr_orig, arr_crop = data['T_on_common'], data['T_fmt_np']
-            else:
-                arr_orig, arr_crop = data['SUB_on_common'], data['SUB_fmt_np']
-            if row_label == 'SUB' and not data['has_sub']:
-                arr_orig = np.zeros_like(data['T_on_common'])
-                arr_crop = np.zeros((Ho, Wo))
-            vmin, vmax = (robust_vmin_vmax(arr_orig)
-                          if not (row_label == 'SUB' and not data['has_sub'])
-                          else (0.0, 1.0))
-            W_common_data = (WCS(data['H_tgt']).celestial
-                             if hasattr(WCS(data['H_tgt']), 'celestial')
-                             else WCS(data['H_tgt'], naxis=2))
-            ax_orig = fig.add_subplot(gs[row_idx, col_orig], projection=W_common_data)
-            ax_crop = fig.add_subplot(gs[row_idx, col_crop], projection=data['W_i_fmt'])
-            if row_label == 'SUB' and not data['has_sub']:
-                ax_orig.imshow(arr_orig, origin="lower", cmap='gray')
-                ax_orig.set_title("N/A", fontsize=9)
-                ax_crop.imshow(arr_crop, origin="lower", cmap='gray')
-                ax_crop.set_title("N/A", fontsize=9)
-            else:
-                ax_orig.imshow(arr_orig, origin="lower", vmin=vmin, vmax=vmax)
-                ax_crop.imshow(arr_crop, origin="lower", vmin=vmin, vmax=vmax)
-                nf = check_nan_fraction(arr_crop, "")
-                ax_crop.set_title(f"{nf*100:.0f}% NaN" if nf > 0 else "", fontsize=8)
+            sc_str = int(data['scale']) if data['scale'] == int(data['scale']) else data['scale']
+            col_centre = (scale_idx * 2 + 1) / ncols
+            x = 0.03 + col_centre * usable_w
+            fig.text(x, y_below_raw, f"{sc_str} kpc",
+                     fontsize=11, fontweight='bold', ha='center', va='bottom',
+                     transform=fig.transFigure)
 
-    mode_str   = "header" if cheat_rt else "circular"
-    nbeams_str = ", ".join([
-        f"{int(d['scale']) if d['scale']==int(d['scale']) else d['scale']}kpc: "
-        f"T={global_nbeams.get(d['scale'], {}).get('T', 20.0):.1f}b "
-        f"Blur={global_nbeams.get(d['scale'], {}).get('Blur', 20.0):.1f}b"
-        for d in processed_scales
-    ]) + f"  I={global_nbeams.get('RAW', 20.0):.1f}b"
-    center_note = processed_scales[0]['center_note'] if processed_scales else ""
-    fig.suptitle(f"{source_name} — Multi-scale ({mode_str}) — z={z:.4f}\n"
-                 f"Crop: {nbeams_str}\n{center_note}", fontsize=11, y=0.995)
-    out_png.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_png, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-    scales_str = ", ".join([f"{int(s) if s == int(s) else s}kpc"
-                            for s in [d['scale'] for d in processed_scales]])
-    print(f"[OK] {source_name} -- scales: {scales_str} -> {out_png}")
+        row_label_names = ['Blur', 'T', 'SUB'] if has_sub else ['Blur', 'T']
+        total_height = sum(row_heights)
+        for row_idx, label in enumerate(row_label_names, start=1):
+            y_top = 1.0 - sum(row_heights[:row_idx]) / total_height
+            y_bot = 1.0 - sum(row_heights[:row_idx + 1]) / total_height
+            fig.text(0.005, (y_top + y_bot) / 2, label, fontsize=13, fontweight='bold',
+                     ha='left', va='center', transform=fig.transFigure)
+
+        first_data = processed_scales[0]
+        I_raw      = first_data['I_raw']
+        I_fmt_np   = first_data['I_fmt_np']
+        W_i_fmt    = first_data['W_i_fmt']
+        W_common   = (WCS(first_data['H_tgt']).celestial
+                      if hasattr(WCS(first_data['H_tgt']), 'celestial')
+                      else WCS(first_data['H_tgt'], naxis=2))
+        I_on_common_for_display = reproject_like(I_raw, first_data['H_raw'], first_data['H_tgt'])
+
+        ax_raw_orig = fig.add_subplot(gs[0, :n_scales], projection=W_common)
+        ax_raw_crop = fig.add_subplot(gs[0, n_scales:], projection=W_i_fmt)
+        vmin_I, vmax_I = robust_vmin_vmax(I_on_common_for_display)
+        ax_raw_orig.imshow(I_on_common_for_display, origin="lower", vmin=vmin_I, vmax=vmax_I)
+        ax_raw_orig.set_title("RAW (original)", fontsize=12, pad=8)
+        ax_raw_crop.imshow(I_fmt_np, origin="lower", vmin=vmin_I, vmax=vmax_I)
+        nan_frac = check_nan_fraction(I_fmt_np, "")
+        ax_raw_crop.set_title(f"RAW (cropped {Ho}x{Wo})"
+                              + (f" {nan_frac*100:.1f}% NaN" if nan_frac > 0 else ""),
+                              fontsize=12, pad=8)
+
+        row_labels = ['Blur', 'T', 'SUB'] if has_sub else ['Blur', 'T']
+        for row_idx, row_label in enumerate(row_labels, start=1):
+            for scale_idx, data in enumerate(processed_scales):
+                sc_str   = int(data['scale']) if data['scale'] == int(data['scale']) else data['scale']
+                col_orig = scale_idx * 2
+                col_crop = scale_idx * 2 + 1
+                if row_label == 'Blur':
+                    arr_orig, arr_crop = data['RT_rawgrid'], data['RT_fmt_np']
+                elif row_label == 'T':
+                    arr_orig, arr_crop = data['T_on_common'], data['T_fmt_np']
+                else:
+                    arr_orig, arr_crop = data['SUB_on_common'], data['SUB_fmt_np']
+                if row_label == 'SUB' and not data['has_sub']:
+                    arr_orig = np.zeros_like(data['T_on_common'])
+                    arr_crop = np.zeros((Ho, Wo))
+                vmin, vmax = (robust_vmin_vmax(arr_orig)
+                              if not (row_label == 'SUB' and not data['has_sub'])
+                              else (0.0, 1.0))
+                W_common_data = (WCS(data['H_tgt']).celestial
+                                 if hasattr(WCS(data['H_tgt']), 'celestial')
+                                 else WCS(data['H_tgt'], naxis=2))
+                ax_orig = fig.add_subplot(gs[row_idx, col_orig], projection=W_common_data)
+                ax_crop = fig.add_subplot(gs[row_idx, col_crop], projection=data['W_i_fmt'])
+                if row_label == 'SUB' and not data['has_sub']:
+                    ax_orig.imshow(arr_orig, origin="lower", cmap='gray')
+                    ax_orig.set_title("N/A", fontsize=9)
+                    ax_crop.imshow(arr_crop, origin="lower", cmap='gray')
+                    ax_crop.set_title("N/A", fontsize=9)
+                else:
+                    ax_orig.imshow(arr_orig, origin="lower", vmin=vmin, vmax=vmax)
+                    ax_crop.imshow(arr_crop, origin="lower", vmin=vmin, vmax=vmax)
+                    nf = check_nan_fraction(arr_crop, "")
+                    ax_crop.set_title(f"{nf*100:.0f}% NaN" if nf > 0 else "", fontsize=8)
+
+        mode_str   = "header" if cheat_rt else "circular"
+        nbeams_str = ", ".join([
+            f"{int(d['scale']) if d['scale']==int(d['scale']) else d['scale']}kpc: "
+            f"T={global_nbeams.get(d['scale'], {}).get('T', 20.0):.1f}b "
+            f"Blur={global_nbeams.get(d['scale'], {}).get('Blur', 20.0):.1f}b"
+            for d in processed_scales
+        ]) + f"  I={global_nbeams.get('RAW', 20.0):.1f}b"
+        center_note = processed_scales[0]['center_note'] if processed_scales else ""
+        fig.suptitle(f"{source_name} — Multi-scale ({mode_str}) — z={z:.4f}\n"
+                     f"Crop: {nbeams_str}\n{center_note}", fontsize=11, y=0.995)
+        out_png.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out_png, dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        scales_str = ", ".join([f"{int(s) if s == int(s) else s}kpc"
+                                for s in [d['scale'] for d in processed_scales]])
+        print(f"[OK] {source_name} -- scales: {scales_str} -> {out_png}")
 
     if save_fits:
         out_fits_dir = (out_fits_dir or out_png.parent)
@@ -678,6 +680,172 @@ def create_comparison_plot(sources: List[str],
     plt.close(fig)
     print(f"[comparison] Saved -> {output_path}")
 
+# ========================= crop strategy comparison ==========================
+
+def create_crop_strategy_comparison_plot(
+    source_name: str,
+    root: Path,
+    scales: List[float],
+    slug_to_z: Dict[str, float],
+    output_path: Path,
+    fov_arcsec_fov_crop: float = 800.0,
+    figsize: Tuple[float, float] = (14, 6),
+    dpi: int = 200,
+    annotate: bool = False,
+    subtract_beam: bool = True,
+    cheat_rt: bool = False,
+    cache_path: Optional[Path] = None,
+    percentile_lo: float = 30,
+    percentile_hi: float = 99,
+):
+    """3×7 figure: one DE source × three crop strategies × 7 image versions."""
+    print(f"\n[crop-comparison] Source: {source_name}")
+
+    n_cols = 1 + len(scales) * 2
+    downsample_size = (128, 128)
+    fov_nbeams = {'RAW': 0.0, **{scale: {'T': 0.0, 'Blur': 0.0} for scale in scales}}
+
+    # Row labels are deterministic — needed for both cache and compute paths
+    row_labels = [
+        "Beam crop",
+        f'FoV crop ({fov_arcsec_fov_crop:.0f}")',
+        "Pixel crop",
+    ]
+
+    _cache = Path(cache_path) if cache_path is not None else None
+    if _cache is not None and _cache.exists():
+        print(f"[crop-comparison] Loading from cache: {_cache}")
+        npz = np.load(_cache, allow_pickle=False)
+        z_val = float(npz['_z'][0])
+        z = None if np.isnan(z_val) else z_val
+        all_images = []
+        for i in range(3):
+            prefix = f'r{i}__'
+            imgs = {k[len(prefix):]: npz[k] for k in npz.files if k.startswith(prefix)}
+            all_images.append(imgs)
+        # nbeams/fov_arcsec only matter when annotate=True
+        crop_configs = [
+            {"label": row_labels[0], "fov_arcsec": None,                "nbeams": {}},
+            {"label": row_labels[1], "fov_arcsec": fov_arcsec_fov_crop, "nbeams": fov_nbeams},
+            {"label": row_labels[2], "fov_arcsec": None,                "nbeams": {}},
+        ]
+    else:
+        # Compute global nbeams once (used by beam_crop and pixel_crop rows)
+        print("[crop-comparison] Computing global nbeams (beam_crop/pixel_crop)...")
+        global_nbeams = compute_global_nbeams_equalized(
+            root, scales, slug_to_z, subtract_beam=subtract_beam)
+        print(f"  RAW: {global_nbeams.get('RAW', 0.0):.2f} beams")
+        for scale in scales:
+            sc_str = int(scale) if scale == int(scale) else scale
+            nb = global_nbeams.get(scale, {'T': 0.0, 'Blur': 0.0})
+            print(f"  T{sc_str}kpc: T={nb['T']:.2f}b  Blur={nb['Blur']:.2f}b")
+
+        crop_configs = [
+            {"label": row_labels[0], "fov_arcsec": None,                "nbeams": global_nbeams},
+            {"label": row_labels[1], "fov_arcsec": fov_arcsec_fov_crop, "nbeams": fov_nbeams},
+            {"label": row_labels[2], "fov_arcsec": None,                "nbeams": global_nbeams},
+        ]
+
+        # Process all 3 crop configs
+        all_images = []
+        for cfg in crop_configs:
+            print(f"[crop-comparison] Processing row: {cfg['label']}")
+            imgs = _process_source_for_comparison(
+                source_name, root, scales, slug_to_z,
+                global_nbeams=cfg["nbeams"],
+                downsample_size=downsample_size,
+                subtract_beam=subtract_beam,
+                cheat_rt=cheat_rt,
+                fov_arcsec=cfg["fov_arcsec"],
+            )
+            all_images.append(imgs)
+
+        try:
+            z = _load_redshift(source_name, slug_to_z)
+        except Exception:
+            z = None
+
+        if _cache is not None:
+            print(f"[crop-comparison] Saving cache -> {_cache}")
+            _cache.parent.mkdir(parents=True, exist_ok=True)
+            arrays = {'_z': np.array([z if z is not None else np.nan])}
+            for i, imgs in enumerate(all_images):
+                for key, arr in imgs.items():
+                    arrays[f'r{i}__{key}'] = arr
+            np.savez(_cache, **arrays)
+            print(f"[crop-comparison] Cache saved.")
+
+    fig = plt.figure(figsize=figsize)
+    gs = gridspec.GridSpec(3, n_cols, figure=fig,
+                           hspace=0.04, wspace=0.003,
+                           width_ratios=[1.0] * n_cols,
+                           height_ratios=[1.0, 1.0, 1.0],
+                           left=0.09, right=0.999, top=0.999, bottom=0.01)
+
+    cmap = plt.cm.viridis.copy()
+    cmap.set_bad('white', 1.0)
+
+    def _stretch(arr):
+        """Apply per-image percentile normalisation to [0, 1], matching training pipeline."""
+        vals = arr[np.isfinite(arr)]
+        if vals.size == 0:
+            return arr
+        p_lo = np.percentile(vals, percentile_lo)
+        p_hi = np.percentile(vals, percentile_hi)
+        out = (arr - p_lo) / (p_hi - p_lo + 1e-6)
+        return np.clip(out, 0, 1)
+
+    for row_idx, (cfg, images) in enumerate(zip(crop_configs, all_images)):
+        is_first = (row_idx == 0)
+
+        # Column 0: RAW
+        ax = fig.add_subplot(gs[row_idx, 0])
+        if 'RAW' in images:
+            ax.imshow(_stretch(images['RAW']), origin='lower', vmin=0, vmax=1,
+                      cmap=cmap, interpolation='nearest')
+            if is_first:
+                ax.set_title('Reference', fontsize=13.5, fontweight='bold', pad=2)
+            if z is not None and annotate:
+                _add_comparison_annotations(ax, source_name, root, None, z,
+                                            cfg["nbeams"], downsample_size, 'RAW',
+                                            subtract_beam=subtract_beam,
+                                            fov_arcsec=cfg["fov_arcsec"],
+                                            cheat_rt=cheat_rt)
+        ax.axis('off')
+        # Row label on left
+        ax.text(-0.15, 0.5, cfg["label"], transform=ax.transAxes,
+                fontsize=13.5, va='center', ha='right', rotation=90, fontweight='bold')
+
+        col_idx = 1
+        for scale in scales:
+            scale_int = int(scale) if float(scale).is_integer() else scale
+            for key, img_type, col_title in [
+                    (f'T{scale_int}',    'T',    f'Tap.\u2009{scale_int}\u2009kpc'),
+                    (f'Blur{scale_int}', 'Blur', f'Blur\u2009{scale_int}\u2009kpc')]:
+                ax = fig.add_subplot(gs[row_idx, col_idx])
+                if key in images:
+                    ax.imshow(_stretch(images[key]), origin='lower', vmin=0, vmax=1,
+                              cmap=cmap, interpolation='nearest')
+                    if is_first:
+                        ax.set_title(col_title, fontsize=13.5, fontweight='bold', pad=2)
+                    if z is not None and annotate:
+                        _add_comparison_annotations(ax, source_name, root, scale, z,
+                                                    cfg["nbeams"], downsample_size, img_type,
+                                                    subtract_beam=subtract_beam,
+                                                    fov_arcsec=cfg["fov_arcsec"],
+                                                    cheat_rt=cheat_rt)
+                else:
+                    ax.text(0.5, 0.5, 'MISSING', transform=ax.transAxes,
+                            ha='center', va='center', fontsize=12, color='red')
+                ax.axis('off')
+                col_idx += 1
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=dpi, bbox_inches='tight', pad_inches=0.01)
+    plt.close(fig)
+    print(f"[crop-comparison] Saved -> {output_path}")
+
+
 # ========================= parallel helpers ==================================
 
 def process_raw_only_source(source_name: str,
@@ -775,7 +943,8 @@ def process_single_source_wrapper(args_tuple):
             source_name=source_name, raw_path=raw_path,
             scales=scale_values, z=z, global_nbeams=global_nbeams,
             root_dir=args_dict['root'], downsample_size=args_dict['down'],
-            save_fits=args_dict['save_fits'], cheat_rt=args_dict['cheat_rt'],
+            save_fits=args_dict['save_fits'], save_montage=args_dict.get('save_montage', True),
+            cheat_rt=args_dict['cheat_rt'],
             subtract_beam=args_dict.get('subtract_beam', True),
             force=args_dict['force'], out_png=out_png,
             out_fits_dir=args_dict['out_fits_dir'], suffix=args_dict['suffix'],
@@ -1002,7 +1171,7 @@ def main():
     ap.add_argument("--force",    action="store_true", default=False)
     ap.add_argument("--only-offsets", action="store_true")
     ap.add_argument("--only",     type=str,   default="")
-    ap.add_argument("--save-fits", action="store_true", default=True)
+    ap.add_argument("--save-fits", action="store_true", default=False)
     ap.add_argument("--fits-out", type=Path,  default=None,
                     help="Processed FITS output dir (default: PSZ2/<mode>/fits_files/)")
     ap.add_argument("--n-workers", type=int, default=None)
@@ -1021,6 +1190,18 @@ def main():
     ap.add_argument("--n-nde", type=int, default=3)
     ap.add_argument("--comp-seed", type=int, default=10)
     ap.add_argument("--comp-figsize", type=str, default="10,9")
+
+    # --- crop strategy comparison ---
+    ap.add_argument("--crop-comparison", action="store_true", default=False,
+                    help="Generate 3×7 crop-strategy comparison figure.")
+    ap.add_argument("--crop-comp-source", type=str, default=None,
+                    help="Source slug for crop comparison (default: random DE).")
+    ap.add_argument("--crop-comp-out", type=Path, default=None,
+                    help="Output path for crop comparison figure.")
+    ap.add_argument("--crop-comp-fov", type=float, default=800.0,
+                    help="FOV arcsec for the fov_crop row (default: 800).")
+    ap.add_argument("--crop-comp-figsize", type=str, default="14,6",
+                    help="Figure size as W,H (default: 14,6).")
 
     args = ap.parse_args()
 
@@ -1092,9 +1273,9 @@ def main():
                                    processed_dir=proc_dir if proc_dir.is_dir() else None,
                                    fov_arcsec=fov_arcsec, mode=mode_subdir)
 
-    if not args.no_montage:
+    if not args.no_montage or args.save_fits:
         print("\n" + "=" * 80)
-        print("STEP 2: Per-source multi-scale montages")
+        print("STEP 2: Per-source multi-scale processing")
         print("=" * 80)
         source_names_seen = set()
         sources_to_process = []
@@ -1110,8 +1291,8 @@ def main():
         n_workers = args.n_workers if args.n_workers else cpu_count()
         print(f"[PARALLEL] Using {n_workers} workers")
         args_dict = dict(out=args.out, suffix=suffix, root=args.root, down=args.down,
-                         save_fits=args.save_fits, cheat_rt=cheat_rt,
-                         subtract_beam=subtract_beam,
+                         save_fits=args.save_fits, save_montage=not args.no_montage,
+                         cheat_rt=cheat_rt, subtract_beam=subtract_beam,
                          force=args.force, out_fits_dir=out_fits_dir,
                          fov_arcsec=fov_arcsec)
         tasks = []; raw_only_tasks = []; n_skip_z = 0
@@ -1233,6 +1414,43 @@ def main():
             )
     else:
         print("[comparison] Skipped (use --comparison-plot to enable).")
+
+    if args.crop_comparison and not args.only_one:
+        print("\n" + "=" * 80)
+        print("STEP 4: Crop strategy comparison plot")
+        print("=" * 80)
+        if args.crop_comp_source:
+            crop_comp_source = args.crop_comp_source
+        else:
+            de_sources, _ = get_classified_sources_from_loader(args.root, scale_values)
+            if not de_sources:
+                print("[ERROR] No valid DE sources found — skipping crop comparison.")
+                crop_comp_source = None
+            else:
+                random.seed(args.comp_seed)
+                crop_comp_source = random.choice(de_sources)
+        if crop_comp_source is not None:
+            if args.crop_comp_out is not None:
+                crop_comp_out = args.crop_comp_out
+            else:
+                crop_comp_out = Path("/users/mbredber/scratch/figures/processing") / "crop_strategy_comparison.pdf"
+            crop_comp_figsize = tuple(float(x) for x in args.crop_comp_figsize.split(','))
+            create_crop_strategy_comparison_plot(
+                source_name=crop_comp_source,
+                root=args.root,
+                scales=scale_values,
+                slug_to_z=slug_to_z,
+                output_path=crop_comp_out,
+                fov_arcsec_fov_crop=args.crop_comp_fov,
+                figsize=crop_comp_figsize,
+                annotate=not args.no_annotate,
+                subtract_beam=subtract_beam,
+                cheat_rt=cheat_rt,
+                cache_path=crop_comp_out.with_suffix('.cache.npz'),
+            )
+    else:
+        if not args.only_one:
+            print("[crop-comparison] Skipped (use --crop-comparison to enable).")
 
     print("\n" + "=" * 80)
     print("PROCESSING COMPLETE")

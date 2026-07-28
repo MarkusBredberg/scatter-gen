@@ -1,10 +1,11 @@
 #!/bin/bash -l
 
 #SBATCH --job-name=fetch_sort
-#SBATCH --account=sk032
+#SBATCH --account=sk036
+#SBATCH --partition=xfer
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --time=0:10:00
+#SBATCH --time=2:00:00
 #SBATCH --chdir=/users/mbredber/p2_DCRECLASS
 #SBATCH --output=/users/mbredber/p2_DCRECLASS/outputs/logs/sbatchrun-%j.out
 #SBATCH --error=/users/mbredber/p2_DCRECLASS/outputs/logs/sbatchrun-%j.err
@@ -15,17 +16,11 @@
 
 mkdir -p "/users/mbredber/p2_DCRECLASS/outputs/logs"
 
-# Restore system defaults
-source /opt/cray/pe/cpe/23.12/restore_lmod_system_defaults.sh
+source /users/mbredber/p2_DCRECLASS/.venv/bin/activate
 
-# Load Python
-module load cray/23.12
-module load cray-python/3.11.5
-
-export PYTHONPATH=/users/mbredber/.local/lib/python3.11/site-packages:$PYTHONPATH
 export PYTHONPATH=/users/mbredber/p2_DCRECLASS/src:$PYTHONPATH
 
-python -c "import dcreclass; print('dcreclass OK')"
+python3 -c "import requests, bs4; print('fetch deps OK')"
 
 echo "========================================"
 echo "Job started at: $(date)"
@@ -33,10 +28,10 @@ echo "Running on node: $(hostname)"
 echo "========================================"
 
 echo "--- Step 1: Download missing PSZ2 sources ---"
-python /users/mbredber/p2_DCRECLASS/scripts/01.rsync_PSZ2.py
+python3 -u /users/mbredber/p2_DCRECLASS/scripts/01.rsync_PSZ2.py
 
 echo "--- Step 2: Categorise missing sources ---"
-python /users/mbredber/p2_DCRECLASS/scripts/02.categorise_PSZ2.py --symlink
+python3 -u /users/mbredber/p2_DCRECLASS/scripts/02.categorise_PSZ2.py --symlink
 
 echo "========================================"
 echo "Job finished at: $(date)"
