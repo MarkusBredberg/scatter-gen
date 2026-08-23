@@ -2,6 +2,8 @@
 
 ML classification of diffuse radio emission in PSZ2 galaxy clusters. Processes multi-scale LOFAR radio images and trains CNN-based classifiers to distinguish diffuse emission (DE) from non-diffuse emission (NDE) sources.
 
+Paper: https://ui.adsabs.harvard.edu/abs/2026arXiv260728349B/abstract
+
 ## Overview
 
 The pipeline proceeds in five steps:
