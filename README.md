@@ -94,7 +94,7 @@ python scripts/04.train_classifier.py [OPTIONS]
 
 | Argument | Default | Description |
 |---|---|---|
-| `--classifier` | `ImageCNN` | `CNN`, `ScatterNet`, `DualCSN`, `DualSSN`, `ImageCNN` |
+| `--classifier` | `ImageCNN` | `ImageCNN`, `SimpleScatterNet`, `DualCSN`, `DualSSN` |
 | `--versions` | `RAW` | `+`-separated image versions, e.g. `RAW` or `T25kpc+T50kpc` |
 | `--crop-mode` | `beam_crop` | `beam_crop`, `beam_crop_no_sub`, `fov_crop`, `cheat_crop`, `pixel_crop` |
 | `--blur-method` | `circular` | `circular`, `circular_no_sub`, `cheat` |
@@ -126,13 +126,19 @@ Same `--classifier`, `--version`, `--crop-mode`, `--blur-method`, `--folds`, `--
 
 ## Running on the HPC Cluster
 
-Edit `jobs/classify.sh` to set `CLASSIFIER`, `CROP_MODE`, `VERSIONS`, `FOLDS`, and `RUN_DIR`, then submit:
+`jobs/classify.sh` is a SLURM job array that trains all four classifiers across two image versions (T25kpc and RAW) in parallel (8 jobs total). Submit with:
 
 ```bash
 sbatch jobs/classify.sh
 ```
 
-The job runs both training (script 04) and evaluation (script 05) sequentially. Logs go to `outputs/logs/`.
+Once training is complete, generate notebook figures with:
+
+```bash
+sbatch jobs/plot_results.sh
+```
+
+Logs go to `outputs/logs/sbatchrun-<array_id>_<task_id>.out`.
 
 ## Package Structure
 
@@ -142,7 +148,7 @@ src/dcreclass/
 │   ├── loaders.py      # FITS loading, caching, augmentation, train/test split
 │   └── processing.py   # Cropping, convolution kernels, NaN analysis
 ├── models/
-│   └── classifiers.py  # CNN, ImageCNN, ScatterNet, DualCSN, DualSSN
+│   └── classifiers.py  # ImageCNN, SimpleScatterNet, DualCSN, DualSSN
 ├── training/
 │   └── trainer.py      # Early stopping, mixup, metrics
 └── utils/
@@ -157,7 +163,6 @@ src/dcreclass/
 | Name | Description |
 |---|---|
 | `ImageCNN` | Single-branch CNN with adaptive pooling |
-| `CNN` | 6-layer conv net with batch norm and LeakyReLU |
-| `ScatterNet` | Processes scattering transform coefficients |
+| `SimpleScatterNet` | Processes scattering transform coefficients |
 | `DualCSN` | Dual-branch CNN with feature fusion |
 | `DualSSN` | Dual-branch hybrid: CNN + scattering paths |

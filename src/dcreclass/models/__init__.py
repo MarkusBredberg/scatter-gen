@@ -1,5 +1,5 @@
 # models/__init__.py
 # Expose model classes for import by training/evaluation scripts.
-# Usage: from dcreclass.models import CNN, DualScatterSqueezeNet
+# Usage: from dcreclass.models import DualScatterSqueezeNet
 
-from .classifiers import CNN, ImageCNN, ScatterNet, SimpleScatterNet, DualCNNSqueezeNet, DualScatterSqueezeNet
+from .classifiers import ImageCNN, ScatterNet, SimpleScatterNet, DualCNNSqueezeNet, DualScatterSqueezeNet

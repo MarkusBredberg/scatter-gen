@@ -6,7 +6,7 @@ from matplotlib.colors import LinearSegmentedColormap
 from torch.utils.data import TensorDataset, DataLoader
 
 # Import your classifiers
-from dcreclass.models import CNN, ImageCNN, ScatterNet, SimpleScatterNet, DualCNNSqueezeNet, DualScatterSqueezeNet
+from dcreclass.models import ImageCNN, ScatterNet, SimpleScatterNet, DualCNNSqueezeNet, DualScatterSqueezeNet
 from dcreclass.utils import fold_T_axis, custom_collate, compute_scattering_coeffs, round_to_1
 from dcreclass.utils.calc_tools import initialize_metrics, update_metrics, recalculate_metrics_with_correct_positive_class
 from dcreclass.utils.plotting import (robust_metric_histograms, plot_avg_roc_curves,
@@ -16,7 +16,7 @@ from dcreclass.utils.plotting import (robust_metric_histograms, plot_avg_roc_cur
 def _parse_args():
     p = argparse.ArgumentParser(description="Plot classifier results")
     p.add_argument('--classifier',    default='ImageCNN',
-                   choices=['CNN','ScatterNet','SimpleScatterNet','DualCSN','DualSSN','ImageCNN'])
+                   choices=['ScatterNet','SimpleScatterNet','DualCSN','DualSSN','ImageCNN'])
     p.add_argument('--version',       default='RAW',
                    help="Single image version, e.g. RAW or T25kpc")
     p.add_argument('--crop-mode',     default='beam_crop',
@@ -511,7 +511,7 @@ if GENERATE_ATTENTION_MAPS:
             test_dataset = TensorDataset(mock_test, test_scat, test_labels)
         else:  # DualSSN
             test_dataset = TensorDataset(test_images_folded, test_scat, test_labels)
-    else:  # CNN or DualCSN
+    else:  # DualCSN
         if test_images.dim() == 5:
             test_images = fold_T_axis(test_images)
         mock_scat = torch.zeros_like(test_images)
@@ -531,9 +531,7 @@ if GENERATE_ATTENTION_MAPS:
     img_shape = tuple(test_images.shape[1:]) if test_images.dim() == 4 else tuple(test_images.shape[2:])
     num_classes = len(galaxy_classes)
     
-    if classifier == "CNN":
-        model = CNN(input_shape=img_shape, num_classes=num_classes).to(device)
-    elif classifier == "ImageCNN":
+    if classifier == "ImageCNN":
         model = ImageCNN(input_shape=img_shape, num_classes=num_classes).to(device)
     elif classifier == "SimpleScatterNet":
         model = SimpleScatterNet(input_shape=img_shape, num_classes=num_classes).to(device)

@@ -24,7 +24,7 @@ import matplotlib.pyplot as plt
 
 # ── Project ────────────────────────────────────────────────────────────────────
 from dcreclass.data import load_galaxies, get_classes
-from dcreclass.models import CNN, ImageCNN, ScatterNet, SimpleScatterNet, DualCNNSqueezeNet, DualScatterSqueezeNet
+from dcreclass.models import ImageCNN, ScatterNet, SimpleScatterNet, DualCNNSqueezeNet, DualScatterSqueezeNet
 from dcreclass.training import (EarlyStopping, reset_weights,
                                 relabel, permute_like,
                                 mixup_data, mixup_criterion,
@@ -40,7 +40,7 @@ from dcreclass.utils import (cluster_metrics, normalise_images, check_tensor, fo
 def _parse_args():
     p = argparse.ArgumentParser(description="Train a radio-image classifier")
     p.add_argument('--classifier',    default='ImageCNN',
-                   choices=['CNN','ScatterNet','SimpleScatterNet','DualCSN','DualSSN','ImageCNN'])
+                   choices=['ScatterNet','SimpleScatterNet','DualCSN','DualSSN','ImageCNN'])
     p.add_argument('--versions',      default='RAW',
                    help="'+'-separated list, e.g. RAW or T25kpc+T50kpc")
     p.add_argument('--crop-mode',     default='beam_crop',
@@ -374,7 +374,7 @@ print("Labels of the test set after relabelling:", torch.unique(test_labels, ret
 ################# NORMALISE AND PACKAGE TEST DATA ############################
 ##############################################################################
 
-if classifier in ['CNN', 'ImageCNN', 'SimpleScatterNet', 'DualCSN', 'DualSSN']: # When images are used
+if classifier in ['ImageCNN', 'SimpleScatterNet', 'DualCSN', 'DualSSN']: # When images are used
     test_images = _as_5d(test_images).to(DEVICE)
 
 if classifier in ['ScatterNet', 'DualSSN']: # When scattering is used
@@ -553,7 +553,7 @@ for fold in folds:
     ############ NORMALISE AND PACKAGE THE INPUT #############
     ##########################################################
 
-    if classifier in ['CNN', 'DualCSN', 'DualSSN']:
+    if classifier in ['DualCSN', 'DualSSN']:
         train_images = _as_5d(train_images).to(DEVICE)
         valid_images = _as_5d(valid_images).to(DEVICE)
 
@@ -743,9 +743,7 @@ for fold in folds:
     ###############################################
 
     # Directly create the model for the selected classifier
-    if classifier == "CNN":
-        model = CNN(input_shape=tuple(valid_images.shape[1:]), num_classes=num_classes).to(DEVICE)
-    elif classifier == "ImageCNN":
+    if classifier == "ImageCNN":
         model = ImageCNN(input_shape=tuple(valid_images.shape[1:]), num_classes=num_classes).to(DEVICE)
     elif classifier == "SimpleScatterNet":
         model = SimpleScatterNet(input_shape=tuple(valid_images.shape[1:]), num_classes=num_classes).to(DEVICE)

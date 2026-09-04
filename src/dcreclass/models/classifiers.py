@@ -1,68 +1,6 @@
 import torch
 import torch.nn as nn
 
-class CNN(nn.Module):
-    def __init__(self, input_shape, num_classes=2):
-        super(CNN, self).__init__()
-        
-        in_channels = input_shape[0]
-        
-        self.features = nn.Sequential(
-            # Block 1: 128→64, 16 channels
-            nn.Conv2d(in_channels, 16, kernel_size=5, stride=2, padding=2, bias=True),
-            nn.BatchNorm2d(16),
-            nn.LeakyReLU(0.2), 
-            nn.Dropout2d(0.15),  # Reduced from 0.2
-            
-            # Block 2: 64→32, 32 channels
-            nn.Conv2d(16, 32, kernel_size=5, stride=2, padding=2, bias=True),
-            nn.BatchNorm2d(32),
-            nn.LeakyReLU(0.2),
-            nn.Dropout2d(0.20),  # Progressive increase
-            
-            # Block 3: 32→16, 32 channels (keep same size - refinement)
-            nn.Conv2d(32, 32, kernel_size=5, stride=2, padding=2, bias=True),
-            nn.BatchNorm2d(32),
-            nn.LeakyReLU(0.2),
-            nn.Dropout2d(0.25),
-            
-            # Block 4: 16→8, 48 channels
-            nn.Conv2d(32, 48, kernel_size=3, stride=2, padding=1, bias=True),
-            nn.BatchNorm2d(48),
-            nn.LeakyReLU(0.2),
-            nn.Dropout2d(0.30),
-            
-            # Block 5: 8→4, 48 channels
-            nn.Conv2d(48, 48, kernel_size=3, stride=2, padding=1, bias=True),
-            nn.BatchNorm2d(48),
-            nn.LeakyReLU(0.2),
-            nn.Dropout2d(0.35),
-            
-            # Block 6: 4→2, 64 channels (extra spatial reduction)
-            nn.Conv2d(48, 64, kernel_size=3, stride=2, padding=1, bias=True),
-            nn.BatchNorm2d(64),
-            nn.LeakyReLU(0.2),
-            nn.Dropout2d(0.40),
-            
-            # Global Average Pooling
-            nn.AdaptiveAvgPool2d(1)
-        )
-        
-        # Classifier with extra regularization
-        self.classifier = nn.Sequential(
-            nn.Flatten(),
-            nn.Dropout(0.5),
-            nn.Linear(64, 32), 
-            nn.BatchNorm1d(32),
-            nn.LeakyReLU(0.2),
-            nn.Dropout(0.5),
-            nn.Linear(32, num_classes)
-        )
-    
-    def forward(self, x):
-        x = self.features(x)
-        return self.classifier(x)
-    
 
 class ScatterNet(nn.Module):
     """
